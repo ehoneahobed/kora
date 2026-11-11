@@ -1885,6 +1885,15 @@ export class SqliteServerStore implements ServerStore {
 		})
 	}
 
+	async getDeliveryAnchor(throughDeliverySequence: number): Promise<string | null> {
+		return this.track(async () => {
+			const rows = this.db.all<{ id: string }>(
+				sql`SELECT id FROM operations WHERE delivery_seq <= ${throughDeliverySequence} ORDER BY delivery_seq DESC LIMIT 1`,
+			)
+			return rows[0]?.id ?? null
+		})
+	}
+
 	async getOperationsAfterDelivery(
 		afterDeliverySequence: number,
 		limit: number,

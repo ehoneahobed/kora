@@ -7,6 +7,7 @@ export type {
 	QuarantinedOperation,
 	RejectedOperation,
 	RejectedOperationStorage,
+	DeliveryAnchorRecord,
 	SyncStatePersistence,
 	SyncAuthRequest,
 	BulkReplicationConfig,

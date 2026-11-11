@@ -340,6 +340,12 @@ export interface DeltaCursor {
 	batchIndex: number
 }
 
+/** The newest server operation at or below a delivery watermark, kept with that watermark. */
+export interface DeliveryAnchorRecord {
+	readonly watermark: number
+	readonly anchor: string
+}
+
 export interface SyncStatePersistence {
 	loadLastAckedServerVector(): Promise<VersionVector>
 	saveLastAckedServerVector(vector: VersionVector): Promise<void>
@@ -375,6 +381,14 @@ export interface SyncStatePersistence {
 	/** Resolves once everything committed so far is persisted, forcing nothing (null: already). */
 	whenPersisted?(): Promise<void> | null
 	/** Load every persisted view watermark, keyed by signature. */
+	/**
+	 * Delivery anchors (`OperationBatchMessage.deliveryAnchor`), each with the watermark it
+	 * belongs to, by view signature. Optional: without them a device never reports an
+	 * anchor, and a rewound server is recognized only when it is behind the device.
+	 */
+	loadDeliveryAnchors?(): Promise<Record<string, DeliveryAnchorRecord>>
+	/** Persist a view's anchor. Best effort: one that no longer matches the view's watermark is never sent. */
+	saveDeliveryAnchor?(signature: string, record: DeliveryAnchorRecord): Promise<void>
 	loadAllDeliveryWatermarks?(): Promise<Record<string, number>>
 	/**
 	 * Delete a persisted view watermark. Used to bound the number of stored view watermarks

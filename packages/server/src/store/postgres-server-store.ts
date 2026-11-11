@@ -1767,6 +1767,16 @@ export class PostgresServerStore implements ServerStore {
 		return Number(rows[0]?.m ?? 0)
 	}
 
+	async getDeliveryAnchor(throughDeliverySequence: number): Promise<string | null> {
+		this.assertOpen()
+		await this.ready
+		// The delivery_seq index makes this one index step from the top.
+		const rows = (await this.db.execute(
+			sql`SELECT id FROM operations WHERE delivery_seq <= ${throughDeliverySequence} ORDER BY delivery_seq DESC LIMIT 1`,
+		)) as unknown as { id: string }[]
+		return rows[0]?.id ?? null
+	}
+
 	async getOperationsAfterDelivery(
 		afterDeliverySequence: number,
 		limit: number,

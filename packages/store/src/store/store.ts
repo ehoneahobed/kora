@@ -497,6 +497,9 @@ function isSnapshotSuperseded(error: unknown): boolean {
 	return false
 }
 
+/** `_kora_meta` key prefix of a view's delivery anchor; the view signature follows it. */
+const DELIVERY_ANCHOR_META_PREFIX = 'delivery_anchor:'
+
 export class Store implements OperationLog {
 	private writeDurabilityFailing = false
 	private writeDurabilitySince = 0
@@ -3807,6 +3810,9 @@ export class Store implements OperationLog {
 		await this.clearOverlayOnWatermarkReset(signature, 0)
 		await deleteDeliveryWatermark(this.adapter, signature)
 		await deleteOfflineViewMarks(this.adapter, signature)
+		await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [
+			`${DELIVERY_ANCHOR_META_PREFIX}${signature}`,
+		])
 	}
 
 	/**
@@ -3857,6 +3863,46 @@ export class Store implements OperationLog {
 	}
 
 	/** Persist (or clear) the downlink scope the sync server last accepted. */
+	/**
+	 * Delivery anchors by view signature, each with the watermark it belongs to. The sync
+	 * engine reports a view's anchor at handshake only while it still matches the view's
+	 * watermark, which is how a server whose log was rewound by a restore recognizes it.
+	 */
+	async loadDeliveryAnchors(): Promise<Record<string, { watermark: number; anchor: string }>> {
+		this.ensureOpen()
+		const rows = await this.adapter.query<{ key: string; value: string }>(
+			'SELECT key, value FROM _kora_meta WHERE substr(key, 1, ?) = ?',
+			[DELIVERY_ANCHOR_META_PREFIX.length, DELIVERY_ANCHOR_META_PREFIX],
+		)
+		const anchors: Record<string, { watermark: number; anchor: string }> = {}
+		for (const row of rows) {
+			try {
+				const parsed = JSON.parse(row.value) as { watermark?: unknown; anchor?: unknown }
+				if (typeof parsed.watermark === 'number' && typeof parsed.anchor === 'string') {
+					anchors[row.key.slice(DELIVERY_ANCHOR_META_PREFIX.length)] = {
+						watermark: parsed.watermark,
+						anchor: parsed.anchor,
+					}
+				}
+			} catch {
+				// An unreadable anchor is no anchor: the handshake omits it.
+			}
+		}
+		return anchors
+	}
+
+	/** Persist a view's delivery anchor, replacing the previous one. */
+	async saveDeliveryAnchor(
+		signature: string,
+		record: { watermark: number; anchor: string },
+	): Promise<void> {
+		this.ensureOpen()
+		await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			`${DELIVERY_ANCHOR_META_PREFIX}${signature}`,
+			JSON.stringify({ watermark: record.watermark, anchor: record.anchor }),
+		])
+	}
+
 	/** The access read rules' key this device was last fully re-scoped under (null: none). */
 	async loadAccessRulesKey(): Promise<string | null> {
 		this.ensureOpen()

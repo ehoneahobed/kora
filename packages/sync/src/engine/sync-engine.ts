@@ -79,7 +79,7 @@ import {
 import { operationMatchesScope } from '../scopes/scope-filter'
 import { scopeViewKey } from '../scopes/scope-view-key'
 import type { SyncTransport } from '../transport/transport'
-import type { DeltaCursor } from '../types'
+import type { DeliveryAnchorRecord, DeltaCursor } from '../types'
 import {
 	type AdoptionScheduleInfo,
 	type HeldNodeInfo,
@@ -553,6 +553,11 @@ export class SyncEngine {
 	private volatileMarks = new Set<string>()
 	/** Each view's durable watermark as stored (this tab's other engines may advance it). */
 	private offlineWatermarks = new Map<string, number>()
+	/**
+	 * Each view's delivery anchor with the watermark it belongs to. Reported at handshake only
+	 * while it matches the view's watermark, so a lost or stale one is never sent.
+	 */
+	private deliveryAnchors = new Map<string, DeliveryAnchorRecord>()
 	/** True once the persisted per-view watermarks were read (the first start). */
 	private deliveryViewsLoaded = false
 	/** The completion last built for a final batch, so the cache mirrors what was stored. */
@@ -987,6 +992,14 @@ export class SyncEngine {
 				// Fallback: load just the current (default) view's watermark.
 				this.position.preloadView('', await this.syncState.loadDeliveryWatermark(''))
 			}
+			if (this.syncState.loadDeliveryAnchors) {
+				try {
+					this.deliveryAnchors = new Map(Object.entries(await this.syncState.loadDeliveryAnchors()))
+				} catch {
+					// Without anchors the handshake omits them: the old, frontier-only rewind check.
+					this.deliveryAnchors = new Map()
+				}
+			}
 			this.deliveryViewsLoaded = true
 			const startSignature = this.deliverySignature()
 			if (this.position.viewWatermark(startSignature) === undefined && this.querySubsets.size > 0) {
@@ -1129,6 +1142,11 @@ export class SyncEngine {
 				// that understands it drives server->client sync from delivery sequences; an
 				// older server ignores it and falls back to the version-vector delta.
 				lastDeliverySequence: this.position.watermark,
+				...this.deliveryAnchorField(
+					'lastDeliveryAnchor',
+					this.deliverySignature(),
+					this.position.watermark,
+				),
 				// The accepted view this client last streamed under, with its own watermark
 				// (SYNC-11): a server that resolves the same scope again resumes from it.
 				...this.acceptedViewHandshakeFields(),
@@ -1906,14 +1924,44 @@ export class SyncEngine {
 	private acceptedViewHandshakeFields(): {
 		acceptedScopeKey?: string
 		acceptedScopeWatermark?: number
+		acceptedScopeAnchor?: string
 	} {
 		const accepted = this.lastAcceptedScope
 		if (accepted === null) return {}
 		const key = scopeViewKey(accepted)
 		if (key === scopeViewKey(this.activeScope)) return {}
-		const watermark = this.position.viewWatermark(this.deliverySignatureFor(accepted))
+		const signature = this.deliverySignatureFor(accepted)
+		const watermark = this.position.viewWatermark(signature)
 		if (watermark === undefined) return {}
-		return { acceptedScopeKey: key, acceptedScopeWatermark: watermark }
+		return {
+			acceptedScopeKey: key,
+			acceptedScopeWatermark: watermark,
+			...this.deliveryAnchorField('acceptedScopeAnchor', signature, watermark),
+		}
+	}
+
+	/**
+	 * A view's delivery anchor for the handshake, under `field`, when it belongs to exactly
+	 * the watermark being reported. The server compares it with its own log and resyncs this
+	 * client from 0 when the log was rewound underneath it (a restore of any kind).
+	 */
+	private deliveryAnchorField<K extends 'lastDeliveryAnchor' | 'acceptedScopeAnchor'>(
+		field: K,
+		signature: string,
+		watermark: number,
+	): Partial<Record<K, string>> {
+		const record = this.deliveryAnchors.get(signature)
+		if (watermark <= 0 || record === undefined || record.watermark !== watermark) return {}
+		return { [field]: record.anchor } as Partial<Record<K, string>>
+	}
+
+	/** Keep the anchor of a batch that took a view's watermark to its max, durably when possible. */
+	private recordDeliveryAnchor(signature: string, watermark: number, anchor: string): void {
+		const record = { watermark, anchor }
+		this.deliveryAnchors.set(signature, record)
+		this.syncState?.saveDeliveryAnchor?.(signature, record).catch(() => {
+			// Losing it only means the next handshake reports no anchor for this view.
+		})
 	}
 
 	/** Persist the downlink scope the server accepted at this handshake (null: none). */
@@ -3565,6 +3613,16 @@ export class SyncEngine {
 				this.lastOfflineCompletion = null
 				this.hasInFlightDeliveryBatch = false
 				return
+			}
+			// The anchor names the server's newest operation at or below `max`: it belongs to
+			// the watermark only when the watermark is exactly `max`, and only to the live
+			// view (a staged stream's position is not the view's durable one).
+			if (
+				typeof msg.deliveryAnchor === 'string' &&
+				watermark === msg.maxDeliverySequence &&
+				!(outcome && !outcome.merged)
+			) {
+				this.recordDeliveryAnchor(context.signature, watermark, msg.deliveryAnchor)
 			}
 			if (
 				this.blockedFailure &&
