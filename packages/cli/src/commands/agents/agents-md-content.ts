@@ -177,10 +177,20 @@ Enable sync with one option on \`createApp\`: \`createApp({ schema, sync: { url,
 
 ${FRAMEWORK_BINDINGS[framework]}
 
+## Server, files and settings
+
+- **Uploaded files** (\`t.blob()\` fields): \`createProductionServer\` keeps their bytes where the host says, in \`KORA_BLOB_STORE_URL\` (S3 or Azure Blob) or \`KORA_BLOB_DIR\` (a directory), and sweeps bytes no record uses after a day's grace. Never invent your own storage path setting or write files to the container's disk: on most hosts that disk is replaced on every deploy, and backups don't see it.
+- **Settings**: declare every environment variable the app reads in \`.env.example\`. A comment describes the variables right below it, and tags set the rules: \`# [required]\` production can't run without it, \`[secret]\` a credential, \`[development]\` local only. Hosts (Kora Cloud included) and \`npx kora doctor --production\` read this file; nothing else tells them what the app needs.
+- **Tests across users**: use \`@korajs/test\`. A \`TestServer\` with \`auth: true\` and a \`TestDevice\` per \`user\` check access rules exactly as production applies them. Don't assemble devices from framework internals: they change between releases.
+
+## Deploying
+
+\`npx kora deploy --platform kora-cloud --prod\` (after \`npx kora login\`) builds and runs the app on Kora Cloud with its database, file storage, backups and previews. Self-hosting needs nothing more than the same server: \`pnpm build && pnpm start\` on Node 20+.
+
 ## Commands
 
 - \`npx kora dev\` runs the dev environment (app server, local sync server when configured, schema watcher).
-- \`npx kora doctor\` diagnoses a broken setup.
+- \`npx kora doctor\` diagnoses a broken setup (\`--production\` also checks the settings production needs).
 - \`npx kora migrate\` generates a migration from a schema change (\`--apply\` runs it against a SQLite or Postgres database).
 - In a running app, the DevTools overlay (Ctrl+Shift+K, Cmd+Shift+K on macOS) inspects operations, merges, and sync status.
 `

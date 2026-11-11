@@ -455,3 +455,6 @@ export { finalizeSchema } from './schema/finalize-schema'
 // `defineSchema` validate at once (and completes schemas defined before it loaded); browser
 // first-paint code imports `@korajs/core/lite`, which does not reach this line.
 registerAccessCompiler()
+
+// App settings declared in .env.example
+export { missingRequiredEnv, parseEnvExample, type EnvDeclaration } from './env/env-example'

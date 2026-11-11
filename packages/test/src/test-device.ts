@@ -91,6 +91,12 @@ export interface TestDeviceOptions {
 	 */
 	principal?: () => string | null
 	/**
+	 * Sign this device in as `user`, for a `TestServer` created with `auth: true`: its sessions
+	 * present the user id as their token, and its store is bound to that user, so the schema's
+	 * access rules decide what it receives and may write, as in production.
+	 */
+	user?: string
+	/**
 	 * Let the sync engine reconnect on its own, as over a real WebSocket: a `connect()`
 	 * after the session closed opens a new transport pair to the server. Off by default
 	 * (a closed pair stays closed until the next {@link TestDevice.sync}).
@@ -196,6 +202,7 @@ export class TestDevice {
 	private readonly operationTransforms: OperationTransform[]
 	private readonly scopeExit: 'retain' | 'retract' | undefined
 	private readonly principal: (() => string | null) | undefined
+	private readonly user: string | null
 	private readonly reconnectable: boolean
 
 	private applyPipeline: ApplyPipeline | null = null
@@ -215,7 +222,8 @@ export class TestDevice {
 		this.syncSchemaVersion = options.syncSchemaVersion ?? options.schema.version
 		this.operationTransforms = options.operationTransforms ?? []
 		this.scopeExit = options.scopeExit
-		this.principal = options.principal
+		this.user = options.user ?? null
+		this.principal = options.principal ?? (options.user ? () => options.user ?? null : undefined)
 		this.reconnectable = options.reconnectable === true
 		this.encryption = options.encryption
 		this.bulkReplication = options.bulkReplication
@@ -321,6 +329,7 @@ export class TestDevice {
 				...(this.principal
 					? { principal: async () => (this.principal ? this.principal() : null) }
 					: {}),
+				...(this.user ? { auth: async () => ({ token: this.user ?? '' }) } : {}),
 				...(this.encryption ? { encryption: this.encryption.config } : {}),
 				...(this.batchSize !== undefined ? { batchSize: this.batchSize } : {}),
 				...(this.bulkReplication !== undefined ? { bulkReplication: this.bulkReplication } : {}),

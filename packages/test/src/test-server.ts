@@ -1,7 +1,8 @@
 import type { BlobRef, Operation, OperationTransform, SchemaDefinition } from '@korajs/core'
-import { MemoryServerStore } from '@korajs/server'
+import { MemoryServerStore, TokenAuthProvider } from '@korajs/server'
 import { KoraSyncServer } from '@korajs/server'
 import type {
+	AuthProvider,
 	KoraSyncServerConfig,
 	OperationValidator,
 	ServerStore,
@@ -32,6 +33,12 @@ export interface TestServerOptions<S extends ServerStore = MemoryServerStore> {
 	blobStorage?: boolean
 	/** Adjudicate untrusted client operations before materialization. */
 	validateOperation?: OperationValidator
+	/**
+	 * Sign-in, so a schema's access rules apply per user exactly as in production.
+	 * `true`: a device's token is its user id (see `TestDevice`'s `user`). Or pass any
+	 * `AuthProvider`. Without it, sessions are anonymous.
+	 */
+	auth?: true | AuthProvider
 }
 
 export class TestServer<S extends ServerStore = MemoryServerStore> {
@@ -59,6 +66,16 @@ export class TestServer<S extends ServerStore = MemoryServerStore> {
 			...(blob ? blob.callbacks : {}),
 			...(options?.validateOperation ? { validateOperation: options.validateOperation } : {}),
 			...(options?.encryption ? { encryption: options.encryption } : {}),
+			...(options?.auth
+				? {
+						auth:
+							options.auth === true
+								? new TokenAuthProvider({
+										validate: async (token) => (token ? { userId: token } : null),
+									})
+								: options.auth,
+					}
+				: {}),
 		})
 		this.ready = this.store.setSchema(
 			schema,

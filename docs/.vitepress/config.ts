@@ -226,6 +226,7 @@ export default defineConfig({
 					{ text: 'Sync Configuration', link: '/guide/sync-configuration' },
 					{ text: 'Server-side Validation', link: '/guide/server-side-validation' },
 					{ text: 'Storage Configuration', link: '/guide/storage-configuration' },
+					{ text: 'Settings', link: '/guide/settings' },
 					{ text: 'App Updates & Multiple Tabs', link: '/guide/app-updates' },
 					{ text: 'Multi-runtime Storage', link: '/guide/multi-runtime-storage' },
 					{ text: 'Backup and Restore', link: '/guide/backup-restore' },

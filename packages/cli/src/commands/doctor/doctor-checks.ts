@@ -11,6 +11,7 @@ import { type DryRunDeps, checkMigrationDryRun, defaultDryRunDeps } from './db/m
 import { runProductionAudit } from './production-audit'
 import { type ProbeDeps, defaultProbeDeps, probeDeployedServer } from './production-probe'
 import { checkDuplicateSchemas } from './schema-duplicates'
+import { checkDeclaredSettings } from './settings-check'
 
 export type DoctorCheckStatus = 'pass' | 'warn' | 'fail' | 'skip'
 
@@ -85,6 +86,7 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 		})
 	}
 
+	results.push(await checkDeclaredSettings(projectRoot, process.env, options.production === true))
 	results.push(await checkDuplicateSchemas(projectRoot))
 
 	let loadedSchema: SchemaDefinition | null = null

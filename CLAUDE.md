@@ -111,7 +111,7 @@ These decisions are locked. Do not deviate or substitute.
 @korajs/store      -> @korajs/core
 @korajs/merge      -> @korajs/core
 @korajs/sync       -> @korajs/core, @korajs/merge
-@korajs/server     -> @korajs/core, @korajs/merge, @korajs/sync
+@korajs/server     -> @korajs/core, @korajs/merge, @korajs/sync, @korajs/store (server-only entry points: blob-object, blob-fs)
 @korajs/react      -> @korajs/core, @korajs/store, @korajs/sync
 @korajs/vue        -> @korajs/core, @korajs/store, @korajs/sync
 @korajs/svelte     -> @korajs/core, @korajs/store, @korajs/sync
