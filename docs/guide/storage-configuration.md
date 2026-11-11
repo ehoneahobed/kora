@@ -429,9 +429,10 @@ Hosts such as Kora Cloud set these for you. Don't invent a setting of your own f
 To choose in code instead, pass `blobStore` (any `ContentAddressedBlobStore`), or `blobStore: false` to keep none:
 
 ```typescript
-import { createProductionServer } from '@korajs/server'
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 import { FilesystemBlobStore } from '@korajs/store/blob-fs'
 
+const store = createSqliteServerStore({ filename: './kora-server.db' })
 const server = createProductionServer({ store, blobStore: new FilesystemBlobStore('/data/files') })
 ```
 
