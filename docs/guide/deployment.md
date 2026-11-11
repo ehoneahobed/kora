@@ -25,6 +25,38 @@ If you've never deployed an app before, we recommend **Fly.io**. It has a genero
 
 ---
 
+## Deploy to Kora Cloud
+
+Kora Cloud runs Kora apps for you: the sync server, a PostgreSQL database, file storage, verified daily backups, an address under `onkora.app`, and a preview for every pull request. Nothing to install besides the Kora CLI. Self-hosting stays exactly as it is; Kora Cloud is one more place to deploy.
+
+```bash
+kora login
+kora deploy --platform kora-cloud --prod
+```
+
+`kora login` prints a short code and opens the Kora Cloud console. Approve the code there (check it matches your terminal) and the CLI is signed in on this machine. It works over SSH too: open the printed link on any device. The sign-in is kept in `~/.config/kora/cloud.json`, readable by you only, and lasts 90 days. `kora whoami` shows which account is used, and `kora logout` ends it. You can also see and end CLI sign-ins in the console under **Account settings**.
+
+The first `kora deploy` asks which organization and project to deploy to (or creates the project), and links the directory in `.kora/cloud.json`. That file holds two ids and nothing secret, so it can be committed. Later deploys ask nothing.
+
+Each deploy uploads the project's source, the files git would commit; inside a monorepo, the whole repository. `node_modules`, `.git`, `.kora` and `.env` files are never uploaded. Kora Cloud then builds and deploys it exactly as it would a push to the production branch, and the CLI follows each stage until the app is live:
+
+```text
+→ Uploading 84 files (0.4 MiB) at 9ce6070
+→ Building image on Kora Cloud...
+→ Provisioning environment...
+→ Verifying the app...
+✓ Deployment completed: https://my-app.onkora.app
+→ Sync endpoint: wss://my-app.onkora.app/kora-sync
+```
+
+From the CLI, Kora Cloud deploys to production. Previews come from pull requests: connect the repository in the console and every pull request gets its own preview with an empty database.
+
+Set environment variables and secrets in the console (project **Settings**); the CLI never handles them. If the build fails, the CLI prints the end of the build log and the reason. Production keeps running the previous release until a new one is verified.
+
+In CI, set `KORA_CLOUD_TOKEN` to a CLI sign-in's token instead of running `kora login`, and pass `--confirm --prod`. To roll back, use **Roll back** on an earlier deployment in the console.
+
+---
+
 ## Step-by-Step: Deploy to Fly.io
 
 ### Step 1: Create your app

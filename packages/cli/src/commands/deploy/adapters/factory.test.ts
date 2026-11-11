@@ -23,7 +23,7 @@ describe('createDeployAdapter', () => {
 	})
 
 	test('returns StubDeployAdapter for non-implemented platforms', async () => {
-		const platforms = ['render', 'docker', 'kora-cloud'] as const
+		const platforms = ['render', 'docker'] as const
 		for (const platform of platforms) {
 			const adapter = createDeployAdapter(platform)
 			expect(adapter.name).toBe(platform)

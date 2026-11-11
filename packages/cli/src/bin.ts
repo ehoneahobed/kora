@@ -7,6 +7,7 @@ import { deployCommand } from './commands/deploy/deploy-command'
 import { devCommand } from './commands/dev/dev-command'
 import { doctorCommand } from './commands/doctor/doctor-command'
 import { generateCommand } from './commands/generate/generate-command'
+import { loginCommand, logoutCommand, whoamiCommand } from './commands/login/login-command'
 import { logsCommand } from './commands/logs/logs-command'
 import { migrateCommand } from './commands/migrate/migrate-command'
 import { statusCommand } from './commands/status/status-command'
@@ -27,11 +28,14 @@ const main = defineCommand({
 		doctor: doctorCommand,
 		deploy: deployCommand,
 		generate: generateCommand,
+		login: loginCommand,
+		logout: logoutCommand,
 		logs: logsCommand,
 		migrate: migrateCommand,
 		status: statusCommand,
 		studio: studioCommand,
 		upgrade: upgradeCommand,
+		whoami: whoamiCommand,
 	},
 })
 

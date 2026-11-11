@@ -202,9 +202,27 @@ export const deployCommand = defineCommand({
 			throw new DeployPlatformUnavailableError(platform, IMPLEMENTED_DEPLOY_PLATFORMS)
 		}
 		const appName = resolveAppName(args.app, existingState?.appName, projectRoot, confirmMode)
-		const region = resolveRegion(args.region, existingState?.region, confirmMode)
+		// Kora Cloud chooses where to run, and deploys to production from the CLI: previews come
+		// from pull requests, so there is no CLI preview to fall back to.
+		const cloud = platform === 'kora-cloud'
+		const region = cloud ? null : resolveRegion(args.region, existingState?.region, confirmMode)
+		if (cloud && args.prod !== true) {
+			if (confirmMode || !isInteractiveTerminal()) {
+				throw new Error(
+					'Kora Cloud deploys to production from the CLI (previews come from pull requests). Pass --prod to confirm.',
+				)
+			}
+			const proceed = await prompts.confirm(
+				'Kora Cloud deploys to production from the CLI; previews come from pull requests. Deploy to production?',
+				true,
+			)
+			if (!proceed) {
+				logger.warn('Nothing was deployed.')
+				return
+			}
+		}
 		const deployDirectory = resolveDeployDirectory(projectRoot)
-		const environment = args.prod === true ? 'production' : 'preview'
+		const environment = args.prod === true || cloud ? 'production' : 'preview'
 		const deployTarget = detectDeployTarget(projectRoot)
 		const config: ProjectConfig = {
 			projectRoot,
@@ -232,15 +250,16 @@ export const deployCommand = defineCommand({
 			logger.step('Running in --confirm mode (non-interactive, fail-fast).')
 		}
 
-		await writeDockerfileArtifact(deployDirectory, {
-			clientDirectory: deployTarget === 'sync-server' ? null : undefined,
-			nativeDependencies: {
-				'better-sqlite3': '^11.0.0',
-				'drizzle-orm': '^0.45.2',
-				postgres: '^3.4.0',
-			},
-		})
-		await writeDockerIgnoreArtifact(deployDirectory)
+		if (!cloud)
+			await writeDockerfileArtifact(deployDirectory, {
+				clientDirectory: deployTarget === 'sync-server' ? null : undefined,
+				nativeDependencies: {
+					'better-sqlite3': '^11.0.0',
+					'drizzle-orm': '^0.45.2',
+					postgres: '^3.4.0',
+				},
+			})
+		if (!cloud) await writeDockerIgnoreArtifact(deployDirectory)
 		const detected = await adapter.detect()
 		if (!detected) {
 			await adapter.install()
@@ -310,7 +329,11 @@ async function resolvePlatform(options: ResolvePlatformOptions): Promise<DeployP
 
 	return await options.promptClient.select('Where do you want to deploy?', [
 		{
-			label: 'Fly.io (recommended for sync apps)',
+			label: 'Kora Cloud (managed: database, files, backups and previews included)',
+			value: 'kora-cloud',
+		},
+		{
+			label: 'Fly.io',
 			value: 'fly',
 		},
 		{
@@ -332,10 +355,6 @@ async function resolvePlatform(options: ResolvePlatformOptions): Promise<DeployP
 		{
 			label: 'Docker (self-hosted, coming soon)',
 			value: 'docker',
-		},
-		{
-			label: 'Kora Cloud (coming soon)',
-			value: 'kora-cloud',
 		},
 	])
 }
