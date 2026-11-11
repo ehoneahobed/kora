@@ -99,3 +99,31 @@ export class UpgradeError extends KoraError {
 		this.name = 'UpgradeError'
 	}
 }
+
+/**
+ * Thrown when Kora Cloud refuses a request or can't be reached. The message is the platform's
+ * own explanation, so it can be printed as it is.
+ */
+export class KoraCloudError extends KoraError {
+	constructor(
+		message: string,
+		public readonly cloudCode: string,
+		public readonly status: number | null,
+	) {
+		super(message, 'KORA_CLOUD_ERROR', { cloudCode, status })
+		this.name = 'KoraCloudError'
+	}
+}
+
+/**
+ * Thrown when a Kora Cloud command needs a sign-in and there is none, or it has ended.
+ */
+export class KoraCloudSignInRequiredError extends KoraError {
+	constructor() {
+		super(
+			'Not signed in to Kora Cloud, or the sign-in has ended. Run `kora login` (or set KORA_CLOUD_TOKEN in CI).',
+			'KORA_CLOUD_SIGN_IN_REQUIRED',
+		)
+		this.name = 'KoraCloudSignInRequiredError'
+	}
+}

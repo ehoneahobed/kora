@@ -363,7 +363,7 @@ describe('deployCommand', () => {
 		).rejects.toThrow(/Missing app name in --confirm mode/)
 	})
 
-	test.each(['render', 'docker', 'kora-cloud'])(
+	test.each(['render', 'docker'])(
 		'refuses coming-soon platform %s before writing anything (DX-8)',
 		async (platform) => {
 			const { deployCommand } = await import('./deploy-command')
