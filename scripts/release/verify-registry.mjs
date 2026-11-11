@@ -20,7 +20,10 @@ const packageNames = packageDirs
 // readable from the public registry after the publish command succeeds. Keep
 // the wait bounded, but calibrate the default to the propagation observed in
 // real canary releases rather than treating a normal delay as a broken release.
-const attempts = Number.parseInt(process.env.KORA_REGISTRY_ATTEMPTS ?? '60', 10)
+// Observed: @korajs/cli@0.0.0-canary-20261111211020 became readable about 8 minutes after a
+// successful publish, so the default allows 20 minutes (120 checks, 10 s apart).
+const attempts = Number.parseInt(process.env.KORA_REGISTRY_ATTEMPTS ?? '120', 10)
+const intervalMs = Number.parseInt(process.env.KORA_REGISTRY_INTERVAL_MS ?? '10000', 10)
 let missing = packageNames
 let failures = new Map()
 for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -45,7 +48,7 @@ for (let attempt = 1; attempt <= attempts; attempt++) {
 	}
 	if (attempt < attempts) {
 		console.log(`Registry attempt ${attempt}/${attempts}: waiting for ${missing.length} package(s)`)
-		await sleep(5000)
+		await sleep(intervalMs)
 	}
 }
 
