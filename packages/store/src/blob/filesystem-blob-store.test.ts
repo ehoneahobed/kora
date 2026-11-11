@@ -1,5 +1,6 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { resolve as resolvePath } from 'node:path'
 import { join } from 'node:path'
 import { hashBlob } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
@@ -93,4 +94,8 @@ describe('FilesystemBlobStore', () => {
 		// The genuinely-stored 'tampered' blob (under its own correct hash) is fine.
 		expect(await store.get(other.hash)).not.toBeNull()
 	})
+})
+
+test('reports the directory it keeps bytes in, for startup logs', () => {
+	expect(new FilesystemBlobStore('relative/files').location).toBe(resolvePath('relative/files'))
 })
