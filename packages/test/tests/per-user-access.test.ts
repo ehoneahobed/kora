@@ -71,12 +71,21 @@ test('each signed-in user receives only what the access rules give them', async 
 test('a collaborator granted access receives the record, and loses it when removed', async () => {
 	const shared = defineSchema({
 		version: 1,
-		access: { memberships: 'members', roles: ['view', 'edit'], groups: { boards: { owner: 'ownerId', role: 'edit' } } },
+		access: {
+			memberships: 'members',
+			roles: ['view', 'edit'],
+			groups: { boards: { owner: 'ownerId', role: 'edit' } },
+		},
 		collections: {
 			members: { fields: { userId: t.string(), group: t.string(), role: t.string() } },
 			boards: {
 				fields: { title: t.string(), ownerId: t.string().stamp('userId') },
-				access: { read: member('id'), create: owner('ownerId'), update: member('id', 'edit'), delete: member('id', 'edit') },
+				access: {
+					read: member('id'),
+					create: owner('ownerId'),
+					update: member('id', 'edit'),
+					delete: member('id', 'edit'),
+				},
 			},
 		},
 	})
@@ -86,7 +95,11 @@ test('a collaborator granted access receives the record, and loses it when remov
 	cleanup.push(() => rmSync(tmpDir, { recursive: true, force: true }))
 	const device = (name: string, user: string): TestDevice => {
 		const created = new TestDevice({
-			name, schema: shared, server, tmpDir, user,
+			name,
+			schema: shared,
+			server,
+			tmpDir,
+			user,
 			createTransportPair: () => {
 				const pair = createServerTransportPair()
 				return { client: pair.client as unknown as SyncTransport, serverTransport: pair.server }
@@ -103,7 +116,10 @@ test('a collaborator granted access receives the record, and loses it when remov
 	await alice.sync()
 	expect(await alice.getRejectedOperations()).toEqual([])
 	await bob.sync()
-	const titles = async (each: TestDevice): Promise<string[]> => ((await each.collection('boards').where({}).exec()) as Array<{ title: string }>).map((row) => row.title)
+	const titles = async (each: TestDevice): Promise<string[]> =>
+		((await each.collection('boards').where({}).exec()) as Array<{ title: string }>).map(
+			(row) => row.title,
+		)
 	expect(await titles(bob)).toEqual([])
 
 	await server.access.grant({ userId: 'bob', group: ['boards', board.id], role: 'view' })

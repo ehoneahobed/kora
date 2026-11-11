@@ -68,7 +68,9 @@ export class TestServer<S extends ServerStore = MemoryServerStore> {
 			...(blob ? blob.callbacks : {}),
 			...(options?.validateOperation ? { validateOperation: options.validateOperation } : {}),
 			...(options?.encryption ? { encryption: options.encryption } : {}),
-			...(options?.accessSweepIntervalMs !== undefined ? { accessSweepIntervalMs: options.accessSweepIntervalMs } : {}),
+			...(options?.accessSweepIntervalMs !== undefined
+				? { accessSweepIntervalMs: options.accessSweepIntervalMs }
+				: {}),
 			...(options?.auth
 				? {
 						auth:
