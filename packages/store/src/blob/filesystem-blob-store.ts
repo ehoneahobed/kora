@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { type BlobRef, type BlobRefMetadata, createBlobRef, hashBlob } from '@korajs/core'
 import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-addressed-blob-store'
@@ -32,8 +32,11 @@ export class FilesystemBlobStore implements ContentAddressedBlobStore {
 		const ref = await createBlobRef(bytes, metadata)
 		const target = this.pathFor(ref.hash)
 
-		// Dedup: identical content already stored is a no-op.
+		// Dedup: identical content already stored is not written again, but counts as just
+		// written, so a sweep's grace period protects a re-upload for a new record.
 		if (await this.exists(target)) {
+			const now = new Date()
+			await utimes(target, now, now).catch(() => undefined)
 			return ref
 		}
 
@@ -89,6 +92,51 @@ export class FilesystemBlobStore implements ContentAddressedBlobStore {
 		return true
 	}
 
+	/** When the bytes behind `hash` were last written or uploaded again, in ms, or null when absent. */
+	async lastWrittenAt(hash: string): Promise<number | null> {
+		if (!CONTENT_HASH.test(hash)) {
+			return null
+		}
+		try {
+			return (await stat(this.pathFor(hash))).mtimeMs
+		} catch (error) {
+			if (isNotFound(error)) {
+				return null
+			}
+			throw error
+		}
+	}
+
+	/**
+	 * Deletes `hash` only if it was not written since `cutoffMs`. The file is first moved
+	 * aside, then checked again, so an upload racing the sweep is never lost: a re-upload
+	 * that touched it puts it back, and one that wrote it anew wrote the same bytes.
+	 */
+	async deleteIfWrittenBefore(hash: string, cutoffMs: number): Promise<boolean> {
+		const writtenAt = await this.lastWrittenAt(hash)
+		if (writtenAt === null || writtenAt >= cutoffMs) {
+			return false
+		}
+		const target = this.pathFor(hash)
+		const aside = `${target}.${randomUUID()}.deleting`
+		try {
+			await rename(target, aside)
+		} catch (error) {
+			if (isNotFound(error)) {
+				return false
+			}
+			throw error
+		}
+		if ((await stat(aside)).mtimeMs >= cutoffMs) {
+			// Touched between the check and the move: it is in use again.
+			if (await this.exists(target)) await rm(aside)
+			else await rename(aside, target)
+			return false
+		}
+		await rm(aside)
+		return true
+	}
+
 	async size(): Promise<number> {
 		let count = 0
 		let shards: string[]
@@ -103,7 +151,9 @@ export class FilesystemBlobStore implements ContentAddressedBlobStore {
 		for (const shard of shards) {
 			try {
 				const entries = await readdir(join(this.dir, shard))
-				count += entries.filter((name) => !name.endsWith('.tmp')).length
+				count += entries.filter(
+					(name) => !name.endsWith('.tmp') && !name.endsWith('.deleting'),
+				).length
 			} catch (error) {
 				if (!isNotFound(error)) {
 					throw error
@@ -128,7 +178,7 @@ export class FilesystemBlobStore implements ContentAddressedBlobStore {
 			try {
 				const entries = await readdir(join(this.dir, shard))
 				for (const name of entries) {
-					if (!name.endsWith('.tmp')) {
+					if (CONTENT_HASH.test(name)) {
 						hashes.push(name)
 					}
 				}

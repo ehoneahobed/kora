@@ -215,7 +215,7 @@ export async function createPostgresOAuthStateStore(options: {
 	connectionString: string
 }): Promise<PostgresOAuthStateStore> {
 	const postgresClient = await loadPostgresDeps()
-	const sql = postgresClient(options.connectionString) as unknown as PostgresClient
+	const sql = postgresClient(options.connectionString, QUIET) as unknown as PostgresClient
 	return new PostgresOAuthStateStore(sql)
 }
 
@@ -223,7 +223,7 @@ export async function createPostgresLinkedIdentityStore(options: {
 	connectionString: string
 }): Promise<PostgresLinkedIdentityStore> {
 	const postgresClient = await loadPostgresDeps()
-	const sql = postgresClient(options.connectionString) as unknown as PostgresClient
+	const sql = postgresClient(options.connectionString, QUIET) as unknown as PostgresClient
 	return new PostgresLinkedIdentityStore(sql)
 }
 
@@ -232,20 +232,31 @@ export async function createPostgresOAuthStores(options: { connectionString: str
 	linkedIdentityStore: PostgresLinkedIdentityStore
 }> {
 	const postgresClient = await loadPostgresDeps()
-	const sql = postgresClient(options.connectionString) as unknown as PostgresClient
+	const sql = postgresClient(options.connectionString, QUIET) as unknown as PostgresClient
 	return {
 		stateStore: new PostgresOAuthStateStore(sql),
 		linkedIdentityStore: new PostgresLinkedIdentityStore(sql),
 	}
 }
 
-async function loadPostgresDeps(): Promise<(connectionString: string) => unknown> {
+/**
+ * The DDL here is idempotent (`CREATE ... IF NOT EXISTS`), and Postgres reports each skipped
+ * statement as a NOTICE that postgres.js prints by default, so every restart on an existing
+ * database would bury the app's own startup lines under "already exists, skipping".
+ */
+const QUIET = { onnotice: () => {} }
+
+async function loadPostgresDeps(): Promise<
+	(connectionString: string, options?: { onnotice?: () => void }) => unknown
+> {
 	try {
 		const dynamicImport = new Function('specifier', 'return import(specifier)') as (
 			specifier: string,
 		) => Promise<unknown>
 
-		const postgresMod = (await dynamicImport('postgres')) as { default: (cs: string) => unknown }
+		const postgresMod = (await dynamicImport('postgres')) as {
+			default: (cs: string, options?: { onnotice?: () => void }) => unknown
+		}
 		return postgresMod.default
 	} catch {
 		throw new Error(

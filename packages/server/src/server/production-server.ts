@@ -1,6 +1,12 @@
 import { promisify } from 'node:util'
 import { brotliCompress, gzip, constants as zlibConstants } from 'node:zlib'
 import type { BlobRef } from '@korajs/core'
+import {
+	type ContentAddressedBlobStore,
+	collectBlobGarbage,
+	openBlobStoreFromEnv,
+	toServerBlobCallbacks,
+} from '@korajs/store/blob-object'
 import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
 import { addressBucket } from '../read/address-bucket'
@@ -60,6 +66,20 @@ export interface ProductionServerConfig {
 	operationalAuth?: ProductionOperationalAuth
 	/** Reports stored files for `/__kora/insights`, when the app keeps a blob store. */
 	blobStats?: () => Promise<{ readonly count: number; readonly bytes: number }>
+	/**
+	 * Where the bytes behind `t.blob()` fields are kept. By default the store the host names
+	 * in its environment: `KORA_BLOB_STORE_URL` (S3, or Azure Blob with a managed identity)
+	 * or `KORA_BLOB_DIR` (a directory that survives restarts). With neither set, the server
+	 * keeps no file bytes. Pass a store to choose one in code, or `false` to keep none.
+	 * Ignored when `syncOptions` wires `persistBlobChunk` / `resolveBlobChunk` itself.
+	 */
+	blobStore?: ContentAddressedBlobStore | false
+	/**
+	 * Daily sweep of file bytes no live record points at, when the server holds them. A blob
+	 * uploaded within the last day is kept, since its record may still be on its way.
+	 * `false` turns it off. Defaults to on.
+	 */
+	blobGarbageCollection?: false | { readonly intervalHours?: number; readonly graceHours?: number }
 	/**
 	 * Reverse proxies trusted to report the client address in `X-Forwarded-For`,
 	 * which becomes `request.ip` (the key `@korajs/auth` rate-limits sign-in by).
@@ -312,11 +332,19 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const readBodiesByPrincipal = new Map<string, number>()
 	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
 
+	// Files go where the host says, unless the app wired blob handling itself.
+	const wiresBlobsItself =
+		config.syncOptions?.persistBlobChunk !== undefined ||
+		config.syncOptions?.resolveBlobChunk !== undefined
+	const blobStore = resolveServerBlobStore(config, process.env)
 	const syncServer = new KoraSyncServer({
 		store: config.store,
 		enableDashboard: true,
+		...(blobStore ? toServerBlobCallbacks(blobStore) : {}),
 		...config.syncOptions,
 	})
+	let blobSweep: ReturnType<typeof setInterval> | null = null
+	let blobSweepStart: ReturnType<typeof setTimeout> | null = null
 
 	// Scoped, validated data-plane access handed to every custom HTTP route as
 	// `request.kora`, exposed on the handle as `server.kora`, and used by the
@@ -686,6 +714,72 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 							production && !allowPublic
 								? `Operational endpoints without a token are disabled (${paths}). Set operationalAuth.adminToken and backupToken to use them.`
 								: `Operational endpoints without a token are PUBLIC (${paths}). Set operationalAuth.adminToken and backupToken before exposing this server.`,
+					},
+				})
+			}
+			if (blobStore) {
+				const location = (blobStore as { location?: string }).location
+				syncServer.getLogger().log({
+					timestamp: Date.now(),
+					level: 'info',
+					event: 'server.blob_store',
+					details: { location: location ?? 'configured in code' },
+				})
+				const sweep = config.blobGarbageCollection
+				if (sweep !== false) {
+					const intervalMs = Math.max(1, sweep?.intervalHours ?? 24) * 60 * 60 * 1000
+					const graceMs = Math.max(0, sweep?.graceHours ?? 24) * 60 * 60 * 1000
+					let running = false
+					const run = (): void => {
+						if (running) return
+						running = true
+						void (async () => {
+							try {
+								const result = await collectBlobGarbage(
+									blobStore,
+									await syncServer.getLiveBlobRefs(),
+									{ graceMs },
+								)
+								syncServer.getLogger().log({
+									timestamp: Date.now(),
+									level: 'info',
+									event: 'server.blob_gc',
+									details: {
+										scanned: result.scanned,
+										live: result.live,
+										collected: result.collected,
+									},
+								})
+							} catch (error) {
+								syncServer.getLogger().log({
+									timestamp: Date.now(),
+									level: 'warn',
+									event: 'server.blob_gc_failed',
+									details: { message: error instanceof Error ? error.message : String(error) },
+								})
+							} finally {
+								running = false
+							}
+						})()
+					}
+					// The first sweep waits a little, so a restart loop never turns into a sweep loop.
+					blobSweepStart = setTimeout(run, 15 * 60 * 1000)
+					blobSweepStart.unref?.()
+					blobSweep = setInterval(run, intervalMs)
+					blobSweep.unref?.()
+				}
+			} else if (
+				process.env.NODE_ENV === 'production' &&
+				!wiresBlobsItself &&
+				config.blobStore !== false
+			) {
+				syncServer.getLogger().log({
+					timestamp: Date.now(),
+					level: 'info',
+					event: 'server.blob_store_none',
+					details: {
+						message:
+							'No file store: uploaded files (t.blob() fields) stay on devices only. Set KORA_BLOB_STORE_URL or KORA_BLOB_DIR to keep them on the server.',
 					},
 				})
 			}
@@ -1107,6 +1201,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		},
 
 		async stop(): Promise<void> {
+			if (blobSweepStart) clearTimeout(blobSweepStart)
+			if (blobSweep) clearInterval(blobSweep)
+			blobSweepStart = null
+			blobSweep = null
 			await syncServer.stop()
 			if (httpServer) {
 				await new Promise<void>((resolve) => {
@@ -1116,6 +1214,26 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			}
 		},
 	}
+}
+
+/**
+ * The store a production server keeps file bytes in: none when the app wires blob handling
+ * itself or passes `blobStore: false`, the one it passes, or else the one the host names in
+ * `KORA_BLOB_STORE_URL` / `KORA_BLOB_DIR`.
+ *
+ * @internal Exported for tests.
+ */
+export function resolveServerBlobStore(
+	config: Pick<ProductionServerConfig, 'blobStore' | 'syncOptions'>,
+	env: Readonly<Record<string, string | undefined>>,
+): ContentAddressedBlobStore | null {
+	if (
+		config.syncOptions?.persistBlobChunk !== undefined ||
+		config.syncOptions?.resolveBlobChunk !== undefined
+	)
+		return null
+	if (config.blobStore === false) return null
+	return config.blobStore ?? openBlobStoreFromEnv(env)
 }
 
 /** Bodies of read requests being received at once, per pool (cached principals, others). */

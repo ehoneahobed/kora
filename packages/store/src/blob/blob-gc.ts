@@ -18,6 +18,35 @@ export interface BlobGcResult {
 export interface BlobGcOptions {
 	/** Compute what would be collected without deleting anything. */
 	dryRun?: boolean
+	/**
+	 * Unreferenced blobs written within this long are kept (default 24 hours). A device
+	 * uploads a blob's bytes before the record that points at it, and the record can
+	 * arrive much later (the device went offline in between), so a blob is only garbage
+	 * once it has had time to be claimed. Applies to stores that report write times
+	 * (`FilesystemBlobStore`, `ObjectBlobStore`); others are swept as before.
+	 */
+	graceMs?: number
+	/** The current time, for tests. */
+	now?: number
+}
+
+/** The default {@link BlobGcOptions.graceMs}: a day. */
+export const DEFAULT_BLOB_GC_GRACE_MS = 24 * 60 * 60 * 1000
+
+/** A store that knows when each blob was last written, and can delete only older ones atomically. */
+interface WriteTimedBlobStore {
+	lastWrittenAt(hash: string): Promise<number | null>
+	deleteIfWrittenBefore(hash: string, cutoffMs: number): Promise<boolean>
+}
+
+function hasWriteTimes(
+	store: ContentAddressedBlobStore,
+): store is ContentAddressedBlobStore & WriteTimedBlobStore {
+	const candidate = store as Partial<WriteTimedBlobStore>
+	return (
+		typeof candidate.lastWrittenAt === 'function' &&
+		typeof candidate.deleteIfWrittenBefore === 'function'
+	)
 }
 
 /**
@@ -87,8 +116,21 @@ export async function collectBlobGarbage(
 
 	const all = await store.list()
 	const collectedHashes: string[] = []
+	const graceMs = options.graceMs ?? DEFAULT_BLOB_GC_GRACE_MS
+	const cutoff = (options.now ?? Date.now()) - graceMs
+	const timed = graceMs > 0 && hasWriteTimes(store) ? store : null
 	for (const hash of all) {
 		if (live.has(hash)) {
+			continue
+		}
+		if (timed) {
+			if (options.dryRun) {
+				const writtenAt = await timed.lastWrittenAt(hash)
+				if (writtenAt === null || writtenAt >= cutoff) continue
+			} else if (!(await timed.deleteIfWrittenBefore(hash, cutoff))) {
+				continue
+			}
+			collectedHashes.push(hash)
 			continue
 		}
 		collectedHashes.push(hash)

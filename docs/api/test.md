@@ -74,9 +74,52 @@ Merge decisions are recorded in the device's audit trail as in an app.
 ## TestServer
 
 `new TestServer(schema, options?)` with `store`, `schemaVersion`, `supportedSchemaVersions`,
-`operationTransforms`, `encryption`, `blobStorage`, `validateOperation`. Members: `store`, `ready`,
+`operationTransforms`, `encryption`, `blobStorage`, `validateOperation`, `auth`. Members: `store`, `ready`,
 `blobStore`, `getAllOperations()`, `getKoraContext()` (the route context), `authoritativeNodeIds`,
 `getConnectionCount()`, `retransmitPendingRelays()`, `getLiveBlobRefs()`, `close()`.
+
+## Testing access rules across users
+
+Give the server `auth: true` and each device a `user`. A device's sessions then present its user id as their token, and its store is bound to that user, so the schema's access rules decide what each device receives and may write, exactly as in production. Pass an `AuthProvider` as `auth` to use your own.
+
+```typescript
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { defineSchema, owner, t } from '@korajs/core'
+import { createServerTransportPair } from '@korajs/server/internal'
+import type { SyncTransport } from '@korajs/sync'
+import { TestDevice, TestServer } from '@korajs/test'
+import { expect } from 'vitest'
+
+const schema = defineSchema({
+  version: 1,
+  collections: {
+    notes: {
+      fields: { body: t.string(), ownerId: t.string().stamp('userId') },
+      access: { read: owner('ownerId'), write: owner('ownerId') },
+    },
+  },
+})
+const tmpDir = mkdtempSync(join(tmpdir(), 'access-test-'))
+const createTransportPair = () => {
+  const pair = createServerTransportPair()
+  return { client: pair.client as unknown as SyncTransport, serverTransport: pair.server }
+}
+
+const server = new TestServer(schema, { auth: true })
+await server.ready
+const alice = new TestDevice({ name: 'alice-laptop', user: 'alice', schema, server, tmpDir, createTransportPair })
+const bob = new TestDevice({ name: 'bob-laptop', user: 'bob', schema, server, tmpDir, createTransportPair })
+await alice.open()
+await bob.open()
+await alice.collection('notes').insert({ body: 'private' })
+await alice.sync()
+await bob.sync()
+expect(await bob.collection('notes').where({}).exec()).toEqual([])
+```
+
+Build tests on these public options rather than assembling stores and sync engines from internals, which change between releases.
 
 ## Convergence assertions
 

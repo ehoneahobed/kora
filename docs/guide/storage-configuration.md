@@ -415,25 +415,27 @@ Switching storage backends does not migrate data. If you have existing data in S
 
 ## Where a server keeps blobs
 
-A server that accepts the bytes behind `t.blob()` fields needs a durable place for them. Let the host choose it, so your code never names a provider:
-
-```typescript
-import { createProductionServer, createSqliteServerStore } from '@korajs/server'
-import { toServerBlobCallbacks } from '@korajs/store'
-import { openBlobStoreFromEnv } from '@korajs/store/blob-object'
-
-const store = createSqliteServerStore({ filename: './kora-server.db' })
-const blobs = openBlobStoreFromEnv(process.env)
-const server = createProductionServer({
-	store,
-	syncOptions: blobs ? toServerBlobCallbacks(blobs) : {},
-})
-```
+A server that accepts the bytes behind `t.blob()` fields needs a durable place for them. `createProductionServer` uses the store the host names in its environment, so your code never names a provider and needs no code at all:
 
 | Configuration | Store |
 |---|---|
 | `KORA_BLOB_STORE_URL=s3://<bucket>` with `KORA_BLOB_STORE_ACCESS_KEY_ID` and `KORA_BLOB_STORE_SECRET_ACCESS_KEY` | S3, or a compatible service with `KORA_BLOB_STORE_ENDPOINT` and `KORA_BLOB_STORE_REGION` |
 | `KORA_BLOB_STORE_URL=https://<account>.blob.core.windows.net/<container>` | Azure Blob Storage, using the workload's managed identity (`AZURE_CLIENT_ID` picks one) |
 | `KORA_BLOB_DIR=/path` | A directory, which must survive restarts |
+| neither | No file bytes on the server: files stay on the devices that have them |
+
+Hosts such as Kora Cloud set these for you. Don't invent a setting of your own for a storage path, and don't write files to the container's disk: on most hosts it is replaced on every deploy, and backups don't include it.
+
+To choose in code instead, pass `blobStore` (any `ContentAddressedBlobStore`), or `blobStore: false` to keep none:
+
+```typescript
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import { FilesystemBlobStore } from '@korajs/store/blob-fs'
+
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+const server = createProductionServer({ store, blobStore: new FilesystemBlobStore('/data/files') })
+```
+
+The server sweeps bytes that no live record points at once a day. A blob uploaded within the last day is kept even if nothing points at it yet, because its record may still be on its way from a device that went offline in between. Tune it with `blobGarbageCollection: { intervalHours, graceHours }`, or turn it off with `blobGarbageCollection: false`. To sweep yourself, `collectBlobGarbage(store, await server.getLiveBlobRefs())` from `@korajs/store/blob-object` applies the same grace period.
 
 Every object store keeps blobs at `<hash[0:2]>/<hash>`, the same layout as a directory, so you can move between them by copying paths. To add a provider, implement `ObjectStorageBackend` and pass it to `ObjectBlobStore`. S3-compatible services need conditional writes and deletes (`If-None-Match` and `If-Match`).

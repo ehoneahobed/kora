@@ -309,6 +309,7 @@ export {
 } from './blob/server-blob-callbacks'
 export {
 	collectBlobGarbage,
+	DEFAULT_BLOB_GC_GRACE_MS,
 	extractBlobRefs,
 	type BlobGcOptions,
 	type BlobGcResult,
