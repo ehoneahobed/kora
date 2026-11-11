@@ -2988,6 +2988,8 @@ export class ClientSession {
 
 		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
 		this.clientDeliveryWatermark = msg.lastDeliverySequence ?? null
+		// The anchor that goes with whichever watermark this session resumes from.
+		let clientDeliveryAnchor = deliveryAnchorField(msg.lastDeliveryAnchor)
 		this.clientAccessRulesKey = typeof msg.accessRulesKey === 'string' ? msg.accessRulesKey : null
 		// A delivery watermark is valid only for the exact server-visible view that
 		// earned it. `lastDeliverySequence` belongs to the scope the client REQUESTED.
@@ -3014,6 +3016,7 @@ export class ClientSession {
 				msg.acceptedScopeKey ===
 					scopeViewKey(this.clientFacingScopes(this.authContext?.downlinkScopes))
 			this.clientDeliveryWatermark = resumable ? acceptedWatermark : 0
+			clientDeliveryAnchor = resumable ? deliveryAnchorField(msg.acceptedScopeAnchor) : null
 		}
 
 		// Only read the server's delivery frontier when the client actually uses the
@@ -3079,6 +3082,39 @@ export class ClientSession {
 					sessionId: this.sessionId,
 					nodeId: msg.nodeId,
 				})
+			}
+		}
+
+		// A watermark within the frontier can still belong to another log: one rewound by a
+		// restore (Kora's, or a database-level one Kora never saw) and then written past the
+		// client's position again. The newest operation at or below the watermark tells them
+		// apart: the client's anchor names the one it was in step with. Another operation
+		// there means the client would skip what was written since the restore, so it is
+		// resynced from 0 exactly as an operator-forced resync is (advertised just below
+		// its watermark, which every watermark client resets on).
+		if (
+			this.clientDeliveryWatermark !== null &&
+			this.clientDeliveryWatermark > 0 &&
+			clientDeliveryAnchor !== null &&
+			this.store.getDeliveryAnchor
+		) {
+			const expected = await this.store.getDeliveryAnchor(this.clientDeliveryWatermark)
+			if (expected !== clientDeliveryAnchor) {
+				const reported = [
+					msg.lastDeliverySequence,
+					msg.acceptedScopeWatermark,
+					this.clientDeliveryWatermark,
+				].filter((value): value is number => typeof value === 'number' && value > 0)
+				advertisedMaxDelivery = Math.min(advertisedMaxDelivery, Math.min(...reported) - 1)
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'info',
+					event: 'session.delivery_log_rewound',
+					sessionId: this.sessionId,
+					nodeId: msg.nodeId,
+					details: { watermark: this.clientDeliveryWatermark },
+				})
+				this.clientDeliveryWatermark = 0
 			}
 		}
 
@@ -4950,7 +4986,10 @@ export class ClientSession {
 				isFinal ? Math.max(maxScanned, lastSeq, reservedFrontier) : lastSeq,
 				ceiling,
 			)
-			this.sendDeliveryBatch(slice, base, max, batchIndex, isFinal)
+			// Every operation at or below `max` is committed (sequences follow commit order), so
+			// the newest one there is fixed: the client's proof of which log it is in step with.
+			const anchor = this.store.getDeliveryAnchor ? await this.store.getDeliveryAnchor(max) : null
+			this.sendDeliveryBatch(slice, base, max, batchIndex, isFinal, anchor)
 			batchIndex += 1
 			base = max
 			sentOperations += slice.filter(
@@ -5712,6 +5751,7 @@ export class ClientSession {
 		max: number,
 		batchIndex: number,
 		isFinal: boolean,
+		anchor: string | null = null,
 	): boolean {
 		// Every delivered batch passes here: rules installed mid-stream stop it.
 		if (this.refuseIfAccessUnenforceable()) return false
@@ -5754,6 +5794,7 @@ export class ClientSession {
 			batchIndex,
 			baseDeliverySequence: base,
 			maxDeliverySequence: max,
+			...(anchor !== null ? { deliveryAnchor: anchor } : {}),
 		}
 		// Delivery batches are NOT tracked in the bounded pending-relay buffer: recovery of
 		// a dropped or unapplied batch is by re-scan from the client's acknowledged
@@ -7512,4 +7553,9 @@ export function splitRelayForUnorderedRetractions(
 function endUnit(unit: DeliverableOperation[]): void {
 	const last = unit[unit.length - 1]
 	if (last) last.scopeEntry = false
+}
+
+/** A reported delivery anchor, or null when absent or not an operation id. */
+function deliveryAnchorField(value: unknown): string | null {
+	return typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : null
 }

@@ -17,7 +17,11 @@ this design, with these concrete choices worth noting:
 - The watermark advances live during streaming (not only at handshake), so a reconnect
   resends only the true delta. A client's own operations are not echoed back during
   streaming but are included in a full resync for disaster recovery. A client whose
-  watermark is ahead of the server frontier (backup restore) resets to a full resync.
+  watermark is ahead of the server frontier (backup restore) resets to a full resync. A client
+  whose watermark is within the frontier but whose delivery anchor (the newest operation at or
+  below the watermark, sent with the batch that set it) no longer matches the server's log was
+  passed by writes made after a restore; the server resyncs it from 0 the same way. This needs no
+  record of the restore, so database-level restores Kora never saw are covered too.
 - Streaming pushes resume from the client's last ACKNOWLEDGED delivery sequence, not the
   last sent, so a dropped or unapplied batch is re-included by the next push or the
   retransmit tick. Delivery batches are therefore not held in the bounded relay buffer;

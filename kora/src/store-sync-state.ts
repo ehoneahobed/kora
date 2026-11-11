@@ -10,6 +10,7 @@ import type { Store } from '@korajs/store'
 import { decodeDeltaCursor, encodeDeltaCursor, operationMatchesScope } from '@korajs/sync'
 import type {
 	AdoptionScheduleInfo,
+	DeliveryAnchorRecord,
 	DeltaCursor,
 	LocalNodeInfo,
 	QuarantinedOperation,
@@ -99,6 +100,14 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 
 	async deleteDeliveryWatermark(signature: string): Promise<void> {
 		await this.store.deleteDeliveryWatermark(signature)
+	}
+
+	loadDeliveryAnchors(): Promise<Record<string, DeliveryAnchorRecord>> {
+		return this.store.loadDeliveryAnchors()
+	}
+
+	async saveDeliveryAnchor(signature: string, record: DeliveryAnchorRecord): Promise<void> {
+		await this.store.saveDeliveryAnchor(signature, record)
 	}
 
 	loadAccessRulesKey(): Promise<string | null> {

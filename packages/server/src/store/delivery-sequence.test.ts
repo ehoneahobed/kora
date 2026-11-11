@@ -105,6 +105,34 @@ function runDeliveryContract(name: string, makeStore: () => Promise<ServerStore>
 			await store.close()
 		})
 
+		test('getDeliveryAnchor names the newest operation at or below a sequence', async () => {
+			const store = await makeStore()
+			expect(await store.getDeliveryAnchor?.(5)).toBeNull()
+			for (const id of ['anchor-a', 'anchor-b', 'anchor-c'])
+				await store.applyRemoteOperation(op({ id }))
+			const delivered = await store.getOperationsAfterDelivery(0, 100)
+			const [first, second, third] = delivered.map((entry) => entry.deliverySequence)
+			expect(await store.getDeliveryAnchor?.(first as number)).toBe('anchor-a')
+			expect(await store.getDeliveryAnchor?.(second as number)).toBe('anchor-b')
+			expect(await store.getDeliveryAnchor?.((third as number) + 10)).toBe('anchor-c')
+			expect(await store.getDeliveryAnchor?.(0)).toBeNull()
+			await store.close()
+		})
+
+		test('a replace-mode restore written past again holds another operation at a position', async () => {
+			const store = await makeStore()
+			for (const id of ['keep-1', 'keep-2']) await store.applyRemoteOperation(op({ id }))
+			const backup = await store.exportBackup()
+			await store.applyRemoteOperation(op({ id: 'lost-3' }))
+			const position = await store.getMaxDeliverySequence()
+			expect(await store.getDeliveryAnchor?.(position)).toBe('lost-3')
+			await store.importBackup(backup, false)
+			await store.applyRemoteOperation(op({ id: 'new-3' }))
+			expect(await store.getMaxDeliverySequence()).toBeGreaterThanOrEqual(position)
+			expect(await store.getDeliveryAnchor?.(position)).not.toBe('lost-3')
+			await store.close()
+		})
+
 		test('a duplicate does not advance the delivery stream twice', async () => {
 			const store = await makeStore()
 			const a = op({ id: 'dup-1' })
@@ -274,6 +302,20 @@ describe.skipIf(!PG_URL)('postgres delivery sequence', () => {
 		const client = postgres(PG_URL as string, { max: 6, connection: { search_path: PG_SCHEMA } })
 		return new PostgresServerStore(drizzle(client), nodeId)
 	}
+
+	test('getDeliveryAnchor reads the newest operation at or below a sequence', async () => {
+		const store = makeStore('server-anchor')
+		for (const id of ['pg-anchor-a', 'pg-anchor-b']) await store.applyRemoteOperation(op({ id }))
+		const delivered = await store.getOperationsAfterDelivery(0, 100)
+		expect(await store.getDeliveryAnchor(delivered[0]?.deliverySequence as number)).toBe(
+			'pg-anchor-a',
+		)
+		expect(await store.getDeliveryAnchor((delivered[1]?.deliverySequence as number) + 5)).toBe(
+			'pg-anchor-b',
+		)
+		expect(await store.getDeliveryAnchor(0)).toBeNull()
+		await store.close()
+	})
 
 	test('assigns monotonic delivery sequences with no visibility gap under concurrency', async () => {
 		// Two instances sharing one database append concurrently. The counter row locked

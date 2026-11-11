@@ -78,6 +78,14 @@ export interface HandshakeMessage {
 	 */
 	lastDeliverySequence?: number
 	/**
+	 * The delivery anchor (`OperationBatchMessage.deliveryAnchor`) of the batch that took
+	 * `lastDeliverySequence` to its value. The server compares it with its own log: a
+	 * different operation there means the log was rewound (a restored database) and the
+	 * client is resynced from 0, so operations written after the restore are never
+	 * skipped. Optional: omitted when unknown, and old servers ignore it.
+	 */
+	lastDeliveryAnchor?: string
+	/**
 	 * SYNC-11: canonical key (`scopeViewKey`) of the downlink scope the server accepted at
 	 * this client's last handshake, when it differs from `syncScope`. A server that
 	 * resolves a scope with the same key resumes the delivery stream from
@@ -87,6 +95,8 @@ export interface HandshakeMessage {
 	acceptedScopeKey?: string
 	/** The client's delivery watermark for the view named by `acceptedScopeKey`. */
 	acceptedScopeWatermark?: number
+	/** The delivery anchor that goes with `acceptedScopeWatermark` (see `lastDeliveryAnchor`). */
+	acceptedScopeAnchor?: string
 	/**
 	 * Access rules: the key of the read rules this client was last fully re-scoped under
 	 * (`OperationBatchMessage.accessRulesKey`). A server running other rules re-scopes it.
@@ -309,6 +319,14 @@ export interface OperationBatchMessage {
 	 */
 	baseDeliverySequence?: number
 	maxDeliverySequence?: number
+	/**
+	 * The id of the newest operation in the server's log at or below `maxDeliverySequence`,
+	 * whether or not it is in this client's scope. The client keeps it with the watermark
+	 * it advances to and reports it at its next handshake (`lastDeliveryAnchor`), which is
+	 * how a server whose log was rewound by any kind of restore recognizes the client is
+	 * ahead of it. Optional: absent from old servers and from logs with no operation yet.
+	 */
+	deliveryAnchor?: string
 	/**
 	 * The delivery position of each of `operations`, in order: its delivery sequence, or
 	 * for a scope entry its trigger's sequence + 0.5 (after a retraction at that

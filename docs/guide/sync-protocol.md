@@ -74,6 +74,12 @@ has applied, or durably quarantined, every in-scope operation with no gap.
 - The handshake reports the watermark (`lastDeliverySequence`), and the server resumes just after
   it. A server whose log was rolled back (a restore) reports `serverMaxDeliverySequence` below the
   client's watermark; the client then resets to 0 and resyncs.
+- Each delivery batch carries `deliveryAnchor`: the id of the newest operation in the server's log
+  at or below `maxDeliverySequence`. The client keeps it with the watermark it advanced to and
+  reports it at handshake (`lastDeliveryAnchor`, and `acceptedScopeAnchor` for the accepted view),
+  only while it belongs to exactly the reported watermark. A server holding another operation at
+  that position was rewound and written past it again (any restore, including a database-level
+  one), and resyncs the client from 0 through the same advertised-frontier reset.
 - `acceptedScopeKey` and `acceptedScopeWatermark` resume an auth-scoped client's accepted view
   after a reconnect instead of restarting it.
 - First sync streams in chunks with backpressure: the server pauses a client's stream above

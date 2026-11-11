@@ -1004,6 +1004,15 @@ export interface ServerStore extends SyncStore {
 	getMaxDeliverySequence(): Promise<number>
 
 	/**
+	 * The id of the newest operation whose delivery sequence is at most
+	 * `throughDeliverySequence`, or null when there is none. This is a client's delivery
+	 * anchor: the same position in a rewound log (any restore, including a database-level
+	 * one Kora never saw) holds a different operation, or none. Optional: a store without
+	 * it never compares anchors, which leaves the frontier check as the only rewind check.
+	 */
+	getDeliveryAnchor?(throughDeliverySequence: number): Promise<string | null>
+
+	/**
 	 * Operations with `deliverySequence > afterDeliverySequence`, ordered ascending
 	 * by delivery sequence, at most `limit` of them. This is the substrate for the
 	 * gap-free server->client stream: the caller (a client session) applies its own

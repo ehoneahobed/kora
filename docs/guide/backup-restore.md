@@ -213,7 +213,16 @@ keyring (see [Sync Encryption](/guide/sync-encryption#lost-key-records-and-forke
 After a server is restored from an older backup, connected devices notice that the server holds
 fewer of their operations than it had acknowledged and re-upload them
 (`sync:local-node`, `server-behind`), and devices whose delivery watermark is now ahead of the
-server resync from the start. With access rules, a replace-mode restore also ends every live session
+server resync from the start.
+
+This holds however the server was restored, with nothing to configure: `kora backup restore`, a
+`pg_restore` of a database dump, PostgreSQL point-in-time recovery, or a copy of a SQLite file or a
+disk snapshot. Each delivery batch carries a *delivery anchor*, the id of the newest operation at
+or below the device's new watermark, and the device reports it when it reconnects. If the server
+holds a different operation there (it was restored, then written past the device's position
+again), it resyncs that device from the start instead of resuming above writes the device never
+received. Operations the device already has are skipped by id, so the resync costs bandwidth, not
+correctness. A device or server from before anchors behaves as it did. With access rules, a replace-mode restore also ends every live session
 (retriable `ACCESS_RULES_CHANGED`) so each device reconnects and is re-scoped under the restored
 memberships; on another server instance this happens at its next delivery poll. If you restore by
 calling `store.importBackup(...)` yourself, call `server.revalidateAccessSessions()` afterwards.

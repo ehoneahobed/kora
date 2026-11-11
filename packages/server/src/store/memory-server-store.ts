@@ -1295,6 +1295,18 @@ export class MemoryServerStore implements ServerStore {
 		return this.deliverySeqCounter
 	}
 
+	async getDeliveryAnchor(throughDeliverySequence: number): Promise<string | null> {
+		this.assertOpen()
+		// `operations` is in delivery order, so the newest one at or below is found from the end.
+		for (let index = this.operations.length - 1; index >= 0; index--) {
+			const operation = this.operations[index]
+			if (operation && (this.deliverySeqByOpId.get(operation.id) ?? 0) <= throughDeliverySequence) {
+				return operation.id
+			}
+		}
+		return null
+	}
+
 	async getOperationsAfterDelivery(
 		afterDeliverySequence: number,
 		limit: number,
