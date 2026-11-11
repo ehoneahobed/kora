@@ -1,4 +1,4 @@
-import { defineCommand, runMain } from 'citty'
+import { defineCommand } from 'citty'
 import { agentsCommand } from './commands/agents/agents-command'
 import { backupCommand } from './commands/backup/backup-command'
 import { compactCommand } from './commands/compact/compact-command'
@@ -13,6 +13,8 @@ import { migrateCommand } from './commands/migrate/migrate-command'
 import { statusCommand } from './commands/status/status-command'
 import { studioCommand } from './commands/studio/studio-command'
 import { upgradeCommand } from './commands/upgrade/upgrade-command'
+import { foldOptionValues } from './utils/argv'
+import { runCli } from './utils/run-cli'
 
 const main = defineCommand({
 	meta: {
@@ -39,4 +41,4 @@ const main = defineCommand({
 	},
 })
 
-runMain(main)
+void runCli(main, foldOptionValues(process.argv.slice(2)))
