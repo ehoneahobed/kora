@@ -25,6 +25,7 @@ const mockRollback = vi.fn()
 const mockLogs = vi.fn()
 const mockStatus = vi.fn()
 const mockSetContext = vi.fn()
+const mockReadProjectLink = vi.fn()
 let loggerMock: {
 	banner: ReturnType<typeof vi.fn>
 	info: ReturnType<typeof vi.fn>
@@ -86,6 +87,10 @@ vi.mock('./adapters/fly-adapter', () => ({
 		status: mockStatus,
 		setContext: mockSetContext,
 	})),
+}))
+
+vi.mock('../../cloud/project-link', () => ({
+	readProjectLink: mockReadProjectLink,
 }))
 
 vi.mock('./adapters/factory', () => ({
@@ -340,6 +345,50 @@ describe('deployCommand', () => {
 			lastDeploymentId: 'dep-1',
 		})
 		expect(mockWriteDeployState).not.toHaveBeenCalled()
+	})
+
+	test('a folder linked to a Kora Cloud project deploys with --confirm and no --app (CI)', async () => {
+		mockReadProjectLink.mockResolvedValue({ organizationId: 'org_1', projectId: 'prj_1' })
+		const { deployCommand } = await import('./deploy-command')
+		await (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.(
+			asRunContext({
+				args: {
+					_: [],
+					platform: 'kora-cloud',
+					app: '',
+					region: '',
+					reset: false,
+					confirm: true,
+					prod: true,
+				},
+				rawArgs: [],
+				cmd: deployCommand,
+			}),
+		)
+		expect(mockSetContext).toHaveBeenCalledWith(expect.objectContaining({ appName: 'project' }))
+		expect(mockDeploy).toHaveBeenCalled()
+	})
+
+	test('an unlinked folder still needs --app in --confirm mode, and is told so plainly', async () => {
+		mockReadProjectLink.mockResolvedValue(null)
+		const { deployCommand } = await import('./deploy-command')
+		const { CliError } = await import('../../errors')
+		const run = (deployCommand.run as ((ctx: unknown) => Promise<void>) | undefined)?.(
+			asRunContext({
+				args: {
+					_: [],
+					platform: 'kora-cloud',
+					app: '',
+					region: '',
+					reset: false,
+					confirm: true,
+					prod: true,
+				},
+				rawArgs: [],
+				cmd: deployCommand,
+			}),
+		)
+		await expect(run).rejects.toBeInstanceOf(CliError)
 	})
 
 	test('fails fast in confirm mode when app and region are missing', async () => {
