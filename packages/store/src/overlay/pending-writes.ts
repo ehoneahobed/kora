@@ -1029,7 +1029,11 @@ export class PendingWrites {
 		for (const entry of this.entries.values()) {
 			if (entry.collection === collection && entry.recordId === id) newest = entry
 		}
-		if (newest && !this.isOutdated(newest)) {
+		if (newest) {
+			// A foreign change touched the record after its newest entry was added: that entry is
+			// older than the database on fields it did not write, and a cached row is older still
+			// (it predates the entry's own write). Only a read sees both, so the next write reads.
+			if (this.isOutdated(newest)) return { found: 'none' }
 			return newest.kind === 'delete'
 				? { found: 'deleted' }
 				: { found: 'record', record: newest.record, source: 'pending' }
