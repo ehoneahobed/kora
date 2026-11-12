@@ -318,6 +318,21 @@ describe('PendingWrites base lookup and committed-row cache (5.6)', () => {
 		expect(registry.baseFor('todos', 'a')).toMatchObject({ record: { n: 0 } })
 	})
 
+	test('after a foreign change, an entry and an older cached row are not a base: the next write reads', () => {
+		const { registry } = make()
+		const insert = added(registry, change('insert', 'a', { title: 'seed', n: 0 }))
+		registry.commit(insert.writeId, { record: record('a', { title: 'seed', n: 0 }) })
+		const retitle = added(registry, change('update', 'a', { title: 't0', n: 0 }), insert.writeId)
+		// A remote write of the record lands while the retitle is pending...
+		registry.invalidate('todos', ['a'])
+		// ...and a read issued before the retitle finishes late, caching the row without it.
+		registry.cacheRecord('todos', record('a', { title: 'seed', n: 1 }))
+		// Neither the outdated entry nor that row holds both changes: building on the row would
+		// drop the pending title. Only a read sees the retitle and the remote write together.
+		expect(registry.baseFor('todos', 'a')).toEqual({ found: 'none' })
+		expect(registry.pendingFor('todos', 'a')?.writeId).toBe(retitle.writeId)
+	})
+
 	test('a pending delete makes the record deleted', () => {
 		const { registry } = make()
 		added(registry, change('delete', 'a'))
