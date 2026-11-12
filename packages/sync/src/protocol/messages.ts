@@ -185,6 +185,58 @@ export interface HeartbeatMessage {
 }
 
 /**
+ * A device's own sync health, sent to a server that set
+ * `HandshakeResponseMessage.acceptsDeviceStatus`: on connect, then whenever one of these
+ * changes. Counts and a failure code only, never an operation id, record id or value, so
+ * an operator can see that devices are stuck without seeing their data. Never acknowledged.
+ */
+export interface DeviceStatusMessage {
+	type: 'device-status'
+	messageId: string
+	/** Delivery is stalled on an operation this device can't apply yet (`sync:apply-blocked`). */
+	applyBlocked: boolean
+	/** The blocking failure's code (such as `MISSING_TRANSFORM`), when `applyBlocked`. */
+	blockedCode?: string
+	/** Operations this device received but set aside to apply later (its inbound quarantine). */
+	quarantined: number
+	/** Local writes waiting to upload. */
+	pendingOperations: number
+	/** Local writes held for another user or until the app assigns them (RT-38). */
+	heldOperations: number
+	/** `degraded` when the local database couldn't be made durable (RT-49). */
+	localDurability: 'durable' | 'degraded'
+}
+
+/** The largest count a device status carries; anything larger is refused as malformed. */
+const DEVICE_STATUS_MAX_COUNT = 1_000_000_000
+
+/**
+ * Check if a value is a DeviceStatusMessage. Strict: it arrives from a device and is stored
+ * and shown to operators, so only bounded counts and a short upper-case code pass.
+ */
+export function isDeviceStatusMessage(value: unknown): value is DeviceStatusMessage {
+	if (typeof value !== 'object' || value === null) return false
+	const msg = value as Record<string, unknown>
+	const count = (candidate: unknown): boolean =>
+		typeof candidate === 'number' &&
+		Number.isSafeInteger(candidate) &&
+		candidate >= 0 &&
+		candidate <= DEVICE_STATUS_MAX_COUNT
+	return (
+		msg.type === 'device-status' &&
+		typeof msg.messageId === 'string' &&
+		msg.messageId.length <= 128 &&
+		typeof msg.applyBlocked === 'boolean' &&
+		(msg.blockedCode === undefined ||
+			(typeof msg.blockedCode === 'string' && /^[A-Z0-9_]{1,64}$/.test(msg.blockedCode))) &&
+		count(msg.quarantined) &&
+		count(msg.pendingOperations) &&
+		count(msg.heldOperations) &&
+		(msg.localDurability === 'durable' || msg.localDurability === 'degraded')
+	)
+}
+
+/**
  * Server response to a handshake.
  */
 export interface HandshakeResponseMessage {
@@ -242,6 +294,11 @@ export interface HandshakeResponseMessage {
 	 * `supportsHeartbeat` and the server sends them (LMS #12).
 	 */
 	heartbeatIntervalMs?: number
+	/**
+	 * The server records device health: the client may send {@link DeviceStatusMessage}s.
+	 * A client never sends one to a server that didn't say so.
+	 */
+	acceptsDeviceStatus?: boolean
 	/**
 	 * Sync protocol version the server speaks. Absent means 1 (a beta.12-era server).
 	 * Protobuf field 47.
@@ -546,6 +603,7 @@ export type SyncMessage =
 	| BlobChunkPushMessage
 	| HeartbeatMessage
 	| EncryptionKeyMessage
+	| DeviceStatusMessage
 
 // --- Type Guards ---
 
@@ -581,6 +639,8 @@ export function isSyncMessage(value: unknown): value is SyncMessage {
 			return isBlobChunkPushMessage(value)
 		case 'heartbeat':
 			return true
+		case 'device-status':
+			return isDeviceStatusMessage(value)
 		case 'encryption-key-request':
 		case 'encryption-key-put':
 		case 'encryption-key-response':

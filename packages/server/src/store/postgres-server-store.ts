@@ -232,7 +232,12 @@ import {
 	fullResyncUserKey,
 	newestFullResyncToken,
 } from './server-store'
-import { type DeviceActivity, type StoreInsights, readStoreInsights } from './store-insights'
+import {
+	type DeviceActivity,
+	type DeviceHealth,
+	type StoreInsights,
+	readStoreInsights,
+} from './store-insights'
 import {
 	PG_TEXT_CODEC_MIGRATION_KEY,
 	deserializePgFieldValue,
@@ -1740,6 +1745,24 @@ export class PostgresServerStore implements ServerStore {
 				last_seen_at = GREATEST(kora_device_activity.last_seen_at, EXCLUDED.last_seen_at),
 				protocol_version = COALESCE(EXCLUDED.protocol_version, kora_device_activity.protocol_version),
 				delivery_watermark = COALESCE(EXCLUDED.delivery_watermark, kora_device_activity.delivery_watermark)
+		`)
+	}
+
+	async recordDeviceHealth(health: DeviceHealth): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		await this.db.execute(sql`
+			INSERT INTO kora_device_activity (node_id, first_seen_at, last_seen_at, health_at, apply_blocked, blocked_code, quarantined, pending_operations, held_operations, storage_degraded)
+			VALUES (${health.nodeId}, ${health.reportedAt}, ${health.reportedAt}, ${health.reportedAt}, ${health.applyBlocked ? 1 : 0}, ${health.blockedCode}, ${health.quarantined}, ${health.pendingOperations}, ${health.heldOperations}, ${health.storageDegraded ? 1 : 0})
+			ON CONFLICT (node_id) DO UPDATE SET
+				last_seen_at = GREATEST(kora_device_activity.last_seen_at, EXCLUDED.last_seen_at),
+				health_at = EXCLUDED.health_at,
+				apply_blocked = EXCLUDED.apply_blocked,
+				blocked_code = EXCLUDED.blocked_code,
+				quarantined = EXCLUDED.quarantined,
+				pending_operations = EXCLUDED.pending_operations,
+				held_operations = EXCLUDED.held_operations,
+				storage_degraded = EXCLUDED.storage_degraded
 		`)
 	}
 
@@ -5481,6 +5504,18 @@ export class PostgresServerStore implements ServerStore {
 					delivery_watermark BIGINT
 				)
 			`)
+			// What each device last reported about its own sync (a device-status message).
+			for (const [column, definition] of [
+				['health_at', 'BIGINT'],
+				['apply_blocked', 'INTEGER'],
+				['blocked_code', 'TEXT'],
+				['quarantined', 'INTEGER'],
+				['pending_operations', 'INTEGER'],
+				['held_operations', 'INTEGER'],
+				['storage_degraded', 'INTEGER'],
+			] as const) {
+				await addColumn('kora_device_activity', column, definition)
+			}
 			await tx.execute(sql`
 				INSERT INTO kora_device_activity (node_id, first_seen_at, last_seen_at)
 				SELECT node_id, last_seen_at, last_seen_at FROM sync_state WHERE node_id NOT LIKE ${`${SERVER_NODE_PREFIX}%`}

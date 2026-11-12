@@ -20,7 +20,7 @@ import type {
 	DeliverySources,
 } from './delivery-partitions'
 import type { RecordLiveViewsState } from './live-views'
-import type { DeviceActivity, StoreInsights } from './store-insights'
+import type { DeviceActivity, DeviceHealth, StoreInsights } from './store-insights'
 
 /** Rejection code for a second, different operation under an existing (node, sequence). */
 export const SEQUENCE_CONFLICT_CODE = 'SEQUENCE_CONFLICT'
@@ -754,6 +754,8 @@ export interface ServerStore extends SyncStore {
 	 */
 	/** Remembers that a device connected. Optional for custom stores, and never allowed to affect sync. */
 	recordDeviceActivity?(activity: DeviceActivity): Promise<void>
+	/** Remembers what a device reported about its own sync. Optional, and never allowed to affect sync. */
+	recordDeviceHealth?(health: DeviceHealth): Promise<void>
 	/** Aggregates for operators, with no record values. Optional for custom stores. */
 	getStoreInsights?(now: number): Promise<StoreInsights>
 	claimNode?(nodeId: string, userId: string): Promise<boolean>

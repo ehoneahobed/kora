@@ -229,7 +229,12 @@ import {
 	fullResyncUserKey,
 	newestFullResyncToken,
 } from './server-store'
-import { type DeviceActivity, type StoreInsights, readStoreInsights } from './store-insights'
+import {
+	type DeviceActivity,
+	type DeviceHealth,
+	type StoreInsights,
+	readStoreInsights,
+} from './store-insights'
 import {
 	PG_TEXT_CODEC_MIGRATION_KEY,
 	deserializeSqliteFieldValue,
@@ -1857,6 +1862,24 @@ export class SqliteServerStore implements ServerStore {
 					last_seen_at = MAX(kora_device_activity.last_seen_at, excluded.last_seen_at),
 					protocol_version = COALESCE(excluded.protocol_version, kora_device_activity.protocol_version),
 					delivery_watermark = COALESCE(excluded.delivery_watermark, kora_device_activity.delivery_watermark)
+			`)
+		})
+	}
+
+	async recordDeviceHealth(health: DeviceHealth): Promise<void> {
+		await this.track(async () => {
+			this.db.run(sql`
+				INSERT INTO kora_device_activity (node_id, first_seen_at, last_seen_at, health_at, apply_blocked, blocked_code, quarantined, pending_operations, held_operations, storage_degraded)
+				VALUES (${health.nodeId}, ${health.reportedAt}, ${health.reportedAt}, ${health.reportedAt}, ${health.applyBlocked ? 1 : 0}, ${health.blockedCode}, ${health.quarantined}, ${health.pendingOperations}, ${health.heldOperations}, ${health.storageDegraded ? 1 : 0})
+				ON CONFLICT (node_id) DO UPDATE SET
+					last_seen_at = MAX(kora_device_activity.last_seen_at, excluded.last_seen_at),
+					health_at = excluded.health_at,
+					apply_blocked = excluded.apply_blocked,
+					blocked_code = excluded.blocked_code,
+					quarantined = excluded.quarantined,
+					pending_operations = excluded.pending_operations,
+					held_operations = excluded.held_operations,
+					storage_degraded = excluded.storage_degraded
 			`)
 		})
 	}
@@ -4633,6 +4656,25 @@ export class SqliteServerStore implements ServerStore {
 				delivery_watermark INTEGER
 			)
 		`)
+		// What each device last reported about its own sync (a device-status message). SQLite
+		// has no ADD COLUMN IF NOT EXISTS, so the columns present are read first.
+		const activityColumns = new Set(
+			this.db
+				.all<{ name: string }>(sql`PRAGMA table_info(kora_device_activity)`)
+				.map((row) => row.name),
+		)
+		for (const [column, definition] of [
+			['health_at', 'INTEGER'],
+			['apply_blocked', 'INTEGER'],
+			['blocked_code', 'TEXT'],
+			['quarantined', 'INTEGER'],
+			['pending_operations', 'INTEGER'],
+			['held_operations', 'INTEGER'],
+			['storage_degraded', 'INTEGER'],
+		] as const) {
+			if (!activityColumns.has(column))
+				this.db.run(sql.raw(`ALTER TABLE kora_device_activity ADD COLUMN ${column} ${definition}`))
+		}
 		this.db.run(sql`
 			INSERT OR IGNORE INTO kora_device_activity (node_id, first_seen_at, last_seen_at)
 			SELECT node_id, last_seen_at, last_seen_at FROM sync_state WHERE node_id NOT LIKE ${`${SERVER_NODE_PREFIX}%`}
