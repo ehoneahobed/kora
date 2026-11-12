@@ -152,7 +152,7 @@ const backup = await app.exportBackup({
 Two commands back up a server's data, and they hold different things:
 
 - `kora backup create` asks the running server for its Kora data: the operation log and encryption key records. It needs no database access, but leaves out the app's other tables (such as sign-in users) and its files.
-- `kora export` reads the whole PostgreSQL database with `pg_dump` and the files in `KORA_BLOB_DIR`, into one `.tar`. Use it to move an app to another host or to Kora Cloud (`kora import <file> --platform kora-cloud`); see [Moving an existing app to Kora Cloud](./deployment.md#moving-an-existing-app-to-kora-cloud).
+- `kora export` reads the whole PostgreSQL database with `pg_dump` and the files in `KORA_BLOB_DIR`, into one `.tar`. Use it to move an app to another host (`kora import <file>`, see [below](#restore-a-whole-app-on-your-own-machine)) or to Kora Cloud (`kora import <file> --platform kora-cloud`, see [Moving an existing app to Kora Cloud](./deployment.md#moving-an-existing-app-to-kora-cloud)).
 
 For synced apps, back up the server operation log with the CLI:
 
@@ -231,6 +231,50 @@ correctness. A device or server from before anchors behaves as it did. With acce
 (retriable `ACCESS_RULES_CHANGED`) so each device reconnects and is re-scoped under the restored
 memberships; on another server instance this happens at its next delivery poll. If you restore by
 calling `store.importBackup(...)` yourself, call `server.revalidateAccessSessions()` afterwards.
+
+## Restore a Whole App on Your Own Machine
+
+A bundle from `kora export`, or a backup downloaded from Kora Cloud (project **Backups**, **Download**), holds an app's whole PostgreSQL database and its files. `kora import` without `--platform` loads it into your own database: on a laptop, a server, or any other host. Nothing ties it to Kora Cloud.
+
+You need Docker (or any PostgreSQL 16 or newer) and PostgreSQL's client tools (`pg_restore` and `psql`, the same major version as the server or newer).
+
+1. Start an empty database. A `compose.yaml` beside the bundle:
+
+   ```yaml
+   services:
+     postgres:
+       image: postgres:16
+       environment:
+         POSTGRES_USER: kora
+         POSTGRES_PASSWORD: kora
+         POSTGRES_DB: app
+       ports:
+         - "127.0.0.1:5433:5432"
+       volumes:
+         - pgdata:/var/lib/postgresql/data
+   volumes:
+     pgdata: {}
+   ```
+
+   ```bash
+   docker compose up -d --wait
+   ```
+
+   The image restarts once after setting up a new database; if the next step can't connect, wait a few seconds and run it again.
+
+2. Load the bundle:
+
+   ```bash
+   kora import my-app-backup-2026-11-12.tar \
+     --database-url postgresql://kora:kora@127.0.0.1:5433/app \
+     --blob-dir ./blobs
+   ```
+
+   It reads the whole bundle first and checks it: the database dump against its checksum, every file against its name. It refuses a database that already holds tables, restores the dump in one transaction, and compares every table's row count with the counts the bundle recorded. Files go into the folder last. A damaged bundle restores nothing.
+
+3. Start the app with that database and folder, as you would in production: `DATABASE_URL=postgresql://kora:kora@127.0.0.1:5433/app KORA_BLOB_DIR=./blobs` plus its other settings (`KORA_AUTH_SECRET`, and so on; the app's `.env.example` lists them). Point its devices at it with `VITE_SYNC_URL`.
+
+`DATABASE_URL` and `KORA_BLOB_DIR` are read from the environment when the flags are left out. A bundle without files needs no `--blob-dir`.
 
 ## Recommended Practice
 

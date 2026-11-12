@@ -1,11 +1,16 @@
-import { open, stat } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { access, mkdir, mkdtemp, open, readdir, rename, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { defineCommand } from 'citty'
 import { type CloudBackup, KoraCloudClient } from '../../cloud/cloud-client'
 import { readCredentials } from '../../cloud/credentials'
 import { readProjectLink } from '../../cloud/project-link'
 import { DataTransferError, KoraCloudSignInRequiredError } from '../../errors'
 import { type Logger, createLogger } from '../../utils/logger'
+import { readTar } from './tar-reader'
 
 /** Azure allows 50,000 blocks per blob; 16 MiB blocks reach 780 GiB. */
 const BLOCK_BYTES = 16 * 1024 * 1024
@@ -192,6 +197,299 @@ function formatBytes(bytes: number): string {
 	return `${(bytes / 1024 ** 3).toFixed(2)} GB`
 }
 
+export interface LocalImportOptions {
+	file: string
+	/** The PostgreSQL database to fill. It must be empty. */
+	databaseUrl: string
+	/** Where the app keeps its files (`KORA_BLOB_DIR`), or null for a bundle without files. */
+	blobDir: string | null
+	/** Folder holding pg_restore and psql, or null to find them on PATH. */
+	pgBin?: string | null | undefined
+	logger?: Logger | undefined
+}
+
+export interface LocalImportResult {
+	tables: number
+	rows: number | null
+	files: number
+	/** Tables whose row count differs from what the bundle recorded (empty when it matched or recorded none). */
+	differences: string[]
+}
+
+const FILE_ENTRY = /^files\/([a-f0-9]{2})\/([a-f0-9]{64})$/
+const IGNORED_ENTRY = /^(README\.txt|README\.md)$|(^|\/)\._|(^|\/)\.DS_Store$/
+
+/**
+ * Loads a bundle (`kora export`, or a backup downloaded from Kora Cloud) into your own
+ * PostgreSQL database and files folder: everything is read and checked first (the dump against
+ * its checksum, each file against its name), the database must be empty, the dump is restored
+ * in one transaction, row counts are compared with the bundle's, and files go in last.
+ */
+export async function runLocalImport(options: LocalImportOptions): Promise<LocalImportResult> {
+	const logger = options.logger ?? createLogger()
+	const path = resolve(options.file)
+	try {
+		await access(path)
+	} catch {
+		throw new DataTransferError(`${path} doesn't exist.`)
+	}
+	const work = await mkdtemp(join(tmpdir(), 'kora-import-'))
+	try {
+		logger.step('Reading and checking the bundle')
+		const dumpPath = join(work, 'database.dump')
+		const staged = join(work, 'files')
+		let dump: { sha256: string; bytes: number } | null = null
+		let manifest: { database?: { sha256?: unknown; tables?: unknown } } | null = null
+		const files: string[] = []
+		for await (const entry of readTar(createReadStream(path) as AsyncIterable<Uint8Array>)) {
+			if (entry.kind === 'directory' || IGNORED_ENTRY.test(entry.name)) continue
+			if (entry.name === 'database.dump' && entry.kind === 'file') {
+				dump = await writeHashed(entry.body, dumpPath)
+				continue
+			}
+			if (entry.name === 'manifest.json' && entry.kind === 'file') {
+				const chunks: Uint8Array[] = []
+				for await (const chunk of entry.body) chunks.push(chunk)
+				try {
+					manifest = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+				} catch {
+					throw new DataTransferError("The bundle's manifest.json isn't valid JSON.")
+				}
+				continue
+			}
+			const match = FILE_ENTRY.exec(entry.name)
+			if (match && entry.kind === 'file' && match[1] === match[2]?.slice(0, 2)) {
+				const hash = match[2] ?? ''
+				await mkdir(join(staged, match[1] ?? ''), { recursive: true })
+				const written = await writeHashed(entry.body, join(staged, match[1] ?? '', hash))
+				if (written.sha256 !== hash) {
+					throw new DataTransferError(
+						`files/${match[1]}/${hash.slice(0, 12)}… doesn't match its name: the bundle is damaged.`,
+					)
+				}
+				files.push(hash)
+				continue
+			}
+			throw new DataTransferError(
+				`The bundle holds "${entry.name.slice(0, 120)}", which a Kora bundle doesn't (database.dump, files/, manifest.json).`,
+			)
+		}
+		if (!dump) throw new DataTransferError('The bundle has no database.dump.')
+		if (
+			typeof manifest?.database?.sha256 === 'string' &&
+			manifest.database.sha256 !== dump.sha256
+		) {
+			throw new DataTransferError(
+				"The bundle's database.dump doesn't match the checksum in its manifest: it is damaged.",
+			)
+		}
+		if (files.length > 0 && !options.blobDir) {
+			throw new DataTransferError(
+				`The bundle holds ${files.length} files. Say where the app keeps them: set KORA_BLOB_DIR or pass --blob-dir.`,
+			)
+		}
+
+		const psql = postgresTool(options.pgBin ?? null, 'psql')
+		const tablesBefore = await sql(
+			psql,
+			options.databaseUrl,
+			"select count(*) from pg_tables where schemaname not in ('pg_catalog', 'information_schema')",
+		)
+		if (tablesBefore.trim() !== '0') {
+			throw new DataTransferError(
+				'The database already holds tables, so nothing was restored. Point --database-url (or DATABASE_URL) at an empty database.',
+			)
+		}
+		logger.step(`Restoring the ${formatBytes(dump.bytes)} database`)
+		await run(
+			postgresTool(options.pgBin ?? null, 'pg_restore'),
+			[
+				'--no-owner',
+				'--no-privileges',
+				'--single-transaction',
+				'--exit-on-error',
+				`--dbname=${withoutPassword(options.databaseUrl)}`,
+				dumpPath,
+			],
+			options.databaseUrl,
+		)
+
+		const expected = recordedTables(manifest)
+		const counts = await rowCounts(psql, options.databaseUrl)
+		const differences = expected
+			? [...new Set([...Object.keys(expected), ...Object.keys(counts)])]
+					.sort()
+					.filter((table) => expected[table] !== counts[table])
+					.map((table) => `${table}: ${expected[table] ?? 'absent'} → ${counts[table] ?? 'absent'}`)
+			: []
+
+		if (files.length > 0 && options.blobDir) {
+			logger.step(`Copying ${files.length} files into ${options.blobDir}`)
+			for (const prefix of await readdir(staged)) {
+				await mkdir(join(options.blobDir, prefix), { recursive: true })
+				for (const name of await readdir(join(staged, prefix))) {
+					// Content-addressed: a file already there is the same file.
+					const target = join(options.blobDir, prefix, name)
+					if (!(await exists(target)))
+						await rename(join(staged, prefix, name), target).catch(async () =>
+							copyFile(join(staged, prefix, name), target),
+						)
+				}
+			}
+		}
+		return {
+			tables: Object.keys(counts).length,
+			rows: Object.values(counts).reduce((sum, value) => sum + value, 0),
+			files: files.length,
+			differences,
+		}
+	} finally {
+		await rm(work, { recursive: true, force: true })
+	}
+}
+
+async function writeHashed(
+	body: AsyncIterable<Uint8Array>,
+	target: string,
+): Promise<{ sha256: string; bytes: number }> {
+	const hash = createHash('sha256')
+	const out = createWriteStream(target)
+	let bytes = 0
+	for await (const chunk of body) {
+		hash.update(chunk)
+		bytes += chunk.byteLength
+		if (!out.write(chunk))
+			await new Promise<void>((resolveDrain) => out.once('drain', resolveDrain))
+	}
+	await new Promise<void>((resolveEnd, reject) =>
+		out.end((error?: Error | null) => (error ? reject(error) : resolveEnd())),
+	)
+	return { sha256: hash.digest('hex'), bytes }
+}
+
+async function exists(path: string): Promise<boolean> {
+	try {
+		await access(path)
+		return true
+	} catch {
+		return false
+	}
+}
+
+async function copyFile(from: string, to: string): Promise<void> {
+	const { copyFile: copy } = await import('node:fs/promises')
+	await copy(from, to)
+}
+
+function recordedTables(
+	manifest: { database?: { tables?: unknown } } | null,
+): Record<string, number> | null {
+	const tables = manifest?.database?.tables
+	if (typeof tables !== 'object' || tables === null || Array.isArray(tables)) return null
+	const out: Record<string, number> = {}
+	for (const [name, count] of Object.entries(tables))
+		if (typeof count === 'number') out[name] = count
+	return Object.keys(out).length > 0 ? out : null
+}
+
+function postgresTool(pgBin: string | null, name: 'psql' | 'pg_restore'): string {
+	return pgBin ? join(pgBin, name) : name
+}
+
+function withoutPassword(databaseUrl: string): string {
+	const url = new URL(databaseUrl)
+	url.password = ''
+	return url.toString()
+}
+
+/** Runs a PostgreSQL tool with the password in the environment, never on the command line. */
+async function run(command: string, args: string[], databaseUrl: string): Promise<string> {
+	let url: URL
+	try {
+		url = new URL(databaseUrl)
+	} catch {
+		throw new DataTransferError('The database address is not a valid postgresql:// URL.')
+	}
+	return await new Promise<string>((resolveRun, reject) => {
+		const child = spawn(command, args, {
+			env: {
+				...process.env,
+				PGPASSWORD: decodeURIComponent(url.password),
+				PGCONNECT_TIMEOUT: '30',
+			},
+			stdio: ['ignore', 'pipe', 'pipe'],
+		})
+		let stdout = ''
+		let stderr = ''
+		child.stdout.on('data', (chunk: Buffer) => {
+			stdout += chunk.toString('utf8')
+		})
+		child.stderr.on('data', (chunk: Buffer) => {
+			if (stderr.length < 8192) stderr += chunk.toString('utf8')
+		})
+		child.on('error', (error) => {
+			reject(
+				(error as NodeJS.ErrnoException).code === 'ENOENT'
+					? new DataTransferError(
+							`${command} wasn't found. Install PostgreSQL's client tools (the same major version as the database server or newer), or point --pg-bin at them.`,
+						)
+					: error,
+			)
+		})
+		child.on('close', (code) => {
+			if (code === 0) return resolveRun(stdout)
+			const line =
+				stderr
+					.split('\n')
+					.find((entry) => /error/i.test(entry))
+					?.trim() ??
+				stderr.trim().split('\n')[0] ??
+				''
+			reject(
+				new DataTransferError(
+					`${command.split('/').at(-1)} failed: ${line.replace(/postgres(?:ql)?:\/\/\S+/gi, '<database>').slice(0, 300)}`,
+				),
+			)
+		})
+	})
+}
+
+async function sql(psql: string, databaseUrl: string, query: string): Promise<string> {
+	return await run(
+		psql,
+		[
+			'--no-psqlrc',
+			'--tuples-only',
+			'--no-align',
+			`--dbname=${withoutPassword(databaseUrl)}`,
+			'--command',
+			query,
+		],
+		databaseUrl,
+	)
+}
+
+/** Row counts per table, keyed `schema.table` as Kora Cloud's manifests record them. */
+async function rowCounts(psql: string, databaseUrl: string): Promise<Record<string, number>> {
+	const tables = (
+		await sql(
+			psql,
+			databaseUrl,
+			"select schemaname || '.' || tablename from pg_tables where schemaname not in ('pg_catalog', 'information_schema') order by 1",
+		)
+	)
+		.split('\n')
+		.map((line) => line.trim())
+		.filter(Boolean)
+	const counts: Record<string, number> = {}
+	for (const table of tables) {
+		const [schema, name] = table.split('.')
+		const quoted = `"${(schema ?? '').replaceAll('"', '""')}"."${(name ?? '').replaceAll('"', '""')}"`
+		counts[table] = Number((await sql(psql, databaseUrl, `select count(*) from ${quoted}`)).trim())
+	}
+	return counts
+}
+
 export const importCommand = defineCommand({
 	meta: {
 		name: 'import',
@@ -206,15 +504,60 @@ export const importCommand = defineCommand({
 		},
 		platform: {
 			type: 'string',
-			description: 'Where to import it: kora-cloud',
+			description:
+				'Import into Kora Cloud (kora-cloud). Leave out to load it into your own database',
+		},
+		'database-url': {
+			type: 'string',
+			description:
+				'Without --platform: the empty PostgreSQL database to fill (default: DATABASE_URL)',
+		},
+		'blob-dir': {
+			type: 'string',
+			description: 'Without --platform: where the app keeps its files (default: KORA_BLOB_DIR)',
+		},
+		'pg-bin': {
+			type: 'string',
+			description: 'Folder holding pg_restore and psql, when they are not on PATH',
 		},
 	},
 	async run({ args }) {
 		const logger = createLogger()
-		if (args.platform !== 'kora-cloud') {
+		if (args.platform !== undefined && args.platform !== 'kora-cloud') {
 			throw new DataTransferError(
-				'Say where to import to: `kora import <file> --platform kora-cloud`. To load a bundle into your own database, follow the README inside it (pg_restore, then copy files/).',
+				`Unknown --platform "${args.platform}". Use kora-cloud, or leave it out to load the bundle into your own database.`,
 			)
+		}
+		if (args.platform !== 'kora-cloud') {
+			const databaseUrl =
+				typeof args['database-url'] === 'string' ? args['database-url'] : process.env.DATABASE_URL
+			if (!databaseUrl)
+				throw new DataTransferError(
+					'Say which database to fill: set DATABASE_URL or pass --database-url (an empty PostgreSQL database).',
+				)
+			logger.banner()
+			const result = await runLocalImport({
+				file: String(args.file),
+				databaseUrl,
+				blobDir:
+					typeof args['blob-dir'] === 'string'
+						? args['blob-dir']
+						: (process.env.KORA_BLOB_DIR ?? null),
+				pgBin: typeof args['pg-bin'] === 'string' ? args['pg-bin'] : null,
+				logger,
+			})
+			if (result.differences.length > 0) {
+				throw new DataTransferError(
+					`Restored, but row counts differ from the bundle's: ${result.differences.slice(0, 5).join('; ')}. Don't use this copy; restore again into an empty database.`,
+				)
+			}
+			logger.success(
+				`Restored ${result.tables} tables (${result.rows} rows) and ${result.files} files`,
+			)
+			logger.step(
+				'Start the app with this DATABASE_URL and KORA_BLOB_DIR, and point its devices at it (VITE_SYNC_URL).',
+			)
+			return
 		}
 		logger.banner()
 		const backup = await runCloudImport({
