@@ -282,6 +282,29 @@ const arbitraries: Record<SyncMessage['type'], fc.Arbitrary<SyncMessage>> = {
 		bytes: fc.base64String(),
 	}),
 	heartbeat: fc.record({ type: fc.constant('heartbeat' as const), messageId: id }),
+	'device-status': fc.record(
+		{
+			type: fc.constant('device-status' as const),
+			messageId: id,
+			applyBlocked: fc.boolean(),
+			blockedCode: fc.constantFrom('MISSING_TRANSFORM', 'DECRYPT_FAILED', 'APPLY_FAILED'),
+			quarantined: fc.nat({ max: 1_000_000 }),
+			pendingOperations: fc.nat({ max: 1_000_000 }),
+			heldOperations: fc.nat({ max: 1_000_000 }),
+			localDurability: fc.constantFrom('durable' as const, 'degraded' as const),
+		},
+		{
+			requiredKeys: [
+				'type',
+				'messageId',
+				'applyBlocked',
+				'quarantined',
+				'pendingOperations',
+				'heldOperations',
+				'localDurability',
+			],
+		},
+	),
 	// ENC-1 key distribution. NegotiatedMessageSerializer sends these as JSON on every
 	// wire format, but a transport that uses the protobuf serializer explicitly must still
 	// carry them losslessly (their bodies travel in the extension field).

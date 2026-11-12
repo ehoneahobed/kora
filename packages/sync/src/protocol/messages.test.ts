@@ -9,6 +9,7 @@ import type {
 } from './messages'
 import {
 	isAcknowledgmentMessage,
+	isDeviceStatusMessage,
 	isErrorMessage,
 	isHandshakeMessage,
 	isHandshakeResponseMessage,
@@ -257,5 +258,35 @@ describe('isSyncMessage', () => {
 
 	test('rejects object without type', () => {
 		expect(isSyncMessage({ messageId: 'x' })).toBe(false)
+	})
+})
+
+describe('isDeviceStatusMessage', () => {
+	const valid = {
+		type: 'device-status',
+		messageId: 'm1',
+		applyBlocked: true,
+		blockedCode: 'MISSING_TRANSFORM',
+		quarantined: 2,
+		pendingOperations: 0,
+		heldOperations: 0,
+		localDurability: 'durable',
+	}
+
+	test('accepts bounded counts and an upper-case code', () => {
+		expect(isDeviceStatusMessage(valid)).toBe(true)
+		const { blockedCode: _code, ...withoutCode } = valid
+		expect(isDeviceStatusMessage({ ...withoutCode, applyBlocked: false })).toBe(true)
+	})
+
+	test('refuses anything that could carry more than counts', () => {
+		expect(isDeviceStatusMessage({ ...valid, blockedCode: 'op 0190ab… failed on todos/42' })).toBe(
+			false,
+		)
+		expect(isDeviceStatusMessage({ ...valid, quarantined: -1 })).toBe(false)
+		expect(isDeviceStatusMessage({ ...valid, quarantined: 1.5 })).toBe(false)
+		expect(isDeviceStatusMessage({ ...valid, pendingOperations: 2_000_000_000 })).toBe(false)
+		expect(isDeviceStatusMessage({ ...valid, localDurability: 'unknown' })).toBe(false)
+		expect(isDeviceStatusMessage({ ...valid, messageId: 'x'.repeat(200) })).toBe(false)
 	})
 })

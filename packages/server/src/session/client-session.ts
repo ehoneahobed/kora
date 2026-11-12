@@ -31,6 +31,7 @@ import type {
 	BlobChunkPushMessage,
 	BlobChunkRequestMessage,
 	BlobChunkResponseMessage,
+	DeviceStatusMessage,
 	EncryptionKeyPutMessage,
 	EncryptionKeyRequestMessage,
 	HandshakeMessage,
@@ -194,6 +195,8 @@ export const OPERATION_TOO_LARGE_CODE = 'OPERATION_TOO_LARGE'
 
 /** Refusal of an operation whose schema transform broke its contract (RT-84). */
 export const SCHEMA_TRANSFORM_INVALID_CODE = 'SCHEMA_TRANSFORM_INVALID'
+/** A session writes its device's reported status at most this often, keeping the latest. */
+export const DEVICE_STATUS_MIN_INTERVAL_MS = 5_000
 /** Default time a connection has to send its handshake before it is closed (SRV-6). */
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
 /**
@@ -2023,6 +2026,58 @@ export class ClientSession {
 			: this.lastAckedDeliverySeq
 	}
 
+	/** The device's latest status, waiting for its write; and when one was last written. */
+	private pendingDeviceStatus: DeviceStatusMessage | null = null
+	private deviceStatusWrittenAt = 0
+	private deviceStatusTimer: ReturnType<typeof setTimeout> | null = null
+
+	/**
+	 * Records what the device reported about its own sync, for operators. At most one write
+	 * every {@link DEVICE_STATUS_MIN_INTERVAL_MS} per session, keeping the latest, so a device
+	 * sending too often costs nothing; a failure is logged and never affects sync.
+	 */
+	private noteDeviceStatus(message: DeviceStatusMessage): void {
+		if (!this.store.recordDeviceHealth) return
+		this.pendingDeviceStatus = message
+		if (this.deviceStatusTimer) return
+		const wait = Math.max(
+			0,
+			this.deviceStatusWrittenAt + DEVICE_STATUS_MIN_INTERVAL_MS - Date.now(),
+		)
+		this.deviceStatusTimer = setTimeout(() => {
+			this.deviceStatusTimer = null
+			void this.writeDeviceStatus()
+		}, wait)
+		this.deviceStatusTimer.unref?.()
+	}
+
+	private async writeDeviceStatus(): Promise<void> {
+		const status = this.pendingDeviceStatus
+		const nodeId = this.getClientNodeId()
+		this.pendingDeviceStatus = null
+		if (!status || !nodeId || !this.store.recordDeviceHealth) return
+		this.deviceStatusWrittenAt = Date.now()
+		try {
+			await this.store.recordDeviceHealth({
+				nodeId,
+				reportedAt: this.deviceStatusWrittenAt,
+				applyBlocked: status.applyBlocked,
+				blockedCode: status.applyBlocked ? (status.blockedCode ?? null) : null,
+				quarantined: status.quarantined,
+				pendingOperations: status.pendingOperations,
+				heldOperations: status.heldOperations,
+				storageDegraded: status.localDurability === 'degraded',
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: '',
+				message: `Recording a device's sync status failed: ${error instanceof Error ? error.message : String(error)}`,
+				code: 'DEVICE_STATUS_WRITE_FAILED',
+			})
+		}
+	}
+
 	getClientNodeId(): string | null {
 		return this.clientNodeId
 	}
@@ -2230,6 +2285,9 @@ export class ClientSession {
 			case 'error':
 			case 'heartbeat':
 				// A client liveness probe needs no answer: receiving it is the point.
+				break
+			case 'device-status':
+				this.noteDeviceStatus(message)
 				break
 			case 'awareness-update':
 				await this.handleAwarenessUpdate(message)
@@ -3246,6 +3304,7 @@ export class ClientSession {
 				: {}),
 			...(this.issuedNodeToken !== null ? { nodeToken: this.issuedNodeToken } : {}),
 			...(heartbeat ? { heartbeatIntervalMs: this.appHeartbeatIntervalMs } : {}),
+			...(this.store.recordDeviceHealth ? { acceptsDeviceStatus: true } : {}),
 			protocolVersion: SYNC_PROTOCOL_VERSION,
 			authoritativeNodeIds: this.advertisedAuthoritativeNodeIds(),
 			...this.advertisedRevocations(),

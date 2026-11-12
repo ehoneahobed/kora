@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { SERVER_LOG_QUARANTINE_TABLE } from './log-integrity'
 
 /** What a server records about a device's connection. Never the device's data. */
 export interface DeviceActivity {
@@ -6,6 +7,21 @@ export interface DeviceActivity {
 	readonly seenAt: number
 	readonly protocolVersion: number | null
 	readonly deliveryWatermark: number | null
+}
+
+/**
+ * What a device reported about its own sync (a `device-status` message): counts and a failure
+ * code, never an operation id or a value.
+ */
+export interface DeviceHealth {
+	readonly nodeId: string
+	readonly reportedAt: number
+	readonly applyBlocked: boolean
+	readonly blockedCode: string | null
+	readonly quarantined: number
+	readonly pendingOperations: number
+	readonly heldOperations: number
+	readonly storageDegraded: boolean
 }
 
 /**
@@ -35,6 +51,28 @@ export interface StoreInsights {
 			readonly lastSeenAt: number
 			readonly positionsBehind: number
 		}[]
+		/**
+		 * What devices seen in the last 7 days reported about themselves. Only devices on a
+		 * Kora version that reports are counted (`reporting`); older ones are in none of these.
+		 */
+		readonly health: {
+			readonly reporting: number
+			/** Delivery stalled on an operation the device can't apply yet. */
+			readonly blocked: number
+			readonly withQuarantined: number
+			readonly quarantinedOperations: number
+			/** Devices whose local database couldn't be made durable. */
+			readonly storageDegraded: number
+			readonly pendingOperations: number
+			readonly heldOperations: number
+			readonly blockedDevices: readonly {
+				readonly device: string
+				readonly lastSeenAt: number
+				readonly reportedAt: number
+				readonly code: string | null
+				readonly quarantined: number
+			}[]
+		}
 	}
 	readonly people: number
 	readonly operations: {
@@ -43,6 +81,8 @@ export interface StoreInsights {
 		readonly last7d: number
 		readonly lastReceivedAt: number | null
 		readonly latestPosition: number
+		/** Rows the server's own log-integrity scan set aside (`operations_quarantine`). */
+		readonly quarantined: number
 		readonly byCollection: readonly {
 			readonly collection: string
 			readonly inserts: number
@@ -119,6 +159,26 @@ export async function readStoreInsights(
 		COUNT(*) FILTER (WHERE type = 'delete') AS deletes,
 		MAX(received_at) AS last_received
 		FROM operations GROUP BY collection ORDER BY COUNT(*) DESC LIMIT ${COLLECTION_LIMIT}`)
+	const reportingSince = week
+	const [health] = await query(`SELECT COUNT(*) AS reporting,
+		COUNT(*) FILTER (WHERE apply_blocked = 1) AS blocked,
+		COUNT(*) FILTER (WHERE quarantined > 0) AS with_quarantined,
+		COALESCE(SUM(quarantined), 0) AS quarantined_operations,
+		COUNT(*) FILTER (WHERE storage_degraded = 1) AS storage_degraded,
+		COALESCE(SUM(pending_operations), 0) AS pending_operations,
+		COALESCE(SUM(held_operations), 0) AS held_operations
+		FROM kora_device_activity WHERE health_at IS NOT NULL AND last_seen_at >= ${reportingSince}`)
+	const blockedDevices =
+		await query(`SELECT node_id, last_seen_at, health_at, blocked_code, quarantined FROM kora_device_activity
+		WHERE apply_blocked = 1 AND last_seen_at >= ${reportingSince} ORDER BY last_seen_at DESC, node_id LIMIT ${MOST_BEHIND_LIMIT}`)
+	// The table exists once the scan has set anything aside; before that there is nothing to count.
+	let serverQuarantined = 0
+	try {
+		const [row] = await query(`SELECT COUNT(*) AS total FROM ${SERVER_LOG_QUARANTINE_TABLE}`)
+		serverQuarantined = number(row?.total)
+	} catch {
+		serverQuarantined = 0
+	}
 	const refused =
 		await query(`SELECT outcome, code, COUNT(*) AS operations, MAX(resolved_at) AS last_at FROM operation_resolutions
 		WHERE outcome <> 'accepted' GROUP BY outcome, code ORDER BY operations DESC LIMIT 100`)
@@ -144,6 +204,25 @@ export async function readStoreInsights(
 				lastSeenAt: number(row.last_seen_at),
 				positionsBehind: number(row.positions_behind),
 			})),
+			health: {
+				reporting: number(health?.reporting),
+				blocked: number(health?.blocked),
+				withQuarantined: number(health?.with_quarantined),
+				quarantinedOperations: number(health?.quarantined_operations),
+				storageDegraded: number(health?.storage_degraded),
+				pendingOperations: number(health?.pending_operations),
+				heldOperations: number(health?.held_operations),
+				blockedDevices: blockedDevices.map((row) => ({
+					device: deviceLabel(String(row.node_id)),
+					lastSeenAt: number(row.last_seen_at),
+					reportedAt: number(row.health_at),
+					code:
+						row.blocked_code === null || row.blocked_code === undefined
+							? null
+							: String(row.blocked_code),
+					quarantined: number(row.quarantined),
+				})),
+			},
 		},
 		people: number(people?.people),
 		operations: {
@@ -152,6 +231,7 @@ export async function readStoreInsights(
 			last7d: number(operations?.last_week),
 			lastReceivedAt: optional(operations?.last_received),
 			latestPosition: position,
+			quarantined: serverQuarantined,
 			byCollection: collections.map((row) => ({
 				collection: String(row.collection),
 				inserts: number(row.inserts),

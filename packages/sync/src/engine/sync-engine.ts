@@ -169,6 +169,11 @@ function yieldToMainThread(): Promise<void> {
 /** Most digests in flight at once while a batch is verified before its transaction (C1.0(a)). */
 const VERIFY_CONCURRENCY = 64
 const DEFAULT_SCHEMA_VERSION = 1
+/**
+ * A device's status goes to the server this long after the last change, so a burst of writes
+ * (each changing the pending count) is one message.
+ */
+const DEVICE_STATUS_DEBOUNCE_MS = 5000
 const DEFAULT_OUTBOUND_ACK_TIMEOUT_MS = 30000
 const DEFAULT_OUTBOUND_RETRY_BASE_DELAY_MS = 250
 const DEFAULT_OUTBOUND_RETRY_MAX_DELAY_MS = 30000
@@ -1247,6 +1252,7 @@ export class SyncEngine {
 			this.querySubsetReconnectTimer = null
 		}
 		this.clearAdoptionRetryTimer()
+		this.clearDeviceStatusTimer()
 	}
 
 	private clearAdoptionRetryTimer(): void {
@@ -1287,7 +1293,59 @@ export class SyncEngine {
 		}
 	}
 
+	/** The server said it records device health (`acceptsDeviceStatus`), for this session. */
+	private serverAcceptsDeviceStatus = false
+	/** The last status sent this session, so an unchanged one isn't sent again. */
+	private lastDeviceStatusKey: string | null = null
+	private deviceStatusTimer: ReturnType<typeof setTimeout> | null = null
+
+	/**
+	 * Sends this device's sync health to the server soon, if the server records it: counts and
+	 * a failure code only. Called whenever something it reports may have changed; debounced, and
+	 * nothing is sent when nothing changed. Never affects sync.
+	 */
+	private scheduleDeviceStatus(): void {
+		if (!this.serverAcceptsDeviceStatus || this.deviceStatusTimer) return
+		this.deviceStatusTimer = setTimeout(() => {
+			this.deviceStatusTimer = null
+			void this.sendDeviceStatus().catch(() => undefined)
+		}, DEVICE_STATUS_DEBOUNCE_MS)
+	}
+
+	private async sendDeviceStatus(): Promise<void> {
+		if (!this.serverAcceptsDeviceStatus || (this.state !== 'streaming' && this.state !== 'syncing'))
+			return
+		const status = this.getStatus()
+		const quarantined = (await this.getQuarantinedOperations()).length
+		if (!this.serverAcceptsDeviceStatus || (this.state !== 'streaming' && this.state !== 'syncing'))
+			return
+		const blocked = this.blockedFailure
+		const body = {
+			applyBlocked: blocked !== null,
+			...(blocked && /^[A-Z0-9_]{1,64}$/.test(blocked.code) ? { blockedCode: blocked.code } : {}),
+			quarantined,
+			pendingOperations: status.pendingOperations,
+			heldOperations: status.heldOperations ?? 0,
+			localDurability: status.localDurability ?? ('durable' as const),
+		}
+		const key = JSON.stringify(body)
+		if (key === this.lastDeviceStatusKey) return
+		try {
+			this.transport.send({ type: 'device-status', messageId: generateMessageId(), ...body })
+			this.lastDeviceStatusKey = key
+		} catch {
+			// The socket closed under us: the next session sends its status afresh.
+		}
+	}
+
+	private clearDeviceStatusTimer(): void {
+		if (!this.deviceStatusTimer) return
+		clearTimeout(this.deviceStatusTimer)
+		this.deviceStatusTimer = null
+	}
+
 	private notifyStatusChange(): void {
+		this.scheduleDeviceStatus()
 		for (const listener of this.statusListeners) {
 			try {
 				listener()
@@ -1610,6 +1668,7 @@ export class SyncEngine {
 				type: prior?.operationId === op.id ? 'sync:apply-retrying' : 'sync:apply-blocked',
 				failure: this.blockedFailure,
 			})
+			this.scheduleDeviceStatus()
 		}
 		this.emitEvent({
 			type: 'sync:apply-failed',
@@ -2555,6 +2614,10 @@ export class SyncEngine {
 
 		this.blobStorageEnabled = msg.blobStorageEnabled === true
 		this.blobPossessionProof = msg.blobPossessionProof === true
+		// A new session: the server learns this device's status afresh, if it records it.
+		this.serverAcceptsDeviceStatus = msg.acceptsDeviceStatus === true
+		this.lastDeviceStatusKey = null
+		this.clearDeviceStatusTimer()
 
 		if (typeof msg.serverTime === 'number') {
 			this.evaluateClockSkew(msg.serverTime)
@@ -3631,6 +3694,7 @@ export class SyncEngine {
 				const recovered = this.blockedFailure
 				this.blockedFailure = null
 				this.emitter?.emit({ type: 'sync:apply-recovered', failure: recovered })
+				this.scheduleDeviceStatus()
 			}
 		} else if (!isDeliveryBatch) {
 			// A legacy (version-vector) or relay batch has no watermark to move, but its
@@ -5051,6 +5115,8 @@ export class SyncEngine {
 						watermark: change.watermark,
 						...(change.completion ? { completion: change.completion } : {}),
 					})
+					// Debounced: it reads the quarantine after this transaction has committed.
+					this.scheduleDeviceStatus()
 				} else {
 					await change.batch.saveDeliveryWatermark(
 						at.signature,
@@ -5083,6 +5149,7 @@ export class SyncEngine {
 						await syncState.saveDeliveryWatermark(signature, change.watermark, change.completion)
 					}
 				}
+				if (change.quarantined.length > 0) this.scheduleDeviceStatus()
 				// Nothing re-checks the position after the durable write: a full resync cannot overlap
 				// a batch in flight (see resetDeliveryForFullResync), and every other mover is
 				// answered by the callers' next check, which stops the stream.
@@ -5254,6 +5321,7 @@ export class SyncEngine {
 		if (released.length === 0) return 0
 		if (this.syncState?.removeQuarantine) {
 			await this.syncState.removeQuarantine(released)
+			this.scheduleDeviceStatus()
 		}
 		for (const id of released) this.memoryQuarantine.delete(id)
 		return released.length

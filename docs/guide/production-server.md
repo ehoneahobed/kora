@@ -166,6 +166,8 @@ timestamp) to an `operations_quarantine` table, verbatim, so no fold ever reads 
 logged; `store.getLogIntegrityReport()` returns the result. A record that owns quarantined
 operations keeps its pre-fold row as the base its remaining and later writes fold onto. Later
 starts skip the scan.
+The count of rows set aside is in [operator insights](#operator-insights-kora-insights) as
+`stored.operations.quarantined`.
 
 ### json values stored as strings
 
@@ -189,6 +191,47 @@ await store.close()
 Each report names a field, how many live rows hold an encoded string, and sample ids. Kora does
 not rewrite them, since a string is also a valid json value; write the decoded value with
 `server.kora.apply` where your app expects an object or array.
+
+## Operator insights (`/__kora/insights`)
+
+`GET /__kora/insights` reports how the app and its devices are doing, as counts, timings, schema
+names and hashed device labels: never a record's values, a user id or a device's real id. Someone
+who operates the server without access to its data (a hosting platform, an on-call engineer) can
+read it. It accepts `KORA_INSIGHTS_TOKEN` (which opens this endpoint and nothing else), or the
+metrics or admin token. Kora Cloud sets `KORA_INSIGHTS_TOKEN` for every app and reads it only
+while the app is awake.
+
+It holds:
+
+- `server`: version, uptime, devices connected now, operations received, refused and duplicated
+  since start, bytes in and out, errors.
+- `stored.devices`: devices known and active in the last day, week and month; how many are up to
+  date, behind, or far behind the newest operation; the twenty furthest behind.
+- `stored.devices.health`: what devices seen in the last week reported about their own sync:
+  how many report at all, how many have delivery **blocked** on an operation they can't apply yet
+  (with each blocked device's failure code, such as `MISSING_TRANSFORM`), how many have operations
+  **set aside** to apply later and how many in total, how many have **local storage that couldn't
+  be made durable**, and the writes waiting to upload or held for another user.
+- `stored.operations`: totals, the last day and week, per collection, the newest delivery
+  position, and `quarantined`, the rows the [log integrity scan](#operation-log-integrity) set aside.
+- `stored.refused`: operations the server refused, by outcome and code.
+- `blobs`: files stored and their size, when the app keeps a blob store.
+
+### How devices report their health
+
+Devices on this release send a small `device-status` message, counts and a failure code only, to
+a server that says it records them (`acceptsDeviceStatus` in the handshake response): once per
+session and then whenever something changes, at most every few seconds. The built-in SQLite and
+Postgres stores record it; a custom store opts in by implementing `recordDeviceHealth`. Older
+devices and servers are unaffected: an older device sends nothing, and a device never sends to a
+server that didn't ask. A device offline for a week falls out of the counts, since what it last
+said no longer describes it.
+
+A device whose delivery is **blocked** is waiting for something it needs to apply the next
+operation, typically a schema transform from an app update, or an encryption key. Its sync status
+(`useSyncStatus`) shows `blockedFailure`; updating the app usually clears it. Operations **set
+aside** are applied automatically once the device can (after an update, or when a key arrives);
+nothing is dropped.
 
 ## Static files and the offline app shell
 

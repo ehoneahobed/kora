@@ -471,6 +471,9 @@ function toProtoEnvelope(message: SyncMessage): ProtoEnvelope {
 			}
 		case 'heartbeat':
 			return { type: message.type, messageId: message.messageId }
+		case 'device-status':
+			// Its counts travel in the extension field (49) and are validated on decode.
+			return { type: message.type, messageId: message.messageId }
 		case 'encryption-key-request':
 		case 'encryption-key-put':
 		case 'encryption-key-response':
@@ -633,6 +636,17 @@ function fromProtoEnvelope(envelope: ProtoEnvelope): SyncMessage {
 			}
 		case 'heartbeat':
 			return { type: 'heartbeat', messageId: envelope.messageId }
+		case 'device-status':
+			// A skeleton the extension completes (applyResidualFields validates the result).
+			return {
+				type: 'device-status',
+				messageId: envelope.messageId,
+				applyBlocked: false,
+				quarantined: 0,
+				pendingOperations: 0,
+				heldOperations: 0,
+				localDurability: 'durable',
+			}
 		case 'awareness-update':
 			// The body travels in the extension field (49); these are its empty defaults.
 			return { type: 'awareness-update', messageId: envelope.messageId, clientId: 0, states: {} }
