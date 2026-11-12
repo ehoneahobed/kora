@@ -105,14 +105,12 @@ const server = createProductionServer({
   syncOptions: {
     auth: auth.auth,
   },
-  httpRoutes: [
-    {
-      path: '/auth',
-      handle: auth.handleRequest,
-    },
-  ],
+  // The auth routes at /auth; they also report sign-in activity in /__kora/insights.
+  httpRoutes: [auth.httpRoute],
 })
 ```
+
+`auth.httpRoute` is `{ path: '/auth', handle: auth.handleRequest }` plus counts for operators: sign-ins, sign-ups, second factors, OAuth sign-ins, token refreshes and verification or reset emails, by outcome and failure code (such as `INVALID_CREDENTIALS` or `RATE_LIMITED`), and server errors, for the last hour and the last 24 hours (`auth.activity()` returns the same). Counts only, never an email or user id; kept in memory per instance. An app that mounts `auth.handleRequest` itself keeps working and simply doesn't report them. See [operator insights](./production-server.md#operator-insights-kora-insights).
 
 `createKoraAuthServer()` includes token revocation, atomic refresh-token rotation, rate limiting (per account and per IP), device registration, OAuth sign-in routes with browser-bound state, account linking, MFA at sign-in (with `mfa`), and sync-server authentication with server-granted scopes. For custom stores or advanced route wiring, use `BuiltInAuthRoutes`, `OAuthManager`, `TokenManager`, and `UserStore` directly.
 

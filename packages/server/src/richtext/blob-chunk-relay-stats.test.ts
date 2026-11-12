@@ -106,6 +106,10 @@ const ZERO: BlobChunkRelayStats = {
 	throttledNotReceivable: 0,
 	refusedDuplicateRequestId: 0,
 	requesterGone: 0,
+	servedFromStore: 0,
+	servedByPeer: 0,
+	storeReadErrors: 0,
+	badPeerAnswers: 0,
 }
 const only = (counts: Partial<BlobChunkRelayStats>): BlobChunkRelayStats => ({ ...ZERO, ...counts })
 const notHeld = (requestId: string): BlobChunkResponseMessage => ({
@@ -188,7 +192,7 @@ describe('relay stats: notHeldAfterPeers', () => {
 			requestId: 'r1',
 			bytes: encodeBlobChunkBytes(new Uint8Array([1])),
 		})
-		expect(relay.getStats()).toEqual(only({ notHeldAfterPeers: 1 }))
+		expect(relay.getStats()).toEqual(only({ notHeldAfterPeers: 1, badPeerAnswers: 1 }))
 	})
 
 	test('the only peer asked leaves', async () => {
@@ -387,7 +391,7 @@ describe('relay stats: requesterGone, counted once and under nothing else', () =
 		expect(relay.getStats()).toEqual(only({ requesterGone: 2 }))
 	})
 
-	test('a delivered answer of bytes moves no counter', async () => {
+	test('a delivered answer of bytes counts only as served, by where it came from', async () => {
 		const bytes = new Uint8Array([5])
 		const hash = await hashBlob(bytes)
 		const { relay } = setup()
@@ -398,7 +402,7 @@ describe('relay stats: requesterGone, counted once and under nothing else', () =
 			requestId: 'r1',
 			bytes: encodeBlobChunkBytes(bytes),
 		})
-		expect(relay.getStats()).toEqual(ZERO)
+		expect(relay.getStats()).toEqual(only({ servedByPeer: 1 }))
 	})
 })
 

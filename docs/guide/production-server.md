@@ -216,6 +216,14 @@ It holds:
   position, and `quarantined`, the rows the [log integrity scan](#operation-log-integrity) set aside.
 - `stored.refused`: operations the server refused, by outcome and code.
 - `blobs`: files stored and their size, when the app keeps a blob store.
+- `files`: how devices' requests for file chunks were answered since the server started:
+  `served` (from the central store or by another device), `notHeld` (nobody had it: with a
+  central store that file is missing, without one its holders were offline), `throttled`, and
+  errors (`storeReadErrors`, `badPeerAnswers` for a device that sent wrong bytes).
+- `http`: what HTTP routes report about themselves, keyed by route. `@korajs/auth`'s
+  `httpRoute` reports sign-in activity under `http.auth`: `lastHour` and `last24h`, each with
+  `signIns`, `signUps`, `mfa`, `oauth`, `refreshes` and `emails` (`succeeded`, `failed`,
+  `byCode`) and `serverErrors`, and `since`, when this instance started counting.
 
 ### How devices report their health
 

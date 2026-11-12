@@ -19,6 +19,7 @@ import {
 	type OAuthProviderConfig,
 	type OAuthUserInfo,
 } from '../oauth/oauth-types'
+import { AuthActivity, type AuthActivitySnapshot, countedSend } from './auth-activity'
 import {
 	type AuthRevocationEvent,
 	type AuthRouteResponse,
@@ -167,6 +168,22 @@ export interface KoraAuthServer {
 	passwordReset?: PasswordResetManager
 	handleRequest(request: KoraAuthHttpRequest): Promise<AuthRouteResponse<unknown>>
 	/**
+	 * The auth routes as a `createProductionServer` HTTP route, mounted at this server's path,
+	 * that also reports {@link activity} in `/__kora/insights` (under `http.auth`):
+	 * `httpRoutes: [auth.httpRoute]`.
+	 */
+	readonly httpRoute: {
+		readonly path: string
+		handle(request: KoraAuthHttpRequest): Promise<AuthRouteResponse<unknown>>
+		readonly insights: { readonly key: string; read(): AuthActivitySnapshot }
+	}
+	/**
+	 * What the routes did in the last hour and day: sign-ins, sign-ups, second factors, OAuth,
+	 * refreshes and emails by outcome and failure code, and server errors. Counts only, kept in
+	 * memory on this instance.
+	 */
+	activity(): AuthActivitySnapshot
+	/**
 	 * Revoke every credential a user holds (call after a password change made
 	 * outside these routes, an admin action or an account deletion).
 	 */
@@ -240,6 +257,7 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 			throw new InMemoryAuthStoreError('revocationStore')
 		}
 	}
+	const activity = new AuthActivity()
 	const routes = new BuiltInAuthRoutes({
 		userStore,
 		tokenManager,
@@ -250,7 +268,10 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 	const oauth = options.oauth ? createOAuthRuntime(options.oauth) : undefined
 	const path = normalizePath(options.path ?? '/auth')
 	const emailVerification = options.emailVerification
-		? new EmailVerificationManager(userStore, options.emailVerification)
+		? new EmailVerificationManager(userStore, {
+				...options.emailVerification,
+				send: countedSend(options.emailVerification.send, activity),
+			})
 		: undefined
 	if (
 		emailVerification &&
@@ -264,6 +285,7 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 	const passwordReset = resetConfig
 		? new PasswordResetManager(userStore, {
 				...resetConfig,
+				send: countedSend(resetConfig.send, activity),
 				// Sessions end through the routes, so live sync sessions end with them.
 				onPasswordChanged: async (userId, revokedAt) => {
 					await routes.revokeAllForUser(userId, revokedAt)
@@ -291,6 +313,27 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 		throw new InMemoryAuthStoreError('passwordResetStore')
 	}
 
+	async function handleRequest(request: KoraAuthHttpRequest): Promise<AuthRouteResponse<unknown>> {
+		let response: AuthRouteResponse<unknown>
+		try {
+			response = await handleAuthRequest(
+				routes,
+				path,
+				request,
+				oauth,
+				userStore,
+				tokenManager,
+				emailVerification,
+				passwordReset,
+			)
+		} catch (error) {
+			activity.serverError()
+			throw error
+		}
+		recordActivity(activity, path, request, response)
+		return response
+	}
+
 	return {
 		routes,
 		userStore,
@@ -303,18 +346,13 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 			scopeValues: options.scopeValues,
 			resolveScopes: options.resolveScopes,
 		}),
-		handleRequest(request) {
-			return handleAuthRequest(
-				routes,
-				path,
-				request,
-				oauth,
-				userStore,
-				tokenManager,
-				emailVerification,
-				passwordReset,
-			)
+		handleRequest,
+		httpRoute: {
+			path,
+			handle: handleRequest,
+			insights: { key: 'auth', read: () => activity.snapshot() },
 		},
+		activity: () => activity.snapshot(),
 		async revokeAllForUser(userId) {
 			await routes.revokeAllForUser(userId)
 		},
@@ -1106,4 +1144,43 @@ function readEnvSecret(): string | undefined {
 
 function isProduction(): boolean {
 	return typeof process !== 'undefined' && process.env.NODE_ENV === 'production'
+}
+
+/**
+ * Counts a finished request by what it was and how it ended. Codes come from the response's own
+ * `code`; nothing about the person is read.
+ */
+function recordActivity(
+	activity: AuthActivity,
+	pathPrefix: string,
+	request: KoraAuthHttpRequest,
+	response: AuthRouteResponse<unknown>,
+): void {
+	if (response.status >= 500) activity.serverError()
+	const path = normalizePath(request.path)
+	const relative = path === pathPrefix ? '/' : path.slice(pathPrefix.length)
+	const method = request.method.toUpperCase()
+	const body = response.body as { code?: unknown; data?: unknown }
+	const code =
+		typeof body?.code === 'string' ? body.code : response.status >= 500 ? 'SERVER_ERROR' : null
+	const ok = response.status < 400
+	const count = (group: Parameters<AuthActivity['failed']>[0]): void => {
+		if (ok) activity.succeeded(group)
+		else activity.failed(group, code)
+	}
+	if (method === 'POST' && relative === '/signin') {
+		// A first factor that asks for a second isn't a sign-in yet: the MFA step counts it.
+		const data = body?.data as { mfaRequired?: unknown } | undefined
+		if (ok && data?.mfaRequired === true) return
+		count('signIns')
+	} else if (method === 'POST' && relative === '/signup') {
+		count('signUps')
+	} else if (method === 'POST' && relative === '/mfa/verify') {
+		count('mfa')
+		if (ok) activity.succeeded('signIns')
+	} else if (method === 'POST' && relative === '/refresh') {
+		count('refreshes')
+	} else if (/^\/oauth\/[^/]+\/callback$/.test(relative)) {
+		count('oauth')
+	}
 }

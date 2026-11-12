@@ -77,7 +77,7 @@ async function start() {
 		port: Number(process.env.PORT) || 3001,
 		staticDir: './dist',
 		syncPath,
-		httpRoutes: auth ? [{ path: '/auth', handle: auth.handleRequest }] : undefined,
+		httpRoutes: auth ? [auth.httpRoute] : undefined,
 		syncOptions: {
 			schemaVersion: schema.version,
 			...(auth ? { auth: auth.auth } : {}),

@@ -305,7 +305,7 @@ const auth = createKoraAuthServer({
 const server = createProductionServer({
   store: createSqliteServerStore({ filename: './kora-server.db' }),
   syncPath: '/kora-sync',
-  httpRoutes: [{ path: '/auth', handle: auth.handleRequest }],
+  httpRoutes: [auth.httpRoute],
   syncOptions: { auth: auth.auth },
 })
 ```

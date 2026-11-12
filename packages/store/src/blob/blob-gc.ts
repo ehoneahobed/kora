@@ -24,6 +24,10 @@ export interface BlobGcOptions {
 	 * arrive much later (the device went offline in between), so a blob is only garbage
 	 * once it has had time to be claimed. Applies to stores that report write times
 	 * (`FilesystemBlobStore`, `ObjectBlobStore`); others are swept as before.
+	 *
+	 * It applies to `dryRun` too: a dry run lists what a real sweep would delete. To list
+	 * every unreferenced blob however recent (to apply a grace of your own, per uploader
+	 * say), pass `graceMs: 0`.
 	 */
 	graceMs?: number
 	/** The current time, for tests. */
