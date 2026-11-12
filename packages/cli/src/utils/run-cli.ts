@@ -3,9 +3,10 @@ import { type CommandDef, runCommand, runMain } from 'citty'
 import { createLogger } from './logger'
 
 /**
- * Runs the CLI. A KoraError is a failure the CLI expected and explained, so only its message is
- * printed, once. Help, versions, citty's own usage errors and unexpected failures (which keep
- * their stack, to be reported) go through citty's runMain as before.
+ * Runs the CLI. A failure prints its message once: a KoraError is one the CLI expected and
+ * explained; any other error's stack is printed only with `KORA_DEBUG=1`, with a hint saying so.
+ * Help, versions and citty's own usage errors (an unknown command, a missing argument) go
+ * through citty, which shows the usage they need.
  */
 export async function runCli(main: CommandDef, rawArgs: string[]): Promise<void> {
 	if (
@@ -19,14 +20,29 @@ export async function runCli(main: CommandDef, rawArgs: string[]): Promise<void>
 	try {
 		await runCommand(main, { rawArgs })
 	} catch (error) {
+		const logger = createLogger()
 		if (error instanceof KoraError) {
-			createLogger().error(error.message)
+			logger.error(error.message)
 			process.exit(1)
 		}
-		// Let citty report it: usage for an unknown command, the stack for a bug.
-		await runMain(
-			{ ...main, run: () => Promise.reject(error), subCommands: undefined },
-			{ rawArgs: [] },
-		)
+		if (isCittyUsageError(error)) {
+			await runMain(
+				{ ...main, run: () => Promise.reject(error), subCommands: undefined },
+				{ rawArgs: [] },
+			)
+			return
+		}
+		logger.error(error instanceof Error ? error.message : String(error))
+		if (process.env.KORA_DEBUG && error instanceof Error && error.stack) {
+			console.error(error.stack)
+		} else {
+			logger.step('Run again with KORA_DEBUG=1 to see where it happened.')
+		}
+		process.exit(1)
 	}
+}
+
+/** citty's own argument errors (`CLIError`), which need the usage text shown with them. */
+function isCittyUsageError(error: unknown): boolean {
+	return error instanceof Error && error.name === 'CLIError'
 }

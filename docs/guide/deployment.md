@@ -53,7 +53,7 @@ From the CLI, Kora Cloud deploys to production. Previews come from pull requests
 
 Set environment variables and secrets in the console (project **Settings**); the CLI never handles them. If the build fails, the CLI prints the end of the build log and the reason. Production keeps running the previous release until a new one is verified.
 
-In CI, set `KORA_CLOUD_TOKEN` to a CLI sign-in's token instead of running `kora login`, and pass `--confirm --prod`. To roll back, use **Roll back** on an earlier deployment in the console.
+In CI, set `KORA_CLOUD_TOKEN` to a CLI sign-in's token instead of running `kora login`, and pass `--confirm --prod` from a folder linked to the project: `.kora/cloud.json` holds only the organization and project ids (`{"organizationId": "…", "projectId": "…"}`), so CI can write it before deploying. A failure prints one line saying what to do; set `KORA_DEBUG=1` to also see where it happened. To roll back, use **Roll back** on an earlier deployment in the console.
 
 ### Moving an existing app to Kora Cloud
 

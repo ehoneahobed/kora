@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { defineCommand } from 'citty'
-import { DeployPlatformUnavailableError, InvalidProjectError } from '../../errors'
+import { readProjectLink } from '../../cloud/project-link'
+import { CliError, DeployPlatformUnavailableError, InvalidProjectError } from '../../errors'
 import { createPromptClient } from '../../prompts/prompt-client'
 import { findProjectRoot } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
@@ -201,14 +202,22 @@ export const deployCommand = defineCommand({
 		if (!isImplementedDeployPlatform(platform)) {
 			throw new DeployPlatformUnavailableError(platform, IMPLEMENTED_DEPLOY_PLATFORMS)
 		}
-		const appName = resolveAppName(args.app, existingState?.appName, projectRoot, confirmMode)
 		// Kora Cloud chooses where to run, and deploys to production from the CLI: previews come
 		// from pull requests, so there is no CLI preview to fall back to.
 		const cloud = platform === 'kora-cloud'
+		// A folder linked to a Kora Cloud project (.kora/cloud.json) already says where it deploys:
+		// the app name is only a label then, so --confirm (CI) needs no --app.
+		const linked = cloud && (await readProjectLink(projectRoot)) !== null
+		const appName = resolveAppName(
+			args.app,
+			existingState?.appName,
+			projectRoot,
+			confirmMode && !linked,
+		)
 		const region = cloud ? null : resolveRegion(args.region, existingState?.region, confirmMode)
 		if (cloud && args.prod !== true) {
 			if (confirmMode || !isInteractiveTerminal()) {
-				throw new Error(
+				throw new CliError(
 					'Kora Cloud deploys to production from the CLI (previews come from pull requests). Pass --prod to confirm.',
 				)
 			}
@@ -310,7 +319,7 @@ interface ResolvePlatformOptions {
 async function resolvePlatform(options: ResolvePlatformOptions): Promise<DeployPlatform> {
 	if (typeof options.platformArg === 'string') {
 		if (!isDeployPlatform(options.platformArg)) {
-			throw new Error(
+			throw new CliError(
 				`Invalid --platform value "${options.platformArg}". Valid options: ${DEPLOY_PLATFORMS.join(', ')}`,
 			)
 		}
@@ -322,7 +331,7 @@ async function resolvePlatform(options: ResolvePlatformOptions): Promise<DeployP
 	}
 
 	if (options.confirm || !isInteractiveTerminal()) {
-		throw new Error(
+		throw new CliError(
 			'Missing deploy platform in --confirm mode. Provide --platform or run an interactive deploy first.',
 		)
 	}
@@ -374,8 +383,8 @@ function resolveAppName(
 	}
 
 	if (confirm) {
-		throw new Error(
-			'Missing app name in --confirm mode. Provide --app or run an interactive deploy first.',
+		throw new CliError(
+			'Missing app name in --confirm mode. Provide --app, or run an interactive deploy first.',
 		)
 	}
 
@@ -390,7 +399,7 @@ function resolveRegion(
 	if (typeof argValue === 'string' && argValue.length > 0) return argValue
 	if (storedValue !== undefined) return storedValue
 	if (confirm) {
-		throw new Error(
+		throw new CliError(
 			'Missing region in --confirm mode. Provide --region or run an interactive deploy first.',
 		)
 	}
