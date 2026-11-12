@@ -55,6 +55,23 @@ Set environment variables and secrets in the console (project **Settings**); the
 
 In CI, set `KORA_CLOUD_TOKEN` to a CLI sign-in's token instead of running `kora login`, and pass `--confirm --prod`. To roll back, use **Roll back** on an earlier deployment in the console.
 
+### Moving an existing app to Kora Cloud
+
+An app already running elsewhere (self-hosted, or on another platform) brings its data along in three steps. The app where it runs now is only read, never changed.
+
+```bash
+kora deploy --platform kora-cloud --prod              # 1. deploy the app once, with an empty database
+DATABASE_URL=postgresql://... KORA_BLOB_DIR=/data/blobs \
+  kora export --out my-app.tar                         # 2. bundle its database and files
+kora import my-app.tar --platform kora-cloud           # 3. bring them in
+```
+
+`kora export` reads the whole PostgreSQL database with `pg_dump` (install PostgreSQL's client tools, the same major version as the database server or newer; `--pg-bin` points at them) and the files in the folder `KORA_BLOB_DIR` names. It writes one `.tar` in the same format as a backup downloaded from Kora Cloud. Files kept in an object store (`KORA_BLOB_STORE_URL`) need copying to a folder first, keeping their `<aa>/<hash>` layout.
+
+`kora import` uploads the file straight to the project's own backup storage, through a link that can write that one file and expires after 90 minutes; Kora Cloud never passes the data through its control plane. It then checks the import exactly like a backup: the database is restored into a scratch copy, every Kora operation must match its content hash, and every file must match its name. It needs an owner of the organization.
+
+The result is a verified backup marked **Imported** on the project's **Backups** page, and production's data is still unchanged. From there, **Replace production's data** loads it into production, or **Restore to a new environment** opens a copy to try first. Take the bundle's data at a quiet moment, or stop writes to the old app first: anything written there after the export stays behind.
+
 ---
 
 ## Step-by-Step: Deploy to Fly.io

@@ -127,3 +127,14 @@ export class KoraCloudSignInRequiredError extends KoraError {
 		this.name = 'KoraCloudSignInRequiredError'
 	}
 }
+
+/**
+ * Thrown when `kora export` or `kora import` can't do what was asked: a missing setting or tool,
+ * a damaged file, or a bundle the destination refused. The message says what to do.
+ */
+export class DataTransferError extends KoraError {
+	constructor(message: string, context?: Record<string, unknown>) {
+		super(message, 'DATA_TRANSFER_ERROR', context)
+		this.name = 'DataTransferError'
+	}
+}

@@ -149,6 +149,11 @@ const backup = await app.exportBackup({
 
 ## Sync Server Backups
 
+Two commands back up a server's data, and they hold different things:
+
+- `kora backup create` asks the running server for its Kora data: the operation log and encryption key records. It needs no database access, but leaves out the app's other tables (such as sign-in users) and its files.
+- `kora export` reads the whole PostgreSQL database with `pg_dump` and the files in `KORA_BLOB_DIR`, into one `.tar`. Use it to move an app to another host or to Kora Cloud (`kora import <file> --platform kora-cloud`); see [Moving an existing app to Kora Cloud](./deployment.md#moving-an-existing-app-to-kora-cloud).
+
 For synced apps, back up the server operation log with the CLI:
 
 ```bash
