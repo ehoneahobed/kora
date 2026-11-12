@@ -30,7 +30,7 @@ import {
 	ReadThroughService,
 } from '../read/read-through'
 import { BlobAccessIndex } from '../richtext/blob-access-index'
-import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
+import { BlobChunkRelay, type BlobChunkRelayStats } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
 import { type AwarenessCursorTarget, ClientSession } from '../session/client-session'
 import {
@@ -883,6 +883,14 @@ export class KoraSyncServer {
 				details: { message: error instanceof Error ? error.message : String(error) },
 			})
 		}
+	}
+
+	/**
+	 * How file chunk requests were answered since this server started: served (from the central
+	 * store or a peer), not held by anyone, throttled, and errors. Counts only.
+	 */
+	getFileDeliveryStats(): BlobChunkRelayStats {
+		return this.blobChunkRelay.getStats()
 	}
 
 	/** Statistics for operators, with no record values. Null when the store can't produce them. */

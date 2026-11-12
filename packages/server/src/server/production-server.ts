@@ -11,6 +11,7 @@ import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
 import { addressBucket } from '../read/address-bucket'
 import { readBodyDeadlineMs } from '../read/read-body-deadline'
+import type { BlobChunkRelayStats } from '../richtext/blob-chunk-relay'
 import type { FullResyncTarget, ServerStore } from '../store/server-store'
 import type { StoreInsights } from '../store/store-insights'
 import type { WsWebSocket } from '../transport/ws-server-transport'
@@ -210,6 +211,12 @@ export interface ProductionHttpRoute {
 	/** URL path prefix, for example `/auth`. */
 	path: string
 	handle(request: ProductionHttpRouteRequest): Promise<ProductionHttpRouteResponse>
+	/**
+	 * Counts this route reports in `/__kora/insights`, under `http[key]`, such as the sign-in
+	 * activity of `@korajs/auth` (`httpRoutes: [auth.httpRoute]`). Only numbers in objects up
+	 * to four levels deep are kept; anything else is dropped.
+	 */
+	insights?: { readonly key: string; read(): unknown }
 }
 
 /**
@@ -394,6 +401,8 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			},
 			stored,
 			blobs,
+			files: fileDelivery(syncServer.getFileDeliveryStats()),
+			http: await routeInsights(config.httpRoutes ?? []),
 		}
 	}
 
@@ -1374,4 +1383,66 @@ async function compressReadBody(
 	}
 	if (/\bgzip\b/.test(acceptEncoding)) return { encoding: 'gzip', bytes: await gzipAsync(raw) }
 	return null
+}
+
+/**
+ * File chunk requests since start, for insights: what reached devices, what nobody had (with a
+ * central store, a file that is missing for good; without one, its holders were offline), and
+ * errors. The relay's finer counts stay available from `getFileDeliveryStats()`.
+ */
+function fileDelivery(stats: BlobChunkRelayStats): Record<string, number> {
+	return {
+		served: stats.servedFromStore + stats.servedByPeer,
+		servedFromStore: stats.servedFromStore,
+		servedByPeer: stats.servedByPeer,
+		notHeld: stats.notHeldAfterPeers + stats.notHeldNobodyToAsk + stats.expired,
+		throttled:
+			stats.throttledOverPendingCap +
+			stats.throttledNotReceivable +
+			stats.refusedDuplicateRequestId,
+		storeReadErrors: stats.storeReadErrors,
+		badPeerAnswers: stats.badPeerAnswers,
+	}
+}
+
+const INSIGHT_KEY = /^[A-Za-z0-9_]{1,64}$/
+const INSIGHT_MAX_ENTRIES = 500
+
+/**
+ * What HTTP routes report about themselves, keyed by their `insights.key`. The routes are app
+ * code, so what they return is reduced to counts: non-negative numbers, in objects at most four
+ * levels deep, under short plain keys, at most 500 entries per route. A route whose report
+ * throws is left out.
+ */
+async function routeInsights(
+	routes: readonly ProductionHttpRoute[],
+): Promise<Record<string, unknown>> {
+	const out: Record<string, unknown> = {}
+	for (const route of routes) {
+		const source = route.insights
+		if (!source || !INSIGHT_KEY.test(source.key)) continue
+		try {
+			let budget = INSIGHT_MAX_ENTRIES
+			const clean = (value: unknown, depth: number): unknown => {
+				if (typeof value === 'number')
+					return Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
+				if (depth >= 4 || typeof value !== 'object' || value === null || Array.isArray(value))
+					return undefined
+				const result: Record<string, unknown> = {}
+				for (const [key, inner] of Object.entries(value)) {
+					if (budget <= 0 || !INSIGHT_KEY.test(key)) continue
+					const kept = clean(inner, depth + 1)
+					if (kept === undefined) continue
+					budget -= 1
+					result[key] = kept
+				}
+				return result
+			}
+			const kept = clean(await source.read(), 0)
+			if (kept !== undefined) out[source.key] = kept
+		} catch {
+			// One route's broken report never takes insights down.
+		}
+	}
+	return out
 }

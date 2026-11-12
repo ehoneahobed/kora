@@ -23,6 +23,11 @@ export {
 	InMemoryAuthStoreError,
 } from './provider/built-in/quickstart-server'
 export type {
+	AuthActivityCounts,
+	AuthActivitySnapshot,
+	AuthOutcomeCounts,
+} from './provider/built-in/auth-activity'
+export type {
 	CreateKoraAuthServerOptions,
 	KoraAuthHttpRequest,
 	KoraAuthServer,

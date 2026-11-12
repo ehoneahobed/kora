@@ -36,6 +36,63 @@ afterEach(async () => {
 })
 
 describe('/__kora/insights', () => {
+	test('routes report counts under http, reduced to numbers; file delivery is counted', async () => {
+		const base = await start({
+			httpRoutes: [
+				{
+					path: '/auth',
+					handle: async () => ({ status: 200, body: {} }),
+					insights: {
+						key: 'auth',
+						read: () => ({
+							since: 1,
+							lastHour: {
+								signIns: {
+									succeeded: 3,
+									failed: 1,
+									byCode: { INVALID_CREDENTIALS: 1, 'not a key!': 4 },
+								},
+							},
+							email: 'person@example.com',
+							negative: -5,
+							deep: { a: { b: { c: { d: 1 } } } },
+						}),
+					},
+				},
+				{
+					path: '/broken',
+					handle: async () => ({ status: 200, body: {} }),
+					insights: {
+						key: 'broken',
+						read: () => {
+							throw new Error('boom')
+						},
+					},
+				},
+			],
+		})
+		const insights = (await (await get(base, '/__kora/insights', 'insights')).json()) as {
+			http: Record<string, unknown>
+			files: unknown
+		}
+		expect(insights.http.auth).toEqual({
+			since: 1,
+			lastHour: { signIns: { succeeded: 3, failed: 1, byCode: { INVALID_CREDENTIALS: 1 } } },
+			deep: { a: { b: {} } },
+		})
+		expect(insights.http.broken).toBeUndefined()
+		expect(JSON.stringify(insights)).not.toContain('person@example.com')
+		expect(insights.files).toEqual({
+			served: 0,
+			servedFromStore: 0,
+			servedByPeer: 0,
+			notHeld: 0,
+			throttled: 0,
+			storeReadErrors: 0,
+			badPeerAnswers: 0,
+		})
+	})
+
 	test('needs a token, and accepts the insights or metrics one', async () => {
 		const base = await start()
 		expect((await get(base, '/__kora/insights')).status).toBe(401)

@@ -95,7 +95,7 @@ export const DEFAULT_BLOB_RELAY_RETRY_AFTER_MS = 2_000
  * Each answer the requester received is counted once, under its kind; a request the
  * relay could not answer because its requester left (disconnected with it pending, or
  * gone by the time its answer was ready) is counted once under `requesterGone` and
- * under nothing else. Answers with bytes are not counted.
+ * under nothing else. Answers with bytes are counted by where they came from.
  */
 export interface BlobChunkRelayStats {
 	/** Answered "not held": every peer it was forwarded to said not held, or left. */
@@ -112,6 +112,14 @@ export interface BlobChunkRelayStats {
 	refusedDuplicateRequestId: number
 	/** Not answered: the requester left before the answer (nobody to answer). */
 	requesterGone: number
+	/** Answered with bytes from the central store. */
+	servedFromStore: number
+	/** Answered with bytes a peer sent, checked against the hash. */
+	servedByPeer: number
+	/** The central store failed to read a chunk (the request then fell back to peers). */
+	storeReadErrors: number
+	/** A peer sent bytes that didn't hash to the chunk asked for (ignored). */
+	badPeerAnswers: number
 }
 
 interface PendingRequest {
@@ -139,7 +147,10 @@ interface PendingRequest {
 type RelayReply = { bytes: string } | 'not-held' | 'throttled'
 
 /** The counter an answer moves when it reaches its requester (null for bytes). */
-type AnswerCounter = Exclude<keyof BlobChunkRelayStats, 'requesterGone' | 'throttledNotReceivable'>
+type AnswerCounter = Exclude<
+	keyof BlobChunkRelayStats,
+	'requesterGone' | 'throttledNotReceivable' | 'storeReadErrors' | 'badPeerAnswers'
+>
 
 interface InFlightRequest {
 	handlers: number
@@ -205,6 +216,10 @@ export class BlobChunkRelay {
 		throttledNotReceivable: 0,
 		refusedDuplicateRequestId: 0,
 		requesterGone: 0,
+		servedFromStore: 0,
+		servedByPeer: 0,
+		storeReadErrors: 0,
+		badPeerAnswers: 0,
 	}
 
 	constructor(
@@ -289,6 +304,7 @@ export class BlobChunkRelay {
 				} catch {
 					// A store read error is treated as "not held here": fall back to peers
 					// rather than crashing the connection.
+					this.stats.storeReadErrors += 1
 					bytes = null
 				}
 				if (bytes !== null) {
@@ -302,7 +318,12 @@ export class BlobChunkRelay {
 					if (own && own.originSessionId === sourceSessionId) {
 						this.settle(message.requestId, own)
 					}
-					this.answer(sourceSessionId, message.requestId, { bytes: encodeBlobChunkBytes(bytes) })
+					this.answer(
+						sourceSessionId,
+						message.requestId,
+						{ bytes: encodeBlobChunkBytes(bytes) },
+						'servedFromStore',
+					)
 					return
 				}
 			}
@@ -345,6 +366,7 @@ export class BlobChunkRelay {
 		if ((await hashBlob(decoded)) !== entry.hash) {
 			// Wrong bytes for the hash: ignore them and keep waiting for an honest peer.
 			// The liar counts as "not held", so it cannot keep the request open forever.
+			this.stats.badPeerAnswers += 1
 			if (this.pending.get(message.requestId) === entry) {
 				entry.notHeldFrom.add(sourceSessionId)
 				this.answerIfNobodyLeft(message.requestId, entry)
@@ -357,7 +379,7 @@ export class BlobChunkRelay {
 			return
 		}
 		this.policy.observeVerifiedBytes?.(entry.hash, decoded)
-		this.answer(entry.originSessionId, message.requestId, { bytes: message.bytes })
+		this.answer(entry.originSessionId, message.requestId, { bytes: message.bytes }, 'servedByPeer')
 	}
 
 	private async allowed(check: () => Promise<boolean>): Promise<boolean> {
