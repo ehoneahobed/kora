@@ -176,7 +176,7 @@ describe.skipIf(!PG_URL)('postgres: device health', () => {
 	const clients: ReturnType<typeof postgres>[] = []
 	afterAll(async () => {
 		for (const client of clients) await client.end()
-		await dropTrackedPgSchemas(PG_URL ?? '')
+		await dropTrackedPgSchemas()
 	})
 
 	test('a database from before device health gains its columns, and reports are counted', async () => {
