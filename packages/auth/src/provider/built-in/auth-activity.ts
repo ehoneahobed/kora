@@ -76,7 +76,8 @@ export class AuthActivity {
 		}
 	}
 
-	private add(key: string): void {
+	private add(name: string): void {
+		let key = name
 		const hour = Math.floor(this.now() / HOUR_MS)
 		let bucket = this.buckets.at(-1)
 		if (!bucket || bucket.hour !== hour) {
