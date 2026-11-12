@@ -64,6 +64,22 @@ export interface CloudLogLine {
  * The Kora Cloud API, as the CLI uses it. Every call goes through the same public API the console
  * uses; the CLI holds no provider credentials.
  */
+/** A backup or import as the CLI follows it. */
+export interface CloudBackup {
+	id: string
+	status: 'queued' | 'running' | 'verified' | 'failed' | 'expired'
+	trigger: string
+	failure: string | null
+	report: {
+		database: { bytes: number; tables: number; rows: number } | null
+		kora: { operations: number } | null
+		files: { count: number; bytes: number } | null
+		checks: Array<{ name: string; ok: boolean; detail: string }>
+	} | null
+	/** An import waiting for its upload: where to send the file, until when. Owners only. */
+	upload?: { url: string; expiresAt: string; method: string } | null
+}
+
 export class KoraCloudClient {
 	public constructor(
 		private readonly apiUrl: string,
@@ -163,6 +179,26 @@ export class KoraCloudClient {
 				`/v1/projects/${encodeURIComponent(projectId)}/logs?since=${sinceMinutes}`,
 			)
 		).lines
+	}
+
+	/** Starts an import into the project's production environment. Owners only. */
+	public async startImport(projectId: string): Promise<CloudBackup> {
+		return (
+			await this.request<{ backup: CloudBackup }>(
+				'POST',
+				`/v1/projects/${encodeURIComponent(projectId)}/backups/import`,
+				{ json: {} },
+			)
+		).backup
+	}
+
+	public async backups(projectId: string): Promise<CloudBackup[]> {
+		return (
+			await this.request<{ backups: CloudBackup[] }>(
+				'GET',
+				`/v1/projects/${encodeURIComponent(projectId)}/backups`,
+			)
+		).backups
 	}
 
 	private async request<T>(
