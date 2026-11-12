@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import {
 	type CreateKoraAuthServerOptions,
+	authSecretFromEnv,
 	createKoraAuthServer,
 	createPostgresOAuthStores,
 	createPostgresUserStore,
@@ -116,7 +117,8 @@ async function createAuth() {
 		? await createPostgresUserStore({ connectionString: process.env.DATABASE_URL })
 		: await createSqliteUserStore({ filename: process.env.KORA_AUTH_DB || './.kora/kora-auth.db' })
 	return createKoraAuthServer({
-		jwtSecret: process.env.KORA_AUTH_SECRET,
+		// KORA_AUTH_SECRET signs; KORA_AUTH_SECRET_PREVIOUS keeps sessions from an earlier secret valid.
+		jwtSecret: authSecretFromEnv(),
 		userStore,
 		...(oauth ? { oauth } : {}),
 	})

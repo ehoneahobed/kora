@@ -85,6 +85,16 @@ export const auth = createKoraAuthServer({
 
 ::: tip Generating a secret
 Run `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"` to create a 256-bit secret. Store it in `KORA_AUTH_SECRET`, never in source code.
+
+### Changing the sign-in secret
+
+Change the secret (for example after someone who could read it leaves) without signing anyone out:
+
+1. Move the current value to `KORA_AUTH_SECRET_PREVIOUS` and put a new one in `KORA_AUTH_SECRET`. Restart the server.
+2. New sessions are signed with the new secret, and sessions signed with the old one keep working; each moves to the new secret at its next refresh.
+3. After the refresh-token lifetime (90 days by default), remove the old value from `KORA_AUTH_SECRET_PREVIOUS`. It holds several secrets, comma-separated, if you change it again sooner.
+
+`createKoraAuthServer` reads both variables when `jwtSecret` is left out. If you pass `jwtSecret` yourself, pass `authSecretFromEnv()` (from `@korajs/auth/server`) to keep this; a plain `process.env.KORA_AUTH_SECRET` reads only the current secret, so changing it signs everyone out. On Kora Cloud, **Change credentials** does this for you.
 :::
 
 In production (`NODE_ENV=production`) `createKoraAuthServer` refuses the in-memory user and

@@ -32,7 +32,7 @@ Values in the file are examples or defaults, never real secrets. Copy it to `.en
 
 ## What the framework sets for you
 
-Hosts set `PORT`, `DATABASE_URL`, `PUBLIC_URL` and the file store (`KORA_BLOB_STORE_URL` or `KORA_BLOB_DIR`, see [where a server keeps blobs](/guide/storage-configuration#where-a-server-keeps-blobs)). On Kora Cloud the operational tokens (`KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_BACKUP_TOKEN`) and `KORA_AUTH_SECRET` are generated as well. List them anyway: self-hosters need to know they exist.
+Hosts set `PORT`, `DATABASE_URL`, `PUBLIC_URL` and the file store (`KORA_BLOB_STORE_URL` or `KORA_BLOB_DIR`, see [where a server keeps blobs](/guide/storage-configuration#where-a-server-keeps-blobs)). On Kora Cloud the operational tokens (`KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_BACKUP_TOKEN`) and `KORA_AUTH_SECRET` are generated as well (with `KORA_AUTH_SECRET_PREVIOUS` when the secret has been changed, see [changing the sign-in secret](/guide/authentication#changing-the-sign-in-secret)). List them anyway: self-hosters need to know they exist.
 
 ## Checking
 
