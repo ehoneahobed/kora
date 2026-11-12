@@ -102,7 +102,7 @@ If your app signs its own links (share links, invitations, unsubscribe links), s
 import { authSecretFromEnv, createAppSigner } from '@korajs/auth/server'
 
 const shareLinks = createAppSigner(authSecretFromEnv() ?? 'dev-secret', 'share-link')
-const token = shareLinks.sign({ documentId }, { expiresInSeconds: 7 * 24 * 3600 })
+const token = shareLinks.sign({ documentId: 'doc_123' }, { expiresInSeconds: 7 * 24 * 3600 })
 const grant = shareLinks.verify<{ documentId: string }>(token) // null if forged, changed or expired
 ```
 
