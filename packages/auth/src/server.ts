@@ -23,6 +23,8 @@ export {
 	createKoraAuthServer,
 	InMemoryAuthStoreError,
 } from './provider/built-in/quickstart-server'
+export { AppSignerError, createAppSigner } from './provider/built-in/app-signer'
+export type { AppSigner, AppSignOptions, AppVerifyOptions } from './provider/built-in/app-signer'
 export type {
 	AuthActivityCounts,
 	AuthActivitySnapshot,

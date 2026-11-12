@@ -95,6 +95,18 @@ Change the secret (for example after someone who could read it leaves) without s
 3. After the refresh-token lifetime (90 days by default), remove the old value from `KORA_AUTH_SECRET_PREVIOUS`. It holds several secrets, comma-separated, if you change it again sooner.
 
 `createKoraAuthServer` reads both variables when `jwtSecret` is left out. If you pass `jwtSecret` yourself, pass `authSecretFromEnv()` (from `@korajs/auth/server`) to keep this; a plain `process.env.KORA_AUTH_SECRET` reads only the current secret, so changing it signs everyone out. On Kora Cloud, **Change credentials** does this for you.
+
+If your app signs its own links (share links, invitations, unsubscribe links), sign them with `createAppSigner` from `@korajs/auth/server` and the same `authSecretFromEnv()`, so changing the secret doesn't break links already sent:
+
+```typescript
+import { authSecretFromEnv, createAppSigner } from '@korajs/auth/server'
+
+const shareLinks = createAppSigner(authSecretFromEnv() ?? 'dev-secret', 'share-link')
+const token = shareLinks.sign({ documentId }, { expiresInSeconds: 7 * 24 * 3600 })
+const grant = shareLinks.verify<{ documentId: string }>(token) // null if forged, changed or expired
+```
+
+Tokens are signed with the current secret and accepted when signed with any secret still in `KORA_AUTH_SECRET_PREVIOUS`. Each purpose gets its own key, so a share-link token is never accepted as an invitation or a session. The value is signed, not encrypted: put ids in it, not secrets.
 :::
 
 In production (`NODE_ENV=production`) `createKoraAuthServer` refuses the in-memory user and
