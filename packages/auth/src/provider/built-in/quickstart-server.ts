@@ -1129,17 +1129,32 @@ function notFound(): AuthRouteResponse<never> {
 	return { status: 404, body: { error: 'Not found' } }
 }
 
-function readEnvSecret(): string | undefined {
-	if (typeof process === 'undefined') {
-		return undefined
-	}
-	// Treat an explicitly empty or whitespace-only KORA_AUTH_SECRET as "not set"
-	// rather than as a real (invalid) secret. Otherwise an empty string slips past
-	// the nullish-coalescing fallback below and reaches TokenManager, which throws
-	// on secrets shorter than 32 chars — turning a blank env var into a hard crash
-	// instead of the intended dev fallback / production guard.
-	const value = process.env.KORA_AUTH_SECRET
-	return value && value.trim().length > 0 ? value : undefined
+function readEnvSecret(): string | string[] | undefined {
+	return typeof process === 'undefined' ? undefined : authSecretFromEnv(process.env)
+}
+
+/**
+ * The sign-in secret from the environment: `KORA_AUTH_SECRET` signs, and the secrets in
+ * `KORA_AUTH_SECRET_PREVIOUS` (comma-separated) are still accepted, so changing the secret doesn't
+ * sign anyone out: move the old one to `KORA_AUTH_SECRET_PREVIOUS`, set a new `KORA_AUTH_SECRET`,
+ * and remove the old one once every session has refreshed (refresh tokens last 90 days by default).
+ * `createKoraAuthServer` reads this when `jwtSecret` is left out; pass it as `jwtSecret` otherwise.
+ *
+ * An empty or whitespace-only `KORA_AUTH_SECRET` counts as not set (so a blank variable reaches
+ * the development fallback or the production guard, not a crash on a too-short secret), and
+ * previous secrets alone never sign.
+ */
+export function authSecretFromEnv(
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): string | string[] | undefined {
+	// Used exactly as given, as before: trimming would change a secret and sign everyone out.
+	const current = env.KORA_AUTH_SECRET
+	if (!current || current.trim().length === 0) return undefined
+	const previous = (env.KORA_AUTH_SECRET_PREVIOUS ?? '')
+		.split(',')
+		.map((secret) => secret.trim())
+		.filter((secret) => secret.length > 0 && secret !== current)
+	return previous.length > 0 ? [current, ...previous] : current
 }
 
 function isProduction(): boolean {

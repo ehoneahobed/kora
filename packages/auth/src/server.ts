@@ -19,6 +19,7 @@ export type {
 	RateLimiter,
 } from './provider/built-in/auth-routes'
 export {
+	authSecretFromEnv,
 	createKoraAuthServer,
 	InMemoryAuthStoreError,
 } from './provider/built-in/quickstart-server'
