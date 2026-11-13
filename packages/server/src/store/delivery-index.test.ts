@@ -197,6 +197,51 @@ for (const kind of deliveryStoreKinds()) {
 				await handle.done()
 			}
 		})
+
+		test('a reopened store keeps its index when it is not told the partitions again', async () => {
+			const handle = await kind.make()
+			if (kind.name === 'memory' || !handle.open) {
+				await handle.done()
+				return
+			}
+			try {
+				const store = paused(handle.store)
+				store.pauseDeliveryBackfillForTests(true)
+				await store.setSchema(schema)
+				const expected = await fill(store)
+				await store.setDeliveryPartitions?.({ notes: ['body'] })
+				await store.backfillDeliveryPartitions?.()
+				const built = await store.getDeliveryPartitionState?.()
+				expect(built?.through).toBe(expected.length)
+
+				// A server applies the schema before its sync config hands over the partitions,
+				// and a script never does: neither may reset the index.
+				const reopened = paused(handle.open())
+				reopened.pauseDeliveryBackfillForTests(true)
+				await reopened.setSchema(schema)
+				const kept = await reopened.getDeliveryPartitionState?.()
+				expect(kept?.through).toBe(expected.length)
+				expect(kept?.fingerprint).toBe(built?.fingerprint)
+				expect(kept?.planFingerprint).toBe(built?.fingerprint)
+				expect(await rowsOf(handle)).toHaveLength(24)
+				await reopened.setDeliveryPartitions?.({ notes: ['body'] })
+				expect((await reopened.getDeliveryPartitionState?.())?.through).toBe(expected.length)
+
+				// Partitions that really changed still rebuild the index, and are remembered.
+				await reopened.setDeliveryPartitions?.({})
+				const changed = await reopened.getDeliveryPartitionState?.()
+				expect(changed?.through).toBe(0)
+				await reopened.backfillDeliveryPartitions?.()
+				const third = paused(handle.open())
+				third.pauseDeliveryBackfillForTests(true)
+				await third.setSchema(schema)
+				const after = await third.getDeliveryPartitionState?.()
+				expect(after?.fingerprint).toBe(changed?.fingerprint)
+				expect(after?.through).toBe(expected.length)
+			} finally {
+				await handle.done()
+			}
+		})
 	})
 }
 
