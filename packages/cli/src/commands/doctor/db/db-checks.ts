@@ -4,9 +4,11 @@ import type { DoctorCheckResult } from '../doctor-checks'
 import type { DoctorDatabase, DoctorRow } from './database'
 import { type PendingMigrationReport, checkPendingMigrations } from './pending-migrations'
 import {
+	FOLD_PLAN_FINGERPRINTS_KEY,
 	FOLD_PLAN_FINGERPRINT_KEY,
 	RELEASED_NODE_OWNER,
 	RESERVED_NODE_PREFIX,
+	SCOPE_SNAPSHOT_FINGERPRINTS_KEY,
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	SCOPE_SNAPSHOT_PENDING_KEY,
 	SERVER_EVER_AUTHORITY_KEY,
@@ -15,6 +17,7 @@ import {
 	SERVER_LOG_QUARANTINE_TABLE,
 	replannedCollections,
 	scopeSnapshotFingerprint,
+	scopeSnapshotFingerprints,
 } from './server-meta'
 
 /** What the database checks need besides the database. */
@@ -692,30 +695,45 @@ async function checkStartupMigration(
 	const totalRecords = perCollection.reduce((sum, row) => sum + Number(row.records), 0)
 	const totalOps = perCollection.reduce((sum, row) => sum + Number(row.ops), 0)
 
-	// Re-materialization (record fold states).
+	// Re-materialization (record fold states). A server that records per-collection plans
+	// (FOLD_PLAN_FINGERPRINTS_KEY) re-folds only the collections whose plan changed; an older
+	// database re-folds every record when the plan changed, and nothing (a restamp) when not.
 	const stored = layout.meta.get(FOLD_PLAN_FINGERPRINT_KEY)
+	const storedByCollection = parseJsonMap(layout.meta.get(FOLD_PLAN_FINGERPRINTS_KEY))
 	let refoldReason: string | null = null
+	let refoldOnly: string[] | null = null
 	if (!layout.tables.has('kora_fold_state') || stored === undefined) {
 		refoldReason = 'first start of a release with fold states (from beta.12 or earlier)'
 	} else {
 		const plan = replannedCollections(stored, schema)
 		if (plan.formatChanged) refoldReason = 'the fold-state format changed'
-		else if (plan.collections.length > 0)
-			refoldReason = `the merge plan of ${plan.collections.join(', ')} changed`
 		else if (plan.hasTransforms && !stored.includes(`xf@v${schema.version}(`))
 			refoldReason = `the schema version changed to v${schema.version} with operation transforms registered`
+		else if (plan.collections.length > 0) {
+			refoldReason = `the merge plan of ${plan.collections.join(', ')} changed`
+			if (storedByCollection !== null) refoldOnly = plan.collections
+		}
 	}
 	if (refoldReason !== null && totalRecords > 0) {
-		const richtext = await countRichtextOperations(db, schema)
-		steps.push({
-			what: `re-fold every record (${totalRecords} record(s), ${totalOps} operation(s)${richtext > 0 ? `, ${richtext} rich-text` : ''}) because ${refoldReason}`,
-			seconds: (totalOps - richtext) / MIGRATION_RATES.refold + richtext / MIGRATION_RATES.richtext,
-		})
+		const scoped =
+			refoldOnly === null
+				? null
+				: perCollection.filter((row) => refoldOnly?.includes(String(row.collection)))
+		const records =
+			scoped === null ? totalRecords : scoped.reduce((sum, row) => sum + Number(row.records), 0)
+		const ops = scoped === null ? totalOps : scoped.reduce((sum, row) => sum + Number(row.ops), 0)
+		const richtext = await countRichtextOperations(db, schema, refoldOnly)
+		if (records > 0) {
+			steps.push({
+				what: `re-fold ${scoped === null ? 'every record' : `the records of ${refoldOnly?.join(', ')}`} (${records} record(s), ${ops} operation(s)${richtext > 0 ? `, ${richtext} rich-text` : ''}) because ${refoldReason}`,
+				seconds: (ops - richtext) / MIGRATION_RATES.refold + richtext / MIGRATION_RATES.richtext,
+			})
+		}
 	} else if (refoldReason === null && collections.length > 0 && stored !== undefined) {
 		const stale = await staleRecords(
 			db,
 			collections,
-			stored,
+			activePlanStamps(stored, storedByCollection),
 			await columnsOf(db, 'kora_fold_state'),
 		)
 		if (stale.records > 0) {
@@ -726,22 +744,42 @@ async function checkStartupMigration(
 		}
 	}
 
-	// Scope snapshots.
+	// Scope snapshots. A server that records per-collection fingerprints drops and rebuilds
+	// only the changed collections' snapshots; an older database rebuilds every one when the
+	// captured fields changed.
 	const snapshotColumn = layout.operationsColumns.has('scope_snapshot')
 	const snapshotStored = layout.meta.get(SCOPE_SNAPSHOT_FINGERPRINT_KEY)
 	const snapshotTarget = scopeSnapshotFingerprint(schema)
+	const snapshotTargets = scopeSnapshotFingerprints(schema)
+	const snapshotsByCollection = parseJsonMap(layout.meta.get(SCOPE_SNAPSHOT_FINGERPRINTS_KEY))
+	let snapshotChanged: string[] | 'all' = []
+	if (!snapshotColumn || (snapshotsByCollection === null && snapshotStored !== snapshotTarget)) {
+		snapshotChanged = 'all'
+	} else if (snapshotsByCollection !== null) {
+		snapshotChanged = collections.filter(
+			(name) => snapshotsByCollection[name] !== snapshotTargets[name],
+		)
+	}
 	// A start interrupted during the rebuild left the drop recorded under this target: the
 	// next start resumes it, filling only the snapshots still missing (no second drop).
 	const snapshotResuming =
 		snapshotColumn &&
-		snapshotStored !== snapshotTarget &&
-		layout.meta.get(SCOPE_SNAPSHOT_PENDING_KEY) === snapshotTarget
-	if (!snapshotColumn || (snapshotStored !== snapshotTarget && !snapshotResuming)) {
-		if (totalOps > 0) {
+		snapshotChanged.length > 0 &&
+		layout.meta.get(SCOPE_SNAPSHOT_PENDING_KEY) === JSON.stringify(snapshotTargets)
+	if (snapshotChanged.length > 0 && !snapshotResuming) {
+		const changed = snapshotChanged
+		const ops =
+			changed === 'all'
+				? totalOps
+				: perCollection
+						.filter((row) => changed.includes(String(row.collection)))
+						.reduce((sum, row) => sum + Number(row.ops), 0)
+		if (ops > 0) {
 			steps.push({
-				what: `rebuild the scope snapshot of every operation (${totalOps}) because ${!snapshotColumn || snapshotStored === undefined ? 'none were captured yet' : 'the scalar fields of the schema changed'}`,
+				what: `rebuild the scope snapshot of ${changed === 'all' ? 'every operation' : `the operations of ${changed.join(', ')}`} (${ops}) because ${!snapshotColumn || snapshotStored === undefined ? 'none were captured yet' : 'the scalar fields of the schema changed'}`,
 				seconds:
-					totalOps / MIGRATION_RATES.snapshot + layout.operationCount / MIGRATION_RATES.rewrite,
+					ops / MIGRATION_RATES.snapshot +
+					(changed === 'all' ? layout.operationCount : ops) / MIGRATION_RATES.rewrite,
 			})
 		}
 	} else if (collections.length > 0) {
@@ -823,13 +861,14 @@ async function checkStartupMigration(
 async function staleRecords(
 	db: DoctorDatabase,
 	collections: string[],
-	storedFingerprint: string,
+	activeStamps: readonly string[],
 	foldColumns: ReadonlyMap<string, string>,
 ): Promise<{ records: number; ops: number }> {
-	const stamp = createHash('sha256').update(storedFingerprint).digest('hex').slice(0, 16)
 	// beta.13 and beta.14 fold states have no `plan` column; the server adds it as '' on
 	// start, which matches every plan, so its absence marks nothing stale.
-	const planTest = foldColumns.has('plan') ? `OR (f.plan <> '' AND f.plan <> ?)` : ''
+	const planTest = foldColumns.has('plan')
+		? `OR (f.plan <> '' AND f.plan NOT IN (${activeStamps.map(() => '?').join(', ')}))`
+		: ''
 	const coveredTest = foldColumns.has('covered_op_id')
 		? 'OR NOT EXISTS (SELECT 1 FROM operations x WHERE x.id = f.covered_op_id AND x.delivery_seq = f.covered_seq)'
 		: ''
@@ -842,18 +881,55 @@ async function staleRecords(
 		WHERE f.covered_seq IS NULL OR f.covered_seq <> r.max_seq
 			${coveredTest}
 			${planTest}`,
-		foldColumns.has('plan') ? [...collections, stamp] : collections,
+		foldColumns.has('plan') ? [...collections, ...activeStamps] : collections,
 	)
 	return { records: count(rows), ops: Number(rows[0]?.ops ?? 0) }
+}
+
+/** The stamp the server stores with a fold state of a fingerprint (`planStampOf`). */
+function planStampOf(fingerprint: string): string {
+	return createHash('sha256').update(fingerprint).digest('hex').slice(0, 16)
+}
+
+/**
+ * The plan stamps the recorded plan makes current: each collection's own (per-collection
+ * plans) and the whole-schema one (states written before them, or by an older server).
+ */
+function activePlanStamps(
+	storedFingerprint: string,
+	byCollection: Record<string, string> | null,
+): string[] {
+	return [
+		planStampOf(storedFingerprint),
+		...Object.values(byCollection ?? {}).map((fingerprint) => planStampOf(fingerprint)),
+	]
+}
+
+/** A JSON object of strings from `kora_server_meta`, or null when absent or unreadable. */
+function parseJsonMap(raw: string | undefined): Record<string, string> | null {
+	if (raw === undefined) return null
+	try {
+		const parsed: unknown = JSON.parse(raw)
+		if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+		const out: Record<string, string> = {}
+		for (const [key, value] of Object.entries(parsed)) {
+			if (typeof value === 'string') out[key] = value
+		}
+		return out
+	} catch {
+		return null
+	}
 }
 
 /** Operations writing a rich-text field (one Yjs merge each when re-folded). */
 async function countRichtextOperations(
 	db: DoctorDatabase,
 	schema: SchemaDefinition,
+	only: readonly string[] | null = null,
 ): Promise<number> {
 	let total = 0
 	for (const [collection, definition] of Object.entries(schema.collections)) {
+		if (only !== null && !only.includes(collection)) continue
 		const fields = Object.entries(definition.fields)
 			.filter(([, descriptor]) => descriptor.kind === 'richtext')
 			.map(([name]) => name)

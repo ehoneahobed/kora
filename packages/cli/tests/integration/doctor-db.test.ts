@@ -22,7 +22,7 @@ import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
 import { parseDoctorDatabaseUrl, withDoctorDatabase } from '../../src/commands/doctor/db/database'
 import { runDatabaseChecks } from '../../src/commands/doctor/db/db-checks'
-import { scopeSnapshotFingerprint } from '../../src/commands/doctor/db/server-meta'
+import { scopeSnapshotFingerprints } from '../../src/commands/doctor/db/server-meta'
 import type { DoctorCheckResult } from '../../src/commands/doctor/doctor-checks'
 import { doctorHasFailures } from '../../src/commands/doctor/doctor-checks'
 
@@ -463,14 +463,14 @@ for (const backend of [sqliteBackend, pgBackend]) {
 					},
 				}) as unknown as SchemaDefinition
 				const fresh = find(await doctor(database.url, renamed), 'db-startup-migration')
-				expect(fresh.message).toContain('rebuild the scope snapshot of every operation (3)')
-				// A start under `renamed` dropped every snapshot, rebuilt all but one, and died.
-				const target = scopeSnapshotFingerprint(renamed)
+				expect(fresh.message).toContain('rebuild the scope snapshot of the operations of notes (3)')
+				// A start under `renamed` dropped the snapshots, rebuilt all but one, and died.
+				const target = JSON.stringify(scopeSnapshotFingerprints(renamed))
 				await database.raw(
 					`INSERT INTO kora_server_meta (key, value) VALUES ('scope_snapshot_fields_pending', '${target}'); UPDATE operations SET scope_snapshot = NULL WHERE record_id = 'n2'`,
 				)
 				const resumed = find(await doctor(database.url, renamed), 'db-startup-migration')
-				expect(resumed.message).not.toContain('of every operation')
+				expect(resumed.message).not.toContain('rebuild the scope snapshot')
 				expect(resumed.message).toContain(
 					'finish an interrupted scope snapshot rebuild (1 operation(s) left)',
 				)
@@ -488,9 +488,67 @@ for (const backend of [sqliteBackend, pgBackend]) {
 				}) as unknown as SchemaDefinition
 				const result = find(await doctor(database.url, counter), 'db-startup-migration')
 				expect(result.status).toBe('pass')
-				expect(result.message).toContain('re-fold every record (2 record(s), 3 operation(s))')
+				expect(result.message).toContain(
+					're-fold the records of notes (2 record(s), 3 operation(s))',
+				)
 				expect(result.message).toContain('the merge plan of notes changed')
 				expect(result.message).toMatch(/Estimated (under a second|about \d+ s)/)
+			})
+
+			test('startup migration dry run: only the re-planned collection is counted', async () => {
+				const database = await healthy(backend)
+				const twoCollections = defineSchema({
+					version: 1,
+					collections: { ...base, tags: { fields: { label: t.string() } } },
+				}) as unknown as SchemaDefinition
+				const store = await database.open()
+				await store.setSchema(twoCollections)
+				for (const id of ['t1', 't2', 't3', 't4']) {
+					await store.applyRemoteOperation(
+						await op('device-a', { collection: 'tags', recordId: id, data: { label: id } }),
+					)
+				}
+				await store.close()
+				const counter = defineSchema({
+					version: 1,
+					collections: {
+						tags: { fields: { label: t.string() } },
+						notes: {
+							fields: { ...base.notes.fields, views: t.number().default(0).merge('counter') },
+						},
+					},
+				}) as unknown as SchemaDefinition
+				const result = find(await doctor(database.url, counter), 'db-startup-migration')
+				// notes' 2 records, not the 4 tags as well.
+				expect(result.message).toContain(
+					're-fold the records of notes (2 record(s), 3 operation(s))',
+				)
+				expect(result.message).not.toContain('every record')
+			})
+
+			test('startup migration dry run: a database from before per-collection plans', async () => {
+				const database = await healthy(backend)
+				// As an older server leaves it: no per-collection record, and no per-collection
+				// stamps (here: states from before plans were recorded).
+				await database.raw(
+					"DELETE FROM kora_server_meta WHERE key IN ('fold_plan_fingerprints', 'scope_snapshot_fields_by_collection'); UPDATE kora_fold_state SET plan = ''",
+				)
+				// Unchanged plan: the next start restamps, nothing to re-fold or rebuild.
+				const same = find(await doctor(database.url, schemaV1), 'db-startup-migration')
+				expect(same.message).toContain('re-folds nothing')
+				expect(same.message).not.toContain('rebuild the scope snapshot')
+				// Changed plan: which collections changed is not recorded, so every record.
+				const counter = defineSchema({
+					version: 1,
+					collections: {
+						notes: {
+							fields: { ...base.notes.fields, views: t.number().default(0).merge('counter') },
+						},
+					},
+				}) as unknown as SchemaDefinition
+				expect(find(await doctor(database.url, counter), 'db-startup-migration').message).toContain(
+					're-fold every record (2 record(s), 3 operation(s))',
+				)
 			})
 
 			test('startup migration dry run: a beta.12 database re-folds everything', async () => {

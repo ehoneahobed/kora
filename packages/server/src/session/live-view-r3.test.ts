@@ -10,6 +10,7 @@ import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
+import { FOLD_PLAN_FINGERPRINTS_KEY } from '../store/plan-stamps'
 import { PostgresServerStore } from '../store/postgres-server-store'
 import { FOLD_PLAN_FINGERPRINT_KEY } from '../store/record-fold'
 import { RecordHistoryReplayer, replayRecordHistory } from '../store/scope-snapshot'
@@ -432,9 +433,14 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(false)
 		// And a fold-plan change on restart.
 		await pair.sql('UPDATE kora_fold_state SET covered_seq = 1')
+		// The collection's own recorded plan differs from the running one.
 		await pair.sql('UPDATE kora_server_meta SET value = $1 WHERE key = $2', [
 			'other-plan',
 			FOLD_PLAN_FINGERPRINT_KEY,
+		])
+		await pair.sql('UPDATE kora_server_meta SET value = $1 WHERE key = $2', [
+			JSON.stringify({ lessons: 'other-plan' }),
+			FOLD_PLAN_FINGERPRINTS_KEY,
 		])
 		const restarted = pair.reopen()
 		await restarted.setSchema(schema)
@@ -606,6 +612,10 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 				await pair.sql('UPDATE kora_server_meta SET value = $1 WHERE key = $2', [
 					'other-plan',
 					FOLD_PLAN_FINGERPRINT_KEY,
+				])
+				await pair.sql('UPDATE kora_server_meta SET value = $1 WHERE key = $2', [
+					JSON.stringify({ lessons: 'other-plan' }),
+					FOLD_PLAN_FINGERPRINTS_KEY,
 				])
 				const restarted = pair.reopen()
 				await restarted.setSchema(schema)

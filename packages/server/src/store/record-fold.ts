@@ -56,8 +56,9 @@ import type { MaterializedRecord } from './server-store'
 export type ServerFoldOptions = FoldOptions
 
 /**
- * `kora_server_meta` key holding {@link foldPlanFingerprint} of the schema the stored
- * fold states were built under. A change re-materializes every record.
+ * `kora_server_meta` key holding the whole-schema server fold plan fingerprint of the
+ * newest instance (rolling deploys). Which records a change re-folds is decided per
+ * collection (`FOLD_PLAN_FINGERPRINTS_KEY`, plan-stamps.ts).
  */
 export const FOLD_PLAN_FINGERPRINT_KEY = 'fold_plan_fingerprint'
 
@@ -199,7 +200,12 @@ export interface FoldMigrationReport {
 	 * remaining operations folded onto it (RT-70), never re-folded from the log alone.
 	 */
 	skippedUnclean: number
-	/** True when the fold plan (field kinds, strategies, resolvers) changed: every record was re-folded. */
+	/**
+	 * Collections whose fold plan (field kinds, strategies, resolvers, transforms,
+	 * authorities) changed: their records were re-folded, and only theirs.
+	 */
+	replanned: string[]
+	/** True when every collection was re-planned (or which ones changed was not recorded). */
 	fullRefold: boolean
 }
 

@@ -71,28 +71,99 @@ export function scopeFieldNames(schema: SchemaDefinition, collection: string): R
  * from the log (RT-20).
  */
 export function scopeSnapshotFingerprint(schema: SchemaDefinition): string {
-	const parts: string[] = []
-	for (const collection of Object.keys(schema.collections).sort()) {
-		const fields = schema.collections[collection]?.fields ?? {}
-		const captured = Object.keys(fields)
-			.filter((name) => SNAPSHOT_KINDS.has(fields[name]?.kind ?? ''))
-			.sort()
-			.map((name) => `${name}:${fields[name]?.kind ?? ''}`)
-		parts.push(`${collection}(${captured.join(',')})`)
-	}
+	const parts = Object.keys(schema.collections)
+		.sort()
+		.map((collection) => collectionCapture(schema, collection))
 	// The tombstone state (`deleted`) is additive and is NOT part of the fingerprint: an
 	// absent value reads as unknown and is filled in the background (see live-views.ts),
 	// so instances of different versions never wipe each other's snapshots.
 	return `v1|${parts.join('|')}`
 }
 
+/** `collection(field:kind,...)`: the fields snapshots of `collection` capture. */
+function collectionCapture(schema: SchemaDefinition, collection: string): string {
+	const fields = schema.collections[collection]?.fields ?? {}
+	const captured = Object.keys(fields)
+		.filter((name) => SNAPSHOT_KINDS.has(fields[name]?.kind ?? ''))
+		.sort()
+		.map((name) => `${name}:${fields[name]?.kind ?? ''}`)
+	return `${collection}(${captured.join(',')})`
+}
+
+/**
+ * Per-collection {@link scopeSnapshotFingerprint}: a snapshot holds the values of its own
+ * collection's fields only, so a change in one collection's captured fields invalidates
+ * that collection's snapshots and no other's.
+ */
+export function scopeSnapshotFingerprints(schema: SchemaDefinition): Record<string, string> {
+	const out: Record<string, string> = {}
+	for (const collection of Object.keys(schema.collections).sort()) {
+		out[collection] = `v1|${collectionCapture(schema, collection)}`
+	}
+	return out
+}
+
+/** Meta key under which stores persist {@link scopeSnapshotFingerprints} (JSON). */
+export const SCOPE_SNAPSHOT_FINGERPRINTS_KEY = 'scope_snapshot_fields_by_collection'
+
+/** Which collections' snapshots a schema change invalidated (see {@link scopeSnapshotFingerprints}). */
+export interface ScopeSnapshotRefresh {
+	/** Collections whose snapshots are recomputed from the log. */
+	readonly changed: string[]
+	/** The recorded fingerprints differ from the current ones and are rewritten. */
+	readonly write: boolean
+	/** Value of {@link SCOPE_SNAPSHOT_PENDING_KEY} while this refresh's rebuild is pending. */
+	readonly pendingValue: string
+}
+
+/**
+ * Decide which collections' snapshots must be recomputed. With per-collection
+ * fingerprints recorded: those that differ. With only the whole-schema one (a database
+ * from before them): none when it is unchanged, else every collection.
+ */
+export function decideScopeSnapshotRefresh(
+	schema: SchemaDefinition,
+	recorded: { fingerprints: string | undefined; fingerprint: string | undefined },
+): ScopeSnapshotRefresh {
+	const current = scopeSnapshotFingerprints(schema)
+	const collections = Object.keys(current)
+	const pendingValue = JSON.stringify(current)
+	let map: Record<string, unknown> | null = null
+	if (recorded.fingerprints !== undefined) {
+		try {
+			const parsed: unknown = JSON.parse(recorded.fingerprints)
+			if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+				map = parsed as Record<string, unknown>
+			}
+		} catch {
+			// Unreadable: decided from the whole-schema fingerprint, conservatively.
+		}
+	}
+	if (map !== null) {
+		const recordedMap = map
+		const changed = collections.filter((name) => recordedMap[name] !== current[name])
+		const sameSet = Object.keys(recordedMap).length === collections.length
+		return {
+			changed,
+			write:
+				changed.length > 0 || !sameSet || recorded.fingerprint !== scopeSnapshotFingerprint(schema),
+			pendingValue,
+		}
+	}
+	if (recorded.fingerprint === scopeSnapshotFingerprint(schema)) {
+		return { changed: [], write: true, pendingValue }
+	}
+	return { changed: collections, write: true, pendingValue }
+}
+
 /** Meta key under which stores persist {@link scopeSnapshotFingerprint}. */
 export const SCOPE_SNAPSHOT_FINGERPRINT_KEY = 'scope_snapshot_fields'
 
 /**
- * Meta key recording that every snapshot was dropped for a rebuild under this
- * {@link scopeSnapshotFingerprint}: a restart before the rebuild completes resumes it
- * (fills the snapshots still missing) instead of dropping and rebuilding all of them.
+ * Meta key recording that the changed collections' snapshots were dropped for a rebuild
+ * under these fingerprints (`ScopeSnapshotRefresh.pendingValue`): a restart before the
+ * rebuild completes resumes it (fills the snapshots still missing) instead of dropping and
+ * rebuilding them again.
  */
 export const SCOPE_SNAPSHOT_PENDING_KEY = 'scope_snapshot_fields_pending'
 
