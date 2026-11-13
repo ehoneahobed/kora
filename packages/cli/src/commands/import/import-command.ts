@@ -25,6 +25,23 @@ export interface CloudImportOptions {
 	sleep?: ((milliseconds: number) => Promise<void>) | undefined
 	pollMs?: number | undefined
 	blockBytes?: number | undefined
+	/**
+	 * Accept exactly this many operations whose ids aren't their content hashes: written by the
+	 * app's own tools around the server's checks. Use the count a refused import reported.
+	 */
+	acceptUnverified?: number | undefined
+}
+
+/** `--accept-unverified`: a positive whole number, or absent. */
+export function parseAcceptUnverified(value: unknown): number | undefined {
+	if (value === undefined || value === false) return undefined
+	const text = String(value).trim()
+	if (!/^[1-9][0-9]{0,8}$/.test(text)) {
+		throw new DataTransferError(
+			'--accept-unverified takes the number of operations a refused import reported, for example --accept-unverified 120.',
+		)
+	}
+	return Number(text)
 }
 
 /**
@@ -56,7 +73,9 @@ export async function runCloudImport(options: CloudImportOptions): Promise<Cloud
 	const client = options.client ?? (await signedInClient())
 
 	logger.step('Asking Kora Cloud for an upload link')
-	const started = await client.startImport(link.projectId)
+	const started = await client.startImport(link.projectId, {
+		acceptUnverified: options.acceptUnverified,
+	})
 	let backup = started
 	for (let waited = 0; !backup.upload; waited += pollMs) {
 		if (backup.status === 'failed')
@@ -520,12 +539,23 @@ export const importCommand = defineCommand({
 			type: 'string',
 			description: 'Folder holding pg_restore and psql, when they are not on PATH',
 		},
+		'accept-unverified': {
+			type: 'string',
+			description:
+				"With --platform: accept exactly this many operations the app's own tools wrote around the server's checks (the count a refused import reported)",
+		},
 	},
 	async run({ args }) {
 		const logger = createLogger()
 		if (args.platform !== undefined && args.platform !== 'kora-cloud') {
 			throw new DataTransferError(
 				`Unknown --platform "${args.platform}". Use kora-cloud, or leave it out to load the bundle into your own database.`,
+			)
+		}
+		const acceptUnverified = parseAcceptUnverified(args['accept-unverified'])
+		if (args.platform !== 'kora-cloud' && acceptUnverified !== undefined) {
+			throw new DataTransferError(
+				'--accept-unverified applies to an import into Kora Cloud (--platform kora-cloud).',
 			)
 		}
 		if (args.platform !== 'kora-cloud') {
@@ -564,13 +594,18 @@ export const importCommand = defineCommand({
 			file: String(args.file),
 			projectRoot: process.cwd(),
 			logger,
+			acceptUnverified,
 		})
 		const report = backup.report
 		logger.success('Imported and verified')
 		if (report?.database)
 			logger.step(`Database: ${report.database.tables} tables, ${report.database.rows} rows`)
 		if (report?.kora)
-			logger.step(`Kora operations: ${report.kora.operations}, each matching its content hash`)
+			logger.step(
+				backup.acceptUnverified
+					? `Kora operations: ${report.kora.operations}, ${backup.acceptUnverified} of them accepted as written by the app's own tools; any later change to those is still caught`
+					: `Kora operations: ${report.kora.operations}, each matching its content hash`,
+			)
 		if (report?.files)
 			logger.step(`Files: ${report.files.count} (${formatBytes(report.files.bytes)})`)
 		logger.blank()

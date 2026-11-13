@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { expect, test } from 'vitest'
 import { type CloudBackup, KoraCloudClient } from '../../cloud/cloud-client'
 import type { Logger } from '../../utils/logger'
-import { runCloudImport } from './import-command'
+import { parseAcceptUnverified, runCloudImport } from './import-command'
 
 const quiet: Logger = {
 	info: () => undefined,
@@ -32,6 +32,7 @@ async function linkedProject(bytes: number): Promise<{ root: string; file: strin
 /** Kora Cloud's API and Azure's blob endpoint, as the import sees them. */
 function fakeCloud(outcome: { final: Partial<CloudBackup>; refuseBlocks?: number }) {
 	const puts: Array<{ url: string; bytes: number; body?: string }> = []
+	const starts: unknown[] = []
 	let polls = 0
 	let uploaded = false
 	const backup = (extra: Partial<CloudBackup>): CloudBackup => ({
@@ -58,8 +59,10 @@ function fakeCloud(outcome: { final: Partial<CloudBackup>; refuseBlocks?: number
 			return new Response(null, { status: 201 })
 		}
 		const path = new URL(url).pathname
-		if (path === '/v1/projects/prj_1/backups/import')
+		if (path === '/v1/projects/prj_1/backups/import') {
+			starts.push(JSON.parse(String(init?.body ?? '{}')))
 			return Response.json({ backup: backup({ status: 'queued' }) }, { status: 202 })
+		}
 		if (path === '/v1/projects/prj_1/backups') {
 			polls += 1
 			const current = uploaded
@@ -79,7 +82,12 @@ function fakeCloud(outcome: { final: Partial<CloudBackup>; refuseBlocks?: number
 		}
 		return new Response(null, { status: 404 })
 	}) as typeof fetch
-	return { puts, fetchImpl, client: new KoraCloudClient('https://api.example', 'token', fetchImpl) }
+	return {
+		puts,
+		starts,
+		fetchImpl,
+		client: new KoraCloudClient('https://api.example', 'token', fetchImpl),
+	}
 }
 
 test('an import waits for its link, uploads the file as blocks committed at the end, and reports the verified result', async () => {
@@ -119,6 +127,44 @@ test('an import waits for its link, uploads the file as blocks committed at the 
 	expect(commit.body).toBe(
 		`<?xml version="1.0" encoding="utf-8"?><BlockList>${ids.map((id) => `<Latest>${id}</Latest>`).join('')}</BlockList>`,
 	)
+})
+
+test('an import accepts unverifiable operations only when asked, with the exact count', async () => {
+	const { root, file } = await linkedProject(10)
+	const verified = {
+		status: 'verified' as const,
+		report: { database: null, kora: { operations: 4 }, files: null, checks: [] },
+	}
+	const plain = fakeCloud({ final: verified })
+	await runCloudImport({
+		file,
+		projectRoot: root,
+		client: plain.client,
+		fetchImpl: plain.fetchImpl,
+		logger: quiet,
+		sleep: async () => undefined,
+		pollMs: 1,
+	})
+	expect(plain.starts).toEqual([{}])
+	const accepting = fakeCloud({ final: verified })
+	await runCloudImport({
+		file,
+		projectRoot: root,
+		client: accepting.client,
+		fetchImpl: accepting.fetchImpl,
+		logger: quiet,
+		sleep: async () => undefined,
+		pollMs: 1,
+		acceptUnverified: 8349,
+	})
+	expect(accepting.starts).toEqual([{ acceptUnverified: 8349 }])
+})
+
+test('--accept-unverified takes a positive whole number', () => {
+	expect(parseAcceptUnverified(undefined)).toBeUndefined()
+	expect(parseAcceptUnverified('8349')).toBe(8349)
+	for (const wrong of ['0', '-2', '1.5', 'all', '', true])
+		expect(() => parseAcceptUnverified(wrong)).toThrow(/--accept-unverified/)
 })
 
 test('a refused import says why', async () => {

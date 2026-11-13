@@ -78,6 +78,8 @@ export interface CloudBackup {
 	} | null
 	/** An import waiting for its upload: where to send the file, until when. Owners only. */
 	upload?: { url: string; expiresAt: string; method: string } | null
+	/** An import only: how many operations whose ids aren't their content hashes the owner accepted. */
+	acceptUnverified?: number
 }
 
 export class KoraCloudClient {
@@ -181,13 +183,25 @@ export class KoraCloudClient {
 		).lines
 	}
 
-	/** Starts an import into the project's production environment. Owners only. */
-	public async startImport(projectId: string): Promise<CloudBackup> {
+	/**
+	 * Starts an import into the project's production environment. Owners only. `acceptUnverified`
+	 * accepts exactly that many operations whose ids aren't their content hashes, the count a
+	 * refused attempt reported.
+	 */
+	public async startImport(
+		projectId: string,
+		options: { acceptUnverified?: number | undefined } = {},
+	): Promise<CloudBackup> {
 		return (
 			await this.request<{ backup: CloudBackup }>(
 				'POST',
 				`/v1/projects/${encodeURIComponent(projectId)}/backups/import`,
-				{ json: {} },
+				{
+					json:
+						options.acceptUnverified !== undefined
+							? { acceptUnverified: options.acceptUnverified }
+							: {},
+				},
 			)
 		).backup
 	}
