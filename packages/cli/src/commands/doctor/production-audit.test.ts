@@ -238,6 +238,44 @@ describe('production-runtime-storage', () => {
 		)
 		expect(secure.status).toBe('pass')
 	})
+
+	it('does not count an adapter chosen in one branch of a conditional', async () => {
+		const files = {
+			'src/kora-app.ts':
+				"createApp({ store: {\n\t...(backend === 'indexeddb' ? { adapter: 'indexeddb' as const } : {}),\n} })",
+		}
+		const storage = await checkRuntimeStorage(ROOT, memoryFs(files))
+		expect(storage.status).toBe('pass')
+		expect(storage.message).toContain('"sqlite-wasm" adapter')
+		// The worker is still needed on every other path, so its delivery is still checked.
+		const worker = await checkWorkerDelivery(ROOT, memoryFs({ ...files, ...BUILT }))
+		expect(worker.status).toBe('pass')
+		// Optional chaining and ?? on the line are not a conditional branch.
+		const forced = await checkRuntimeStorage(
+			ROOT,
+			memoryFs({
+				'src/main.ts': "createApp({ store: { name: config?.name ?? 'db', adapter: 'indexeddb' } })",
+			}),
+		)
+		expect(forced.message).toContain('"indexeddb" adapter')
+	})
+
+	it('reads only sync settings as sync URLs, and skips reserved test hosts', async () => {
+		const result = await checkRuntimeStorage(
+			ROOT,
+			memoryFs({
+				'scripts/sanity.ts':
+					"check({ KORA_BLOB_STORE_URL: 'http://files.example.com/blobs', PUBLIC_URL: 'http://learn.example.com' })\nconnect({ url: 'ws://hub.example/kora-sync' })\nconnect({ url: 'ws://sync.invalid/kora-sync' })",
+			}),
+		)
+		expect(result.status).toBe('pass')
+		const real = await checkRuntimeStorage(
+			ROOT,
+			memoryFs({ 'src/app.ts': "createApp({ sync: { url: 'ws://hub.example.org/kora-sync' } })" }),
+		)
+		expect(real.status).toBe('warn')
+		expect(real.message).toContain('ws://hub.example.org')
+	})
 })
 
 describe('runProductionAudit', () => {

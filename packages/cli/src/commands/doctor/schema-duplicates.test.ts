@@ -125,6 +125,28 @@ describe('checkDuplicateSchemas', () => {
 		expect(result.message).toContain('1 defineSchema() call(s)')
 	})
 
+	it('with the app schema known, reports only definitions that repeat its collections', async () => {
+		const root = await project({
+			'src/schema.ts': CLIENT_SCHEMA,
+			'scripts/store-safety.ts': 'export default defineSchema({ collections: { notes: {} } })',
+			'scripts/live-append.ts': 'export default defineSchema({ collections: { notes: {} } })',
+		})
+		const appCollections = ['forms', 'form-responses', 'collaborators']
+		const harnesses = await checkDuplicateSchemas(root, undefined, { appCollections })
+		expect(harnesses.status).toBe('pass')
+		expect(harnesses.message).toContain("none repeating the app schema's collections")
+		// Without the app schema, the same project still warns, as before.
+		expect((await checkDuplicateSchemas(root)).status).toBe('warn')
+
+		const copied = await project({
+			'src/schema.ts': CLIENT_SCHEMA,
+			'server/schema.ts': CLIENT_SCHEMA,
+		})
+		const drift = await checkDuplicateSchemas(copied, undefined, { appCollections })
+		expect(drift.status).toBe('warn')
+		expect(drift.message).toContain('server/schema.ts')
+	})
+
 	it('passes for two schemas that declare different collections', async () => {
 		const root = await project({
 			'src/schema.ts': CLIENT_SCHEMA,

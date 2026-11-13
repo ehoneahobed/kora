@@ -325,6 +325,16 @@ export function groupDuplicateSchemas(sites: SchemaDefinitionSite[]): DuplicateS
 	return result
 }
 
+/** What the check knows about the app beyond its sources. */
+export interface DuplicateSchemaOptions {
+	/**
+	 * The collections of the app's own schema (the one `kora.config.ts` names), when it loaded.
+	 * Then only definitions that repeat these collections are reported: a self-contained
+	 * script or test harness with its own throwaway schema can't drift from the app's.
+	 */
+	appCollections?: readonly string[]
+}
+
 /**
  * The `schema-duplicates` check: warn when more than one `defineSchema` call declares the
  * same collection names. A client schema and a server schema written twice drift apart
@@ -337,6 +347,7 @@ export function groupDuplicateSchemas(sites: SchemaDefinitionSite[]): DuplicateS
 export async function checkDuplicateSchemas(
 	projectRoot: string,
 	scan: (root: string) => Promise<SchemaDefinitionSite[]> = scanSchemaDefinitions,
+	options: DuplicateSchemaOptions = {},
 ): Promise<DoctorCheckResult> {
 	const id = 'schema-duplicates'
 	const title = 'One schema'
@@ -351,7 +362,12 @@ export async function checkDuplicateSchemas(
 			message: `Could not scan the project sources: ${error instanceof Error ? error.message : String(error)}`,
 		}
 	}
-	const groups = groupDuplicateSchemas(sites)
+	const app = options.appCollections ? new Set(options.appCollections) : null
+	const groups = groupDuplicateSchemas(sites).flatMap((group) => {
+		if (!app) return [group]
+		const shared = group.shared.filter((name) => app.has(name))
+		return shared.length > 0 ? [{ ...group, shared }] : []
+	})
 	if (groups.length === 0) {
 		return {
 			id,
@@ -360,7 +376,9 @@ export async function checkDuplicateSchemas(
 			message:
 				sites.length === 0
 					? 'No defineSchema() call found in the project sources.'
-					: `${sites.length} defineSchema() call(s), none declaring the same collections.`,
+					: app
+						? `${sites.length} defineSchema() call(s), none repeating the app schema's collections.`
+						: `${sites.length} defineSchema() call(s), none declaring the same collections.`,
 		}
 	}
 	const described = groups.map((group) => {

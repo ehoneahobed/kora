@@ -75,13 +75,27 @@ export function resolveBuildDir(viteConfig: string | null): string {
 	return dir && dir.length > 0 && !dir.startsWith('/') && !dir.includes('..') ? dir : 'dist'
 }
 
-/** The storage adapter the app names (`adapter: 'indexeddb'`), when it names one. */
+/**
+ * The storage adapter the app always uses (`adapter: 'indexeddb'`), when it names one. An
+ * adapter chosen in one branch of a conditional (`backend === 'indexeddb' ? { adapter:
+ * 'indexeddb' } : {}`, for example to reopen a fallback copy) is not the app's adapter: the
+ * default still applies on every other path, so it doesn't count.
+ */
 function configuredAdapter(facts: ProjectFacts): string | null {
 	for (const text of facts.sources.values()) {
-		const match = text.match(/\badapter\s*:\s*['"](sqlite-wasm|indexeddb|sqlite-native|memory)['"]/)
-		if (match?.[1]) return match[1]
+		for (const match of text.matchAll(
+			/\badapter\s*:\s*['"](sqlite-wasm|indexeddb|sqlite-native|memory)['"]/g,
+		)) {
+			if (match[1] && !inConditionalBranch(text, match.index ?? 0)) return match[1]
+		}
 	}
 	return null
+}
+
+/** True when the line before `index` holds a ternary `?` (not `?.` or `??`). */
+function inConditionalBranch(text: string, index: number): boolean {
+	const lineStart = text.lastIndexOf('\n', index) + 1
+	return /\?/.test(text.slice(lineStart, index).replace(/\?\?|\?\./g, ''))
 }
 
 /**
@@ -291,7 +305,11 @@ export async function checkRuntimeStorage(
 				continue
 			}
 			if (/^(?:www\.w3\.org|schemas\.|json-schema\.org)/.test(host) || host.length < 4) continue
-			if (/(?:SYNC_URL|syncUrl|sync\s*:|url\s*:)/i.test(lineAround(text, match.index ?? 0))) {
+			// Reserved names (RFC 2606, RFC 6761) never reach a real server: test values.
+			if (/(?:^|\.)(?:example|invalid|localhost)$/.test(host)) continue
+			// A sync setting: SYNC_URL, syncUrl, `sync:` or a bare `url:` key. Other settings
+			// that merely end in URL (KORA_BLOB_STORE_URL, PUBLIC_URL) are not sync endpoints.
+			if (/(?:SYNC_URL|\bsyncUrl|\bsync\s*:|\burl\s*:)/i.test(lineAround(text, match.index ?? 0))) {
 				insecure.push(`${file}: ${match[0]}`)
 			}
 		}

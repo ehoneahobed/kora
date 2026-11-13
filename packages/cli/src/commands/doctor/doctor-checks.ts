@@ -87,7 +87,8 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 	}
 
 	results.push(await checkDeclaredSettings(projectRoot, process.env, options.production === true))
-	results.push(await checkDuplicateSchemas(projectRoot))
+	// Placed here in the report, run once the app schema is known (see below).
+	const duplicatesAt = results.length
 
 	let loadedSchema: SchemaDefinition | null = null
 	const schemaPath = await resolveSchemaPath(projectRoot, config?.schema)
@@ -148,6 +149,14 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 			})
 		}
 	}
+
+	results.splice(
+		duplicatesAt,
+		0,
+		await checkDuplicateSchemas(projectRoot, undefined, {
+			...(loadedSchema ? { appCollections: Object.keys(loadedSchema.collections) } : {}),
+		}),
+	)
 
 	if (options.production) {
 		// Independent of the schema: static checks of the build output and the project config,
