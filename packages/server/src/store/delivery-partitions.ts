@@ -34,6 +34,15 @@ export const DELIVERY_PARTITIONS_THROUGH_KEY = 'delivery_partitions_through'
  */
 export const DELIVERY_PARTITIONS_EPOCH_KEY = 'delivery_partitions_epoch'
 
+/**
+ * Meta key holding the partition overrides (`deliveryPartitions`) the store was last given, as
+ * canonical JSON. A store opened without being told its overrides (a script calling
+ * `setSchema(schema)`, or a server whose sync config hands them over only after the schema is
+ * applied) uses these, so it derives the plan the index was built under instead of resetting
+ * the index for a plan without them.
+ */
+export const DELIVERY_PARTITION_OVERRIDES_KEY = 'delivery_partition_overrides'
+
 /** Meta key recording the delivery counter when the index was last reset (diagnostics). */
 export const DELIVERY_PARTITIONS_FROM_KEY = 'delivery_partitions_from'
 
@@ -110,6 +119,36 @@ export interface DeliveryPartitionPlan {
 
 /** Collection-keyed extra partition fields (`KoraSyncServer` option `deliveryPartitions`). */
 export type DeliveryPartitionOverrides = Readonly<Record<string, readonly string[]>>
+
+/** Overrides as stored under {@link DELIVERY_PARTITION_OVERRIDES_KEY}: keys and fields sorted. */
+export function serializeDeliveryPartitionOverrides(overrides: DeliveryPartitionOverrides): string {
+	return JSON.stringify(
+		Object.fromEntries(
+			Object.keys(overrides)
+				.sort()
+				.map((collection) => [collection, [...(overrides[collection] ?? [])].sort()]),
+		),
+	)
+}
+
+/** The stored overrides, or null when the value is absent or not a collection-to-fields map. */
+export function parseDeliveryPartitionOverrides(
+	value: string | undefined | null,
+): DeliveryPartitionOverrides | null {
+	if (value === undefined || value === null) return null
+	try {
+		const parsed: unknown = JSON.parse(value)
+		if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+		const out: Record<string, string[]> = {}
+		for (const [collection, fields] of Object.entries(parsed)) {
+			if (!Array.isArray(fields) || !fields.every((field) => typeof field === 'string')) return null
+			out[collection] = fields as string[]
+		}
+		return out
+	} catch {
+		return null
+	}
+}
 
 /**
  * Every record field an access rule's compiled scope can constrain. Mirrors

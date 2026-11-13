@@ -121,7 +121,7 @@ const server = createProductionServer({
 })
 ```
 
-Changing this list rebuilds the index in the background.
+Changing this list rebuilds the index in the background. The store remembers the list, so a restart, or a script that opens the store without being told it, keeps the index instead of rebuilding it.
 
 ### Behaviour changes on the server
 

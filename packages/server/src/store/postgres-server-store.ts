@@ -57,6 +57,7 @@ import {
 	DELIVERY_PARTITIONS_THROUGH_KEY,
 	DELIVERY_PARTITION_BACKFILL_CHUNK,
 	DELIVERY_PARTITION_FIELDS_KEY,
+	DELIVERY_PARTITION_OVERRIDES_KEY,
 	type DeliveryIndexRead,
 	type DeliveryPartitionOverrides,
 	type DeliveryPartitionPlan,
@@ -65,6 +66,8 @@ import {
 	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
 	mergeSequences,
+	parseDeliveryPartitionOverrides,
+	serializeDeliveryPartitionOverrides,
 	tombstonePartitionKeysOf,
 } from './delivery-partitions'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
@@ -390,6 +393,11 @@ export class PostgresServerStore implements ServerStore {
 	private schema: SchemaDefinition | null = null
 	/** Extra partition fields declared by the server (`deliveryPartitions`). */
 	private deliveryOverrides: DeliveryPartitionOverrides = {}
+	/**
+	 * Whether this process was told its overrides (`setSchema` option or `setDeliveryPartitions`).
+	 * Until it is, the ones stored under DELIVERY_PARTITION_OVERRIDES_KEY stand in.
+	 */
+	private deliveryOverridesDeclared = false
 	/** The delivery visibility index's partition plan under the current schema. */
 	private deliveryPlan: DeliveryPartitionPlan | null = null
 	/** `kora_delivery_partitions` did not exist when this instance opened the database. */
@@ -786,8 +794,10 @@ export class PostgresServerStore implements ServerStore {
 			this.operationTransforms = [...options.operationTransforms]
 			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		}
-		if (options.deliveryPartitions !== undefined)
+		if (options.deliveryPartitions !== undefined) {
 			this.deliveryOverrides = options.deliveryPartitions
+			this.deliveryOverridesDeclared = true
+		}
 
 		// Generate and execute DDL for all collection tables
 		const ddlStatements = generateAllCollectionDDL(schema, 'postgres')
@@ -908,6 +918,12 @@ export class PostgresServerStore implements ServerStore {
 	 */
 	private async refreshDeliveryPlan(): Promise<void> {
 		if (!this.schema) return
+		if (!this.deliveryOverridesDeclared) {
+			const stored = (await this.db.execute(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${DELIVERY_PARTITION_OVERRIDES_KEY}`,
+			)) as unknown as { value: string }[]
+			this.deliveryOverrides = parseDeliveryPartitionOverrides(stored[0]?.value) ?? {}
+		}
 		const plan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
 		this.deliveryPlan = plan
 		const needsReset = async (executor: PostgresJsDatabase): Promise<boolean> => {
@@ -930,6 +946,14 @@ export class PostgresServerStore implements ServerStore {
 				if (!(await needsReset(tx))) return
 				await this.resetDeliveryPartitions(tx, plan.fingerprint)
 			})
+		}
+		// Remembered beside the fingerprint, so the next process to open the store derives
+		// this plan even when it isn't told the overrides.
+		if (this.deliveryOverridesDeclared) {
+			await this.db.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITION_OVERRIDES_KEY}, ${serializeDeliveryPartitionOverrides(this.deliveryOverrides)})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
 		}
 		this.deliveryTableFresh = false
 		this.kickDeliveryBackfill()
@@ -970,6 +994,7 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 		this.deliveryOverrides = overrides
+		this.deliveryOverridesDeclared = true
 		await this.refreshDeliveryPlan()
 	}
 
