@@ -89,6 +89,8 @@ export interface DeployAdapter {
 	rollback(deploymentId: string): Promise<void>
 	logs(options: LogOptions): AsyncIterable<LogLine>
 	status(): Promise<DeploymentStatus>
+	/** Restarts the running version in place (same release and data), where the platform can. */
+	restart?(): Promise<void>
 }
 
 /**

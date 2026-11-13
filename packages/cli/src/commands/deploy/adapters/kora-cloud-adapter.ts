@@ -220,19 +220,39 @@ export class KoraCloudAdapter implements ContextAwareDeployAdapter {
 		const overview = await client.projectOverview(link.projectId)
 		const status = overview.latestDeployment?.status
 		const liveUrl = overview.production?.publicUrl ?? undefined
+		const runtime = overview.runtime ?? null
+		// A ready deployment says the release went live; whether it is still running well is the
+		// runtime reading, which Kora Cloud takes every few minutes.
 		const state =
-			status === 'ready'
-				? 'healthy'
-				: status === 'failed'
-					? 'failed'
+			status === 'failed' || runtime?.state === 'unhealthy'
+				? 'failed'
+				: status === 'ready'
+					? runtime?.state === 'unknown'
+						? 'unknown'
+						: 'healthy'
 					: status
 						? 'pending'
 						: 'unknown'
+		const running = runtime
+			? ` Running: ${runtime.state === 'unhealthy' ? 'failing' : runtime.state}${runtime.detail ? ` (${runtime.detail})` : ''}, checked ${ago(runtime.checkedAt)}.${runtime.state === 'unhealthy' ? ' `kora deploy logs` shows why; `kora deploy restart` starts it again.' : ''}`
+			: ''
 		return {
 			state,
-			message: status ? `Latest deployment: ${status}` : 'Not deployed yet.',
+			message: status ? `Latest deployment: ${status}.${running}` : 'Not deployed yet.',
 			...(liveUrl ? { liveUrl } : {}),
 		}
+	}
+
+	public async restart(): Promise<void> {
+		const client = await this.client()
+		const link = await readProjectLink(this.projectRoot)
+		if (!link)
+			throw new KoraCloudError(
+				'This project is not linked to Kora Cloud yet. Run `kora deploy` first.',
+				'not_linked',
+				null,
+			)
+		await client.restart(link.projectId)
 	}
 
 	/**
@@ -324,4 +344,13 @@ function syncUrlFor(publicUrl: string): string {
 	url.protocol = url.protocol === 'http:' ? 'ws:' : 'wss:'
 	url.pathname = DEFAULT_SYNC_PATH
 	return url.toString()
+}
+
+/** "3 minutes ago", for a reading's time. */
+function ago(at: string, now: number = Date.now()): string {
+	const minutes = Math.max(0, Math.round((now - Date.parse(at)) / 60_000))
+	if (minutes < 1) return 'just now'
+	if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`
+	const hours = Math.round(minutes / 60)
+	return `${hours} hour${hours === 1 ? '' : 's'} ago`
 }

@@ -227,7 +227,15 @@ The `--confirm` flag tells Kora to fail fast instead of prompting.
 kora deploy status
 ```
 
-Shows whether your app is healthy, its URL, and sync endpoint.
+Shows whether your app is healthy, its URL, and sync endpoint. On Kora Cloud it also says how the running version is doing (Kora Cloud reads it every few minutes), not only whether the latest deployment finished.
+
+### Restart
+
+```bash
+kora deploy restart
+```
+
+Starts the running version again with the same release, settings and data: a fresh server process. Available on Kora Cloud; on other platforms, use their own dashboard.
 
 ### View logs
 
