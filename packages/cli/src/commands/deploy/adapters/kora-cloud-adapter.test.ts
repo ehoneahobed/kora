@@ -190,3 +190,70 @@ test('without a sign-in, deploying says to run kora login', async () => {
 	})
 	await expect(adapter.provision(config('/tmp'))).rejects.toThrow(/kora login/)
 })
+
+/** A linked project whose overview reports `runtime`, recording restarts. */
+async function linkedCloud(runtime: unknown) {
+	const root = await mkdtemp(join(tmpdir(), 'kora-cloud-'))
+	await import('node:fs/promises').then(async ({ mkdir, writeFile }) => {
+		await mkdir(join(root, '.kora'), { recursive: true })
+		await writeFile(
+			join(root, '.kora/cloud.json'),
+			JSON.stringify({ organizationId: 'org_1', projectId: 'prj_1' }),
+		)
+	})
+	const restarts: string[] = []
+	const fetchImpl = (async (url: string, init?: RequestInit) => {
+		const { pathname } = new URL(url)
+		if (pathname === '/v1/projects/prj_1/overview')
+			return Response.json({
+				production: { publicUrl: 'https://my-app.onkora.app' },
+				latestDeployment: { status: 'ready' },
+				...(runtime === undefined ? {} : { runtime }),
+			})
+		if (pathname === '/v1/projects/prj_1/restart' && init?.method === 'POST') {
+			restarts.push(pathname)
+			return Response.json({ restarting: true }, { status: 202 })
+		}
+		return Response.json({ error: { code: 'route_not_found', message: pathname } }, { status: 404 })
+	}) as typeof fetch
+	const adapter = new KoraCloudAdapter({
+		client: async () => new KoraCloudClient('https://api.example', 'kcli_x', fetchImpl),
+		prompts,
+		logger: recordingLogger([]),
+		interactive: false,
+	})
+	adapter.setContext({ projectRoot: root, appName: 'my-app', region: null })
+	return { adapter, restarts }
+}
+
+test('status says how the running version is doing, not only that the deployment finished', async () => {
+	const checkedAt = new Date(Date.now() - 3 * 60_000).toISOString()
+	const failing = await linkedCloud({
+		state: 'unhealthy',
+		detail: 'The container keeps restarting',
+		checkedAt,
+	})
+	const status = await failing.adapter.status()
+	expect(status.state).toBe('failed')
+	expect(status.message).toContain(
+		'Running: failing (The container keeps restarting), checked 3 minutes ago.',
+	)
+	expect(status.message).toContain('`kora deploy restart`')
+	const healthy = await linkedCloud({ state: 'healthy', detail: null, checkedAt })
+	expect(await healthy.adapter.status()).toMatchObject({
+		state: 'healthy',
+		liveUrl: 'https://my-app.onkora.app',
+	})
+	// A host that doesn't report runtime yet: the deployment's status alone, as before.
+	expect(await (await linkedCloud(undefined)).adapter.status()).toEqual({
+		state: 'healthy',
+		message: 'Latest deployment: ready.',
+		liveUrl: 'https://my-app.onkora.app',
+	})
+})
+
+test('restart asks Kora Cloud to restart production', async () => {
+	const cloud = await linkedCloud(null)
+	await cloud.adapter.restart()
+	expect(cloud.restarts).toEqual(['/v1/projects/prj_1/restart'])
+})

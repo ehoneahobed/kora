@@ -436,6 +436,7 @@ Compacts a local SQLite database's operation log once the server has acknowledge
 kora deploy [--platform fly|railway|aws-ecs|aws-lightsail] [--app <name>] [--region iad] [--prod] [--confirm] [--reset]
 kora deploy status
 kora deploy logs
+kora deploy restart
 kora deploy rollback [id]
 ```
 

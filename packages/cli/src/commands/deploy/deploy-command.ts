@@ -140,6 +140,37 @@ export const deployCommand = defineCommand({
 				logger.success(`Rolled back ${state.platform} deployment to ${deploymentId}.`)
 			},
 		}),
+		restart: defineCommand({
+			meta: {
+				name: 'restart',
+				description: 'Restart the running version (same release and data)',
+			},
+			async run() {
+				const logger = createLogger()
+				const projectRoot = await requireProjectRoot()
+				const state = await readDeployState(projectRoot)
+				if (!state) {
+					logger.warn('No deployment state found. Run `kora deploy` first.')
+					return
+				}
+				const adapter = createDeployAdapter(state.platform)
+				configureAdapterContext(adapter, {
+					projectRoot,
+					appName: state.appName,
+					region: state.region,
+				})
+				if (!adapter.restart) {
+					logger.warn(
+						`Restarting isn't available for ${state.platform} from the CLI. Use its own dashboard.`,
+					)
+					return
+				}
+				await adapter.restart()
+				logger.success(
+					'Restarting: the running version starts again with the same release and data. `kora deploy status` shows how it is running.',
+				)
+			},
+		}),
 		logs: defineCommand({
 			meta: {
 				name: 'logs',
@@ -175,7 +206,7 @@ export const deployCommand = defineCommand({
 	async run({ args, rawArgs }) {
 		// Citty calls run() even after subcommand execution.
 		// Guard against double-execution when a subcommand was invoked.
-		const subCommandNames = ['status', 'rollback', 'logs']
+		const subCommandNames = ['status', 'rollback', 'restart', 'logs']
 		if (rawArgs.some((arg) => subCommandNames.includes(arg))) {
 			return
 		}

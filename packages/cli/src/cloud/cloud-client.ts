@@ -170,8 +170,19 @@ export class KoraCloudClient {
 	public async projectOverview(projectId: string): Promise<{
 		production: { publicUrl: string | null; status?: string } | null
 		latestDeployment: { status: string } | null
+		/** Production's running version as Kora Cloud last read it; absent from older hosts. */
+		runtime?: {
+			state: 'healthy' | 'unhealthy' | 'unknown'
+			detail: string | null
+			checkedAt: string
+		} | null
 	}> {
 		return await this.request('GET', `/v1/projects/${encodeURIComponent(projectId)}/overview`)
+	}
+
+	/** Restarts production's running version: same release, settings and data. Kora Cloud does it within seconds. */
+	public async restart(projectId: string): Promise<void> {
+		await this.request('POST', `/v1/projects/${encodeURIComponent(projectId)}/restart`)
 	}
 
 	public async logs(projectId: string, sinceMinutes: number): Promise<CloudLogLine[]> {
