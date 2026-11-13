@@ -10,10 +10,18 @@ import type { SchemaDefinition } from '@korajs/core'
 
 /** `kora_server_meta`: fold plan fingerprint the stored fold states were built under. */
 export const FOLD_PLAN_FINGERPRINT_KEY = 'fold_plan_fingerprint'
+/**
+ * `kora_server_meta`: JSON map of each collection's server fold plan fingerprint. Present
+ * on a database a server with per-collection plans wrote: its next start re-folds only the
+ * collections whose plan changed, and each fold state is stamped with its collection's plan.
+ */
+export const FOLD_PLAN_FINGERPRINTS_KEY = 'fold_plan_fingerprints'
 /** `kora_server_meta`: fields the per-operation scope snapshots capture. */
 export const SCOPE_SNAPSHOT_FINGERPRINT_KEY = 'scope_snapshot_fields'
+/** `kora_server_meta`: JSON map of {@link scopeSnapshotFingerprints} (per-collection snapshots). */
+export const SCOPE_SNAPSHOT_FINGERPRINTS_KEY = 'scope_snapshot_fields_by_collection'
 /**
- * `kora_server_meta`: the fingerprint a scope snapshot rebuild dropped every snapshot for;
+ * `kora_server_meta`: the fingerprint a scope snapshot rebuild dropped snapshots for;
  * set while that rebuild is unfinished (a restart resumes it at the missing snapshots).
  */
 export const SCOPE_SNAPSHOT_PENDING_KEY = 'scope_snapshot_fields_pending'
@@ -40,16 +48,31 @@ const SNAPSHOT_KINDS = new Set(['string', 'number', 'boolean', 'enum', 'timestam
  * rebuilds every operation's scope snapshot.
  */
 export function scopeSnapshotFingerprint(schema: SchemaDefinition): string {
-	const parts: string[] = []
-	for (const collection of Object.keys(schema.collections).sort()) {
-		const fields = schema.collections[collection]?.fields ?? {}
-		const captured = Object.keys(fields)
-			.filter((name) => SNAPSHOT_KINDS.has(fields[name]?.kind ?? ''))
-			.sort()
-			.map((name) => `${name}:${fields[name]?.kind ?? ''}`)
-		parts.push(`${collection}(${captured.join(',')})`)
-	}
+	const parts = Object.keys(schema.collections)
+		.sort()
+		.map((collection) => collectionCapture(schema, collection))
 	return `v1|${parts.join('|')}`
+}
+
+/**
+ * Per-collection scope-snapshot fingerprints (`@korajs/server` `scopeSnapshotFingerprints`):
+ * a server that records them drops and rebuilds only the changed collections' snapshots.
+ */
+export function scopeSnapshotFingerprints(schema: SchemaDefinition): Record<string, string> {
+	const out: Record<string, string> = {}
+	for (const collection of Object.keys(schema.collections).sort()) {
+		out[collection] = `v1|${collectionCapture(schema, collection)}`
+	}
+	return out
+}
+
+function collectionCapture(schema: SchemaDefinition, collection: string): string {
+	const fields = schema.collections[collection]?.fields ?? {}
+	const captured = Object.keys(fields)
+		.filter((name) => SNAPSHOT_KINDS.has(fields[name]?.kind ?? ''))
+		.sort()
+		.map((name) => `${name}:${fields[name]?.kind ?? ''}`)
+	return `${collection}(${captured.join(',')})`
 }
 
 /** A fold plan fingerprint split into what the doctor can compare. */

@@ -51,10 +51,18 @@ Runs in `setSchema` (and after a replace-mode backup import), after the W8b log
 integrity scan:
 
 - A record is re-folded when its state is missing, stale (covers another operation
-  than the log's newest) or was built under another fold plan
-  (`kora_server_meta.fold_plan_fingerprint`: field kinds, merge strategies, resolver
-  source, fold-state version). A plan change first marks every state stale, then
-  records the new fingerprint, so it is resumable.
+  than the log's newest) or was built under another fold plan. Plans are per
+  collection: `kora_server_meta.fold_plan_fingerprints` maps each collection to its
+  fingerprint (field kinds, merge strategies, resolver source, fold-state version,
+  transforms, explicit authorities) and each `kora_fold_state.plan` is its
+  collection's stamp. A plan change marks the states of the re-planned collections
+  stale, then records the new fingerprints, so it is resumable; other collections are
+  untouched. `fold_plan_fingerprint` (whole schema) is still recorded: it says which
+  instance holds the newest plan during a rolling deploy (the outdated-record sweep
+  runs only there), and a state stamped with the current whole-schema stamp is current
+  in every collection (written before per-collection stamps). A database without
+  per-collection fingerprints is restamped when its plan is unchanged, and fully
+  re-folded once when it changed (which collections changed is not recorded).
 - Batches of 500 records, one transaction each (Postgres: under the delivery-counter
   lock, so a live write on another instance is never overwritten by a stale re-fold).
 - Idempotent and resumable: staleness is derived from the tables at every start; a

@@ -4,11 +4,14 @@ import { describe, expect, test } from 'vitest'
 // The server's own definitions, read from its source (the CLI may not depend on it at
 // runtime): the doctor's restatements must never drift from them.
 import { SERVER_LOG_INTEGRITY_META_KEY as SERVER_INTEGRITY } from '../../../../../server/src/store/log-integrity'
+import { FOLD_PLAN_FINGERPRINTS_KEY as SERVER_FOLD_BY_COLLECTION } from '../../../../../server/src/store/plan-stamps'
 import { FOLD_PLAN_FINGERPRINT_KEY as SERVER_FOLD } from '../../../../../server/src/store/record-fold'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY as SERVER_SNAPSHOT,
+	SCOPE_SNAPSHOT_FINGERPRINTS_KEY as SERVER_SNAPSHOT_BY_COLLECTION,
 	SCOPE_SNAPSHOT_PENDING_KEY as SERVER_SNAPSHOT_PENDING,
 	scopeSnapshotFingerprint as serverSnapshotFingerprint,
+	scopeSnapshotFingerprints as serverSnapshotFingerprints,
 } from '../../../../../server/src/store/scope-snapshot'
 import {
 	SERVER_EVER_AUTHORITY_KEY as SERVER_EVER,
@@ -19,9 +22,11 @@ import { RELEASED_NODE_OWNER as SERVER_RELEASED } from '../../../../../server/sr
 import { parseDoctorDatabaseUrl, scrubSecrets } from './database'
 import { formatDuration, unmatchableWhereReason } from './db-checks'
 import {
+	FOLD_PLAN_FINGERPRINTS_KEY,
 	FOLD_PLAN_FINGERPRINT_KEY,
 	RELEASED_NODE_OWNER,
 	RESERVED_NODE_PREFIX,
+	SCOPE_SNAPSHOT_FINGERPRINTS_KEY,
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	SCOPE_SNAPSHOT_PENDING_KEY,
 	SERVER_EVER_AUTHORITY_KEY,
@@ -29,6 +34,7 @@ import {
 	SERVER_LOG_INTEGRITY_META_KEY,
 	replannedCollections,
 	scopeSnapshotFingerprint,
+	scopeSnapshotFingerprints,
 } from './server-meta'
 
 const schema = defineSchema({
@@ -58,6 +64,9 @@ describe('doctor server layout', () => {
 		expect(RESERVED_NODE_PREFIX).toBe(SERVER_RESERVED)
 		expect(RELEASED_NODE_OWNER).toBe(SERVER_RELEASED)
 		expect(scopeSnapshotFingerprint(schema)).toBe(serverSnapshotFingerprint(schema))
+		expect(FOLD_PLAN_FINGERPRINTS_KEY).toBe(SERVER_FOLD_BY_COLLECTION)
+		expect(SCOPE_SNAPSHOT_FINGERPRINTS_KEY).toBe(SERVER_SNAPSHOT_BY_COLLECTION)
+		expect(scopeSnapshotFingerprints(schema)).toEqual(serverSnapshotFingerprints(schema))
 	})
 
 	test('an unchanged plan re-plans nothing, even when resolvers are lost in JSON', () => {

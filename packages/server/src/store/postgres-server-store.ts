@@ -123,6 +123,17 @@ import {
 	validateFieldName,
 } from './materialization'
 import {
+	EMPTY_PLAN_STAMPS,
+	FOLD_PLAN_FINGERPRINTS_KEY,
+	type ServerPlanStamps,
+	activeStampsOf,
+	allActiveStamps,
+	decideReplan,
+	isActivePlanStamp,
+	outdatedPlanCondition,
+	serverPlanStamps,
+} from './plan-stamps'
+import {
 	type KeptRow,
 	type QuarantineScope,
 	buildQuarantineScope,
@@ -156,9 +167,11 @@ import {
 } from './record-fold'
 import {
 	RecordHistoryReplayer,
+	SCOPE_SNAPSHOT_FINGERPRINTS_KEY,
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	SCOPE_SNAPSHOT_PENDING_KEY,
 	TombstoneStartCache,
+	decideScopeSnapshotRefresh,
 	parseScopeSnapshot,
 	replayScopeSnapshots,
 	resolveTombstoneStart,
@@ -352,7 +365,7 @@ export class PostgresServerStore implements ServerStore {
 		schema: SchemaDefinition
 		transforms: readonly OperationTransform[]
 		authorities: readonly string[]
-		value: string
+		value: ServerPlanStamps
 	} | null = null
 	/** Explicit authority over time: revoked and ever-held ids (RT-81). */
 	private authorityHistory: AuthorityHistory = {
@@ -422,6 +435,7 @@ export class PostgresServerStore implements ServerStore {
 		ran: false,
 		records: 0,
 		skippedUnclean: 0,
+		replanned: [],
 		fullRefold: false,
 	}
 
@@ -811,51 +825,66 @@ export class PostgresServerStore implements ServerStore {
 		await this.canonicalizeLegacyBodies()
 		// Re-materialize every record whose fold state is missing or stale (W7 step 7).
 		this.foldMigration = await this.rematerialize()
-		// A change in the fields snapshots capture invalidates every snapshot: drop them
-		// and rebuild from the log (RT-20). The fingerprint is written last, so a crash
-		// (or a concurrent instance) only repeats the idempotent rebuild. The drop is
-		// recorded (SCOPE_SNAPSHOT_PENDING_KEY) in its own transaction, so a restart
-		// resumes the rebuild at the snapshots still missing instead of dropping the
-		// ones it already rebuilt.
-		const fingerprint = scopeSnapshotFingerprint(schema)
-		const metaRows = (await this.db.execute(
-			sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_FINGERPRINT_KEY}`,
-		)) as unknown as { value: string }[]
-		const stored = metaRows[0]?.value
-		if (stored !== fingerprint) {
+		// A change in the fields a collection's snapshots capture invalidates that collection's
+		// snapshots: they are dropped and rebuilt from the log (RT-20). The fingerprints are
+		// written last, so a crash (or a concurrent instance) only repeats the idempotent
+		// rebuild. The drop is recorded (SCOPE_SNAPSHOT_PENDING_KEY) in its own transaction,
+		// so a restart resumes the rebuild at the snapshots still missing instead of dropping
+		// the ones it already rebuilt.
+		const snapshotMeta = async (key: string): Promise<string | undefined> =>
+			(
+				(await this.db.execute(
+					sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+				)) as unknown as { value: string }[]
+			)[0]?.value
+		const refresh = decideScopeSnapshotRefresh(schema, {
+			fingerprints: await snapshotMeta(SCOPE_SNAPSHOT_FINGERPRINTS_KEY),
+			fingerprint: await snapshotMeta(SCOPE_SNAPSHOT_FINGERPRINT_KEY),
+		})
+		if (refresh.changed.length > 0) {
 			await this.db.transaction(async (tx) => {
 				const pending = (
 					(await tx.execute(
 						sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_PENDING_KEY} FOR UPDATE`,
 					)) as unknown as { value: string }[]
 				)[0]?.value
-				if (pending === fingerprint) return
+				if (pending === refresh.pendingValue) return
 				// The epoch row first, as a rebuild takes it before it writes snapshots: two
 				// transactions taking the locks in opposite orders can deadlock.
 				await this.bumpLiveViewEpoch(tx)
-				await tx.execute(sql`UPDATE operations SET scope_snapshot = NULL`)
-				// Summaries hold values of the fields as captured: rebuilt with the snapshots.
-				await tx.execute(sql`DELETE FROM kora_record_live_views`)
-				await tx.execute(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
-				// A finished backfill over the old summaries says nothing about the new ones.
+				for (const collection of refresh.changed) {
+					await tx.execute(
+						sql`UPDATE operations SET scope_snapshot = NULL WHERE collection = ${collection}`,
+					)
+					// Summaries hold values of the fields as captured: rebuilt with the snapshots.
+					await tx.execute(sql`DELETE FROM kora_record_live_views WHERE collection = ${collection}`)
+					await tx.execute(
+						sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL WHERE collection = ${collection}`,
+					)
+					// A finished backfill over the old summaries says nothing about the new ones.
+					await tx.execute(
+						sql`DELETE FROM kora_server_meta WHERE key = ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}${collection}`}`,
+					)
+				}
 				await tx.execute(
-					sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`,
-				)
-				await tx.execute(
-					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_PENDING_KEY}, ${fingerprint})
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_PENDING_KEY}, ${refresh.pendingValue})
 						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 				)
 			})
 		}
 		await this.backfillScopeSnapshots()
-		if (stored !== fingerprint) {
+		if (refresh.write) {
 			await this.db.transaction(async (tx) => {
 				await tx.execute(
-					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${scopeSnapshotFingerprint(schema)})
 						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 				)
 				await tx.execute(
-					sql`DELETE FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_PENDING_KEY} AND value = ${fingerprint}`,
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINTS_KEY}, ${refresh.pendingValue})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+				await tx.execute(
+					sql`DELETE FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_PENDING_KEY} AND value = ${refresh.pendingValue}`,
 				)
 			})
 		}
@@ -3897,7 +3926,7 @@ export class PostgresServerStore implements ServerStore {
 				sql`SELECT plan FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
 			)) as unknown as { plan: string | null }[]
 		)[0]?.plan
-		if (!plan || plan === this.planStamp()) return undefined
+		if (isActivePlanStamp(this.planStamps(), collection, plan)) return undefined
 		return foldedStoredRow(
 			recordId,
 			await this.readFoldState(tx, collection, recordId),
@@ -4007,13 +4036,13 @@ export class PostgresServerStore implements ServerStore {
 		read: (source: SQL) => Promise<T>,
 	): Promise<T> {
 		const table = sql.raw(quoteIdent(collection))
-		const plan = this.planStamp()
+		const active = activeStampsOf(this.planStamps(), collection)
 		const onlyId = where && typeof where.id === 'string' ? where.id : null
 		const outdated = (
 			(await tx.execute(
 				sql`SELECT record_id FROM kora_fold_state
 					WHERE collection = ${collection}
-						AND ((plan > '' AND plan < ${plan}) OR plan > ${plan})
+						AND ${outdatedPlanCondition(sql`plan`, active)}
 						${onlyId === null ? sql.raw('') : sql`AND record_id = ${onlyId}`}`,
 			)) as unknown as { record_id: string }[]
 		).map((row) => row.record_id)
@@ -4122,7 +4151,7 @@ export class PostgresServerStore implements ServerStore {
 		const prior = Number(last?.d ?? 0)
 		// A state folded with another plan (another instance during a rolling deploy) is
 		// re-folded with this one; '' is a state from before plans were recorded.
-		const samePlan = !stored?.plan || stored.plan === this.planStamp()
+		const samePlan = isActivePlanStamp(this.planStamps(), op.collection, stored?.plan)
 		const parsed =
 			stored && samePlan ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
 		const covered = stored ? Number(stored.covered_seq) : 0
@@ -4288,7 +4317,7 @@ export class PostgresServerStore implements ServerStore {
 			}[]
 			const stored = rows[0]
 			// As in mergeIntoRecord: '' is a state from before plans were recorded.
-			const samePlan = !stored?.plan || stored.plan === this.planStamp()
+			const samePlan = isActivePlanStamp(this.planStamps(), collection, stored?.plan)
 			const parsed =
 				stored && samePlan ? parseStoredFoldState(stored.state, collection, recordId) : null
 			if (
@@ -4350,13 +4379,13 @@ export class PostgresServerStore implements ServerStore {
 		if (liveViews) {
 			await txOrDb.execute(
 				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan, lv_through, lv_fields)
-					VALUES (${collection}, ${recordId}, ${body}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp()}, ${liveViews.through}, ${liveViews.fields})
+					VALUES (${collection}, ${recordId}, ${body}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp(collection)}, ${liveViews.through}, ${liveViews.fields})
 					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan, lv_through = EXCLUDED.lv_through, lv_fields = EXCLUDED.lv_fields`,
 			)
 		} else {
 			await txOrDb.execute(
 				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
-					VALUES (${collection}, ${recordId}, ${body}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
+					VALUES (${collection}, ${recordId}, ${body}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp(collection)})
 					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		}
@@ -4440,7 +4469,7 @@ export class PostgresServerStore implements ServerStore {
 		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef || batch.length === 0) return
 		const kept = batch.filter((entry) => entry.state !== null)
-		const plan = this.planStamp()
+		const plan = this.planStamp(collection)
 		for (let i = 0; i < kept.length; i += 1000) {
 			const values = kept
 				.slice(i, i + 1000)
@@ -4619,7 +4648,7 @@ export class PostgresServerStore implements ServerStore {
 						sql`SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}`,
 					)) as unknown as { value: string }[]
 				)[0]?.value
-				if (recorded === undefined || planStampOf(recorded) !== this.planStamp()) return
+				if (recorded === undefined || planStampOf(recorded) !== this.planStamps().global) return
 			}
 			// The membership index moves with the re-folded records, in this transaction, at
 			// a delivery sequence of its own (like an index reconcile: no operation carries it).
@@ -4750,7 +4779,8 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 		const schema = this.schema
 		if (!schema) return 0
-		const plan = this.planStamp()
+		const stamps = this.planStamps()
+		const plan = stamps.global
 		const collections = Object.keys(schema.collections)
 		if (collections.length === 0) return 0
 		// Only collections of this schema: a state of a dropped collection is never re-folded.
@@ -4766,7 +4796,7 @@ export class PostgresServerStore implements ServerStore {
 				sql`SELECT f.collection, f.record_id,
 					(SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}) AS recorded
 				FROM kora_fold_state f
-				WHERE ((f.plan > '' AND f.plan < ${plan}) OR f.plan > ${plan})
+				WHERE ${outdatedPlanCondition(sql`f.plan`, allActiveStamps(stamps))}
 					AND f.collection IN (${sql.join(
 						collections.map((collection) => sql`${collection}`),
 						sql`, `,
@@ -4793,6 +4823,7 @@ export class PostgresServerStore implements ServerStore {
 			ran: true,
 			records: 0,
 			skippedUnclean: 0,
+			replanned: [],
 			fullRefold: false,
 		}
 		const clean = this.logIntegrity.totalQuarantined === 0
@@ -4841,10 +4872,16 @@ export class PostgresServerStore implements ServerStore {
 		return report.records
 	}
 
-	/** A short stamp of this instance's fold plan (schema, transforms, authorities). */
-	private planStamp(): string {
+	/** The stamp this instance folds `collection` with (see plan-stamps.ts). */
+	private planStamp(collection: string): string {
+		const stamps = this.planStamps()
+		return stamps.byCollection[collection] ?? stamps.global
+	}
+
+	/** This instance's fold plan stamps (schema, transforms, authorities), per collection. */
+	private planStamps(): ServerPlanStamps {
 		const schema = this.schema
-		if (!schema) return ''
+		if (!schema) return EMPTY_PLAN_STAMPS
 		const cached = this.planStampCache
 		if (
 			cached &&
@@ -4854,9 +4891,7 @@ export class PostgresServerStore implements ServerStore {
 		) {
 			return cached.value
 		}
-		const value = planStampOf(
-			serverFoldPlanFingerprint(schema, this.explicitAuthorities, this.operationTransforms),
-		)
+		const value = serverPlanStamps(schema, this.explicitAuthorities, this.operationTransforms)
 		this.planStampCache = {
 			schema,
 			transforms: this.operationTransforms,
@@ -4872,37 +4907,67 @@ export class PostgresServerStore implements ServerStore {
 			ran: true,
 			records: 0,
 			skippedUnclean: 0,
+			replanned: [],
 			fullRefold: false,
 		}
 		if (!schema) return { ...report, ran: false }
 		const clean = this.logIntegrity.totalQuarantined === 0
-		const fingerprint = serverFoldPlanFingerprint(
-			schema,
-			this.explicitAuthorities,
-			this.operationTransforms,
-		)
+		const stamps = this.planStamps()
 		await this.db.transaction(async (tx) => {
 			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('kora:fold-plan', 0))`)
-			const stored = (
-				(await tx.execute(
-					sql`SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}`,
-				)) as unknown as { value: string }[]
-			)[0]?.value
-			if (stored === fingerprint) return
-			report.fullRefold = stored !== undefined
-			// Records are re-folded over many transactions: every instance waits for the
-			// index rebuild that follows.
-			await this.writeRebuildingMarker(tx)
-			// Epoch row first (lock order), so a backfill pass in flight cannot store a cursor
-			// over summaries gone unknown.
-			await this.bumpLiveViewEpoch(tx)
-			await tx.execute(sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL`)
-			// Every summary is unknown now: the finished backfill passes no longer hold.
+			const meta = async (key: string): Promise<string | undefined> =>
+				(
+					(await tx.execute(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+					)) as unknown as { value: string }[]
+				)[0]?.value
+			const recordedGlobal = await meta(FOLD_PLAN_FINGERPRINT_KEY)
+			const decision = decideReplan(stamps, {
+				fingerprints: await meta(FOLD_PLAN_FINGERPRINTS_KEY),
+				globalFingerprint: recordedGlobal,
+			})
+			report.replanned = decision.replanned
+			report.fullRefold =
+				recordedGlobal !== undefined &&
+				decision.replanned.length > 0 &&
+				decision.replanned.length === Object.keys(schema.collections).length
+			if (!decision.write) return
+			if (decision.restampLegacy) {
+				// States stamped with the whole-schema stamp of this very plan: the same plan per
+				// collection, so they take their collection's stamp without a re-fold.
+				for (const [collection, stamp] of Object.entries(stamps.byCollection)) {
+					await tx.execute(
+						sql`UPDATE kora_fold_state SET plan = ${stamp} WHERE collection = ${collection} AND plan = ${stamps.global}`,
+					)
+				}
+			}
+			if (decision.replanned.length > 0) {
+				// Records are re-folded over many transactions. Only the membership index's own
+				// sources change it when re-folded: every instance waits for its rebuild only then.
+				if (
+					decision.replanned.some((collection) => feedsMembershipIndex(schema.access, collection))
+				) {
+					await this.writeRebuildingMarker(tx)
+				}
+				// Epoch row first (lock order), so a backfill pass in flight cannot store a cursor
+				// over summaries gone unknown.
+				await this.bumpLiveViewEpoch(tx)
+				for (const collection of decision.replanned) {
+					await tx.execute(
+						sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL WHERE collection = ${collection}`,
+					)
+					// Those summaries are unknown now: their finished backfill pass no longer holds.
+					await tx.execute(
+						sql`DELETE FROM kora_server_meta WHERE key = ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}${collection}`}`,
+					)
+				}
+			}
 			await tx.execute(
-				sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`,
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${stamps.globalFingerprint})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
 			await tx.execute(
-				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINTS_KEY}, ${JSON.stringify(stamps.fingerprints)})
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
 		})
@@ -4936,14 +5001,13 @@ export class PostgresServerStore implements ServerStore {
 				}[]
 				if (page.length === 0) break
 				cursor = page[page.length - 1]?.record_id ?? cursor
-				const plan = this.planStamp()
 				const stale = page.filter(
 					(row) =>
 						row.covered === null ||
 						Number(row.covered) !== Number(row.max_seq) ||
 						!row.covered_exists ||
 						// Folded meanwhile by an instance on another plan (a rolling deploy).
-						(row.plan !== null && row.plan !== '' && row.plan !== plan),
+						!isActivePlanStamp(stamps, collection, row.plan),
 				)
 				// Bounded transactions (FOLD_MIGRATION_BATCH_OPERATIONS): each holds the lock
 				// every append takes, and each commits its records whole (state, row and
