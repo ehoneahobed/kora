@@ -320,18 +320,37 @@ export async function runLocalImport(options: LocalImportOptions): Promise<Local
 			)
 		}
 		logger.step(`Restoring the ${formatBytes(dump.bytes)} database`)
-		await run(
-			postgresTool(options.pgBin ?? null, 'pg_restore'),
-			[
-				'--no-owner',
-				'--no-privileges',
-				'--single-transaction',
-				'--exit-on-error',
-				`--dbname=${withoutPassword(options.databaseUrl)}`,
-				dumpPath,
-			],
-			options.databaseUrl,
+		const pgRestore = postgresTool(options.pgBin ?? null, 'pg_restore')
+		const toolMajor = majorVersion(await run(pgRestore, ['--version'], options.databaseUrl))
+		const serverMajor = Math.floor(
+			Number((await sql(psql, options.databaseUrl, 'show server_version_num')).trim()) / 10000,
 		)
+		if (toolMajor !== null && toolMajor > serverMajor) {
+			// A newer pg_restore opens every restore with settings an older server doesn't have
+			// (pg_restore 17 sets transaction_timeout, which PostgreSQL 16 refuses), so the restore
+			// would fail on its first line. Restore through psql instead, leaving out only those
+			// header settings. The data and schema statements are passed through untouched.
+			const known = new Set(
+				(await sql(psql, options.databaseUrl, 'select name from pg_settings'))
+					.split('\n')
+					.map((name) => name.trim().toLowerCase())
+					.filter(Boolean),
+			)
+			await restoreThroughPsql(pgRestore, psql, dumpPath, options.databaseUrl, known)
+		} else {
+			await run(
+				pgRestore,
+				[
+					'--no-owner',
+					'--no-privileges',
+					'--single-transaction',
+					'--exit-on-error',
+					`--dbname=${withoutPassword(options.databaseUrl)}`,
+					dumpPath,
+				],
+				options.databaseUrl,
+			)
+		}
 
 		const expected = recordedTables(manifest)
 		const counts = await rowCounts(psql, options.databaseUrl)
@@ -409,6 +428,130 @@ function recordedTables(
 	for (const [name, count] of Object.entries(tables))
 		if (typeof count === 'number') out[name] = count
 	return Object.keys(out).length > 0 ? out : null
+}
+
+/** The major version from a PostgreSQL tool's `--version` line, or null when it can't be read. */
+export function majorVersion(versionLine: string): number | null {
+	const match = /\(PostgreSQL\)\s+(\d+)/.exec(versionLine)
+	return match ? Number(match[1]) : null
+}
+
+const HEADER_SETTING = /^SET\s+([a-z_][a-z0-9_.]*)\s*=/i
+const HEADER_LINE = /^(SET\s|SELECT pg_catalog\.set_config\(|BEGIN;|--|\s*$)/
+
+/**
+ * Returns a line filter for a pg_restore script that drops the `SET name = ...;` lines the
+ * target server doesn't know, but only in the script's opening block of session settings.
+ * Everything from the first statement that isn't a setting on (schema, data, COPY rows) is
+ * passed through unchanged, so a row that happens to read like a SET is never touched.
+ */
+export function createHeaderSettingFilter(known: ReadonlySet<string>): (line: string) => boolean {
+	let inHeader = true
+	return (line) => {
+		if (!inHeader) return true
+		if (!HEADER_LINE.test(line)) {
+			inHeader = false
+			return true
+		}
+		const setting = HEADER_SETTING.exec(line)?.[1]?.toLowerCase()
+		return !setting || setting.includes('.') || known.has(setting)
+	}
+}
+
+/**
+ * Restores with pg_restore writing a script and psql running it in one transaction, stopping at
+ * the first error, as `pg_restore --single-transaction --exit-on-error` does.
+ */
+async function restoreThroughPsql(
+	pgRestore: string,
+	psql: string,
+	dumpPath: string,
+	databaseUrl: string,
+	known: ReadonlySet<string>,
+): Promise<void> {
+	const url = new URL(databaseUrl)
+	const env = {
+		...process.env,
+		PGPASSWORD: decodeURIComponent(url.password),
+		PGCONNECT_TIMEOUT: '30',
+	}
+	const producer = spawn(
+		pgRestore,
+		['--no-owner', '--no-privileges', '--single-transaction', '--file=-', dumpPath],
+		{ env, stdio: ['ignore', 'pipe', 'pipe'] },
+	)
+	const consumer = spawn(
+		psql,
+		[
+			'--no-psqlrc',
+			'--quiet',
+			'--set=ON_ERROR_STOP=1',
+			`--dbname=${withoutPassword(databaseUrl)}`,
+			'--file=-',
+		],
+		{ env, stdio: ['pipe', 'ignore', 'pipe'] },
+	)
+	const stderrOf = (child: typeof producer | typeof consumer): (() => string) => {
+		let text = ''
+		child.stderr?.on('data', (chunk: Buffer) => {
+			if (text.length < 8192) text += chunk.toString('utf8')
+		})
+		return () => text
+	}
+	const producerErrors = stderrOf(producer)
+	const consumerErrors = stderrOf(consumer)
+	const exited = (child: typeof producer | typeof consumer): Promise<number | null> =>
+		new Promise((resolveExit, reject) => {
+			child.on('error', reject)
+			child.on('close', (code) => resolveExit(code))
+		})
+	const producerExit = exited(producer)
+	const consumerExit = exited(consumer)
+
+	const keep = createHeaderSettingFilter(known)
+	let pendingText = ''
+	const write = async (text: string): Promise<void> => {
+		if (consumer.exitCode !== null) throw new Error('psql stopped')
+		if (consumer.stdin && !consumer.stdin.write(text))
+			await Promise.race([
+				new Promise<void>((resolveDrain) => consumer.stdin?.once('drain', resolveDrain)),
+				consumerExit,
+			])
+	}
+	// A broken pipe once psql has stopped is reported through psql's own exit, not thrown here.
+	consumer.stdin?.on('error', () => undefined)
+	try {
+		for await (const chunk of producer.stdout as AsyncIterable<Buffer>) {
+			pendingText += chunk.toString('utf8')
+			const lines = pendingText.split('\n')
+			pendingText = lines.pop() ?? ''
+			const out = lines
+				.filter((line) => keep(line))
+				.map((line) => `${line}\n`)
+				.join('')
+			if (out) await write(out)
+		}
+		if (pendingText && keep(pendingText)) await write(pendingText)
+	} catch {
+		// psql stopped reading (it failed); its exit code and message say why.
+		producer.kill('SIGTERM')
+	}
+	consumer.stdin?.end()
+	const [producerCode, consumerCode] = await Promise.all([producerExit, consumerExit])
+	const failure = (tool: string, stderr: string): DataTransferError => {
+		const line =
+			stderr
+				.split('\n')
+				.find((entry) => /error/i.test(entry))
+				?.trim() ??
+			stderr.trim().split('\n')[0] ??
+			''
+		return new DataTransferError(
+			`${tool} failed: ${line.replace(/postgres(?:ql)?:\/\/\S+/gi, '<database>').slice(0, 300)}`,
+		)
+	}
+	if (consumerCode !== 0) throw failure('psql', consumerErrors())
+	if (producerCode !== 0) throw failure('pg_restore', producerErrors())
 }
 
 function postgresTool(pgBin: string | null, name: 'psql' | 'pg_restore'): string {
