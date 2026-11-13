@@ -70,6 +70,14 @@ kora import my-app.tar --platform kora-cloud           # 3. bring them in
 
 `kora import` uploads the file straight to the project's own backup storage, through a link that can write that one file and expires after 90 minutes; Kora Cloud never passes the data through its control plane. It then checks the import exactly like a backup: the database is restored into a scratch copy, every Kora operation must match its content hash, and every file must match its name. It needs an owner of the organization.
 
+**Operations your own tools wrote.** An app whose scripts wrote straight into the server's database (seeding content under random ids, or repairing stored operations in place) has operations that don't match their content hashes, and the import is refused with their count. If those scripts are the reason, import again accepting exactly that count:
+
+```bash
+kora import my-app.tar --platform kora-cloud --accept-unverified 8349
+```
+
+Kora Cloud records each accepted operation with a digest of its content. Later backups pass them only while that content is unchanged, so any change after the import is still caught, and any other count is refused. The ids stay as they are, so devices that already hold these operations keep syncing them. To keep new data verifiable, write through the app or the server's routes rather than into the database.
+
 The result is a verified backup marked **Imported** on the project's **Backups** page, and production's data is still unchanged. From there, **Replace production's data** loads it into production, or **Restore to a new environment** opens a copy to try first. Take the bundle's data at a quiet moment, or stop writes to the old app first: anything written there after the export stays behind.
 
 ---
