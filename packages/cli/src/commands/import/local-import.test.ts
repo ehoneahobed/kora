@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { afterAll, describe, expect, test } from 'vitest'
 import type { Logger } from '../../utils/logger'
 import { runExport } from '../export/export-command'
-import { runLocalImport } from './import-command'
+import { createHeaderSettingFilter, majorVersion, runLocalImport } from './import-command'
 
 const quiet: Logger = {
 	info: () => undefined,
@@ -22,6 +22,11 @@ const PG_URL = process.env.KORA_PG_TEST_URL
 const PG_BIN =
 	['/opt/homebrew/opt/postgresql@16/bin', '/usr/lib/postgresql/16/bin'].find((dir) =>
 		existsSync(join(dir, 'psql')),
+	) ?? null
+// Client tools newer than the test server (PostgreSQL 16), when installed.
+const NEWER_PG_BIN =
+	['/opt/homebrew/opt/postgresql@17/bin', '/usr/lib/postgresql/17/bin'].find((dir) =>
+		existsSync(join(dir, 'pg_restore')),
 	) ?? null
 const suffix = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`
 const created: string[] = []
@@ -142,3 +147,64 @@ describe.skipIf(!PG_URL || !PG_BIN)('postgres: kora import into your own databas
 		expect(psql(target, "select count(*) from pg_tables where schemaname = 'public'")).toBe('0')
 	})
 })
+
+describe('restoring with client tools newer than the server', () => {
+	test('reads the major version from a tool', () => {
+		expect(majorVersion('pg_restore (PostgreSQL) 17.5 (Homebrew)')).toBe(17)
+		expect(majorVersion('pg_restore (PostgreSQL) 16.4')).toBe(16)
+		expect(majorVersion('something else')).toBeNull()
+	})
+
+	test('drops only header settings the server lacks, and never touches what follows', () => {
+		const keep = createHeaderSettingFilter(new Set(['statement_timeout', 'client_encoding']))
+		const script = [
+			'--',
+			'-- PostgreSQL database dump',
+			'BEGIN;',
+			'SET statement_timeout = 0;',
+			'SET transaction_timeout = 0;',
+			"SET client_encoding = 'UTF8';",
+			"SELECT pg_catalog.set_config('search_path', '', false);",
+			"SET my.custom = 'x';",
+			'',
+			'CREATE TABLE public.notes (body text);',
+			'COPY public.notes (body) FROM stdin;',
+			'SET transaction_timeout = 0;',
+			'\\.',
+		]
+		expect(script.filter((line) => keep(line))).toEqual(script.filter((_, index) => index !== 4))
+	})
+})
+
+describe.skipIf(!PG_URL || !PG_BIN || !NEWER_PG_BIN)(
+	'postgres: kora import with client tools newer than the server',
+	() => {
+		test('restores a bundle the newer tools wrote, leaving data that reads like a setting intact', async () => {
+			const source = await database('newer_source')
+			psql(
+				source,
+				"create table notes (id serial primary key, body text); insert into notes (body) values ('SET transaction_timeout = 0;'), ('an ordinary note')",
+			)
+			const bundle = join(await mkdtemp(join(tmpdir(), 'kora-import-newer-')), 'app.tar')
+			await runExport({
+				databaseUrl: source,
+				blobDir: null,
+				out: bundle,
+				pgBin: NEWER_PG_BIN,
+				logger: quiet,
+			})
+			const target = await database('newer_target')
+			const result = await runLocalImport({
+				file: bundle,
+				databaseUrl: target,
+				blobDir: null,
+				pgBin: NEWER_PG_BIN,
+				logger: quiet,
+			})
+			expect(result.differences).toEqual([])
+			expect(psql(target, 'select body from notes order by id')).toBe(
+				'SET transaction_timeout = 0;\nan ordinary note',
+			)
+		})
+	},
+)
