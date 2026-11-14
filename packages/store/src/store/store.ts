@@ -49,6 +49,7 @@ import {
 	SchemaVersionAheadError,
 	StorageFormatAheadError,
 	StoreNotOpenError,
+	StoreReadOnlyError,
 	WriteNotDurableError,
 } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
@@ -535,6 +536,8 @@ export class Store implements OperationLog {
 	private pinnedNodeOwnedBy: string | null = null
 	/** The sync server refused the pinned node as another user's (F9). */
 	private pinnedNodeRefusedByServer = false
+	/** Set while the app must not write locally ({@link setReadOnly}). */
+	private readOnlyReason: string | null = null
 	/** The user of the last {@link bindPrincipal}. */
 	private signedInPrincipal: string | null = null
 	/**
@@ -4284,8 +4287,31 @@ export class Store implements OperationLog {
 		this.pinnedNodeRefusedByServer = owned
 	}
 
-	/** Refuse a local write while the pinned node belongs to another user (F9). */
+	/**
+	 * Make this store read-only (a reason) or writable again (null). While read-only, every local
+	 * write (insert, update, delete, transaction) throws {@link StoreReadOnlyError} before anything
+	 * is recorded; reads, subscriptions and incoming sync carry on. It applies to this app instance
+	 * only and is not persisted.
+	 *
+	 * @param reason - Why, in words a person reads ("previewing as Ama"); null to allow writes again
+	 */
+	setReadOnly(reason: string | null): void {
+		this.readOnlyReason = reason && reason.trim() !== '' ? reason : null
+	}
+
+	/** The reason this store is read-only, or null when it is writable. */
+	getReadOnlyReason(): string | null {
+		return this.readOnlyReason
+	}
+
+	/** Throws when a local write is not allowed now (read-only, or the node is another user's). */
+	assertWritable(): void {
+		this.assertLocalWriteAllowed()
+	}
+
+	/** Refuse a local write while read-only, or while the pinned node belongs to another user (F9). */
 	private assertLocalWriteAllowed(): void {
+		if (this.readOnlyReason !== null) throw new StoreReadOnlyError(this.readOnlyReason)
 		if (this.pinnedNodeOwnedBy === null && !this.pinnedNodeRefusedByServer) return
 		throw new NodeOwnedByAnotherUserError(this.nodeId, this.signedInPrincipal)
 	}

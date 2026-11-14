@@ -49,6 +49,7 @@ export {
 	LocalDatabaseNotFoundError,
 	NoLeaderError,
 	NodeOwnedByAnotherUserError,
+	StoreReadOnlyError,
 	OptimisticLockError,
 	PersistenceError,
 	QueryError,

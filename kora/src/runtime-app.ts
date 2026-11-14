@@ -99,6 +99,8 @@ export function createRuntimeApp(
 	finalizeSchema(config.schema)
 	void config.schema.access
 	let store: Store | null = null
+	// Applied to the store when it opens, so a read-only app set up before `ready` stays so.
+	let readOnly: string | null = null
 	let applyPipeline: ApplyPipeline | null = null
 	let blobApi: BlobApi | null = null
 	let unsubscribeSync: (() => void) | null = null
@@ -190,6 +192,7 @@ export function createRuntimeApp(
 		warmTransport: options.warmTransport,
 	}).then(async (init) => {
 		store = init.store
+		store.setReadOnly(readOnly)
 		releaseVersionGate = init.releaseVersionGate
 		versionGateActive = init.versionGate !== null
 		activeVersionGate = init.versionGate
@@ -397,6 +400,13 @@ export function createRuntimeApp(
 		},
 		storeInfo(): StoreInfo {
 			return { ...currentStoreInfo }
+		},
+		setReadOnly(reason) {
+			readOnly = reason && reason.trim() !== '' ? reason : null
+			store?.setReadOnly(readOnly)
+		},
+		readOnlyReason() {
+			return readOnly
 		},
 		transaction(fn) {
 			return executeTransaction(fn)

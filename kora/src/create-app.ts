@@ -110,6 +110,8 @@ export function createApp<const S extends SchemaInput>(
 	// The runtime app, once its chunk has loaded and created it; `opened` flips when its
 	// `ready` resolved, which is also when the writes queued before are applied.
 	let runtime: KoraApp | null = null
+	// Read-only set before the runtime exists (applied when it is created).
+	let pendingReadOnly: string | null = null
 	let opened = false
 	let closed = false
 	let started: Promise<void> | null = null
@@ -228,6 +230,7 @@ export function createApp<const S extends SchemaInput>(
 					},
 				},
 			})
+			runtime.setReadOnly(pendingReadOnly)
 			for (const subscriptions of notices) subscriptions.flush()
 			await runtime.ready
 			opened = true
@@ -362,6 +365,7 @@ export function createApp<const S extends SchemaInput>(
 	const host = {
 		getStore,
 		queue,
+		readOnlyReason: (): string | null => (runtime ? runtime.readOnlyReason() : pendingReadOnly),
 		// A subscription asks for the store at once; with read-through it waits for the first
 		// answer (or the wait's end) so the runtime does not compete with it for the link.
 		whenReady: (): Promise<void> => firstAnswer.then(whenOpen).then(seedHeldAnswers),
@@ -756,6 +760,13 @@ export function createApp<const S extends SchemaInput>(
 		},
 		storeInfo(): StoreInfo {
 			return runtime ? runtime.storeInfo() : { ...currentStoreInfo }
+		},
+		setReadOnly(reason) {
+			pendingReadOnly = reason && reason.trim() !== '' ? reason : null
+			runtime?.setReadOnly(pendingReadOnly)
+		},
+		readOnlyReason() {
+			return runtime ? runtime.readOnlyReason() : pendingReadOnly
 		},
 		transaction: (fn) => withRuntime((app) => app.transaction(fn)),
 		mutation: (name, fn) => withRuntime((app) => app.mutation(name, fn)),

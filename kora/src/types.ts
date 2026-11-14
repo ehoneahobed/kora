@@ -765,6 +765,16 @@ export interface KoraApp {
 	getSyncEngine(): SyncEngine | null
 	/** Per-app reference-counted cache for framework query subscriptions. */
 	getQueryStoreCache(): import('@korajs/store').QueryStoreCache
+	/**
+	 * Make the app read-only (a reason) or writable again (null). While read-only, every local
+	 * write (insert, update, delete, transaction, mutation) throws `StoreReadOnlyError`
+	 * (`STORE_READ_ONLY`) before anything is recorded, including writes made before `app.ready`.
+	 * Reads, subscriptions and incoming sync carry on. Per app instance, not persisted: for
+	 * example while an admin previews the app as another person.
+	 */
+	setReadOnly(reason: string | null): void
+	/** Why the app is read-only, or null when it is writable. */
+	readOnlyReason(): string | null
 	/** Safe local-store identity and durability metadata (never exposes records). */
 	storeInfo(): StoreInfo
 	/** Gracefully close the app: stop sync, close store. */
@@ -876,6 +886,16 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	getSyncEngine(): SyncEngine | null
 	/** Per-app reference-counted cache for framework query subscriptions. */
 	getQueryStoreCache(): import('@korajs/store').QueryStoreCache
+	/**
+	 * Make the app read-only (a reason) or writable again (null). While read-only, every local
+	 * write (insert, update, delete, transaction, mutation) throws `StoreReadOnlyError`
+	 * (`STORE_READ_ONLY`) before anything is recorded, including writes made before `app.ready`.
+	 * Reads, subscriptions and incoming sync carry on. Per app instance, not persisted: for
+	 * example while an admin previews the app as another person.
+	 */
+	setReadOnly(reason: string | null): void
+	/** Why the app is read-only, or null when it is writable. */
+	readOnlyReason(): string | null
 	/** Safe local-store identity and durability metadata. */
 	storeInfo(): StoreInfo
 	/** Gracefully close the app: stop sync, close store. */

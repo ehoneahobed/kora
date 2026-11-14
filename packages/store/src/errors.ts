@@ -341,6 +341,9 @@ export class NodeOwnedByAnotherUserError extends KoraError {
 	}
 }
 
+// Its own module so the first-paint (lite) entry can carry it.
+export { StoreReadOnlyError } from './read-only-error'
+
 /** Builds named in a {@link BuildSupersededError}. */
 export interface BuildSupersededInfo {
 	/** The build this tab runs. */
