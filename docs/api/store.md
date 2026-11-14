@@ -51,7 +51,7 @@ Every method rejects with `AppNotReadyError` (`APP_NOT_READY`) before `app.ready
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `insert(data)` | `Promise<Record>` | Validates, applies defaults and `t.timestamp().auto()`, generates a UUID v7 `id`, writes the record and its operation in one transaction. A field given `null` (or `undefined`) counts as left out: an optional field stays empty, a field with a default gets it, a required field is refused. |
+| `insert(data)` | `Promise<Record>` | Validates, applies defaults and `t.timestamp().auto()`, generates a UUID v7 `id`, writes the record and its operation in one transaction. `null` leaves an optional field (with no default) empty; a required field, or one with a default, refuses `null` (leave the field out to get its default). |
 | `insertMany(rows)` | `Promise<Record[]>` | Inserts several records in **one** transaction: all of them or none. Every row is validated before anything is written. Each row is still its own insert operation (in input order, one shared `transactionId`), and live queries update once, after the commit. Use it for bulk writes (imports, seeding): see [Bulk inserts](#bulk-inserts). |
 | `update(id, data)` | `Promise<Record>` | Writes only the fields that change (an unchanged value is not a write). Accepts [atomic ops](/api/core#atomic-ops). Throws `RecordNotFoundError` for a missing or deleted record. |
 | `delete(id)` | `Promise<void>` | Deletes the record (relations apply their `onDelete`). Throws `RecordNotFoundError` when it does not exist. |

@@ -130,17 +130,12 @@ describe('validateRecord', () => {
 			expect('notes' in result).toBe(false)
 		})
 
-		test('applies the default when a field with a default is null', () => {
+		test('refuses null for a field with a default (RT-101), saying how to get the default', () => {
 			const items = simpleTodosCollection()
 			if (!items) return
-			const result = validateRecord(
-				'items',
-				items,
-				{ name: 'a', count: 1, active: null, tags: null },
-				'insert',
-			)
-			expect(result.active).toBe(true)
-			expect(result.tags).toEqual([])
+			expect(() =>
+				validateRecord('items', items, { name: 'a', count: 1, active: null }, 'insert'),
+			).toThrow(/Field "active" in collection "items" cannot be null: it has a default/)
 		})
 
 		test('refuses null for a required field, saying so', () => {

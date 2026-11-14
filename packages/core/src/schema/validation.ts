@@ -80,9 +80,22 @@ export function validateRecord(
 			continue
 		}
 
-		// null is "no value" on an insert, as it already is on an update (where it clears the
-		// field): a form's "None" choice must not fail an insert of an optional field.
-		if (!hasValue || value === undefined || value === null) {
+		// An explicit null on an insert: an optional field with no default is left empty (a form's
+		// "None" choice), as null clears a field on an update. A required field, or one with a
+		// default, refuses it (RT-101): its value is never silently replaced or dropped.
+		if (value === null && hasValue) {
+			if (descriptor.required || descriptor.defaultValue !== undefined) {
+				throw new SchemaValidationError(
+					descriptor.required
+						? `Required field "${fieldName}" in collection "${collection}" cannot be null. Give it a value, or declare it .optional()`
+						: `Field "${fieldName}" in collection "${collection}" cannot be null: it has a default. Leave it out to get the default`,
+					{ collection, field: fieldName },
+				)
+			}
+			continue
+		}
+
+		if (!hasValue || value === undefined) {
 			if (descriptor.defaultValue !== undefined) {
 				// Deep-copy default arrays/objects to prevent shared mutations
 				result[fieldName] =
@@ -94,9 +107,7 @@ export function validateRecord(
 
 			if (descriptor.required) {
 				throw new SchemaValidationError(
-					value === null
-						? `Required field "${fieldName}" in collection "${collection}" cannot be null. Give it a value, or declare it .optional()`
-						: `Required field "${fieldName}" is missing in collection "${collection}"`,
+					`Required field "${fieldName}" is missing in collection "${collection}"`,
 					{ collection, field: fieldName },
 				)
 			}
