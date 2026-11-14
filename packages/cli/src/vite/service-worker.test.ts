@@ -368,6 +368,18 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 		expect(await sw.get('/api/items')).toBe('[]')
 	})
 
+	test("offline, a folder path opens the folder's precached index.html, not the app", async () => {
+		// A static page shipped with the app (public/help/index.html): it carries no shell marker.
+		const files = { ...v1Files, '/help/index.html': '<html>help</html>' }
+		const offline = worker(files, null)
+		await offline.install()
+		expect(await offline.get('/help/', 'navigate')).toBe('<html>help</html>')
+		expect(await offline.get('/help/index.html', 'navigate')).toBe('<html>help</html>')
+		// A folder with no page of its own is a client-side route: the app shell.
+		expect(await offline.get('/todos/', 'navigate')).toBe(page('v1'))
+		expect(await offline.get('/', 'navigate')).toBe(page('v1'))
+	})
+
 	test('the plugin marks built pages (not dev pages) for the worker', () => {
 		const plugin = koraServiceWorker()
 		plugin.configResolved({ root: '/x', base: '/', command: 'build', build: { outDir: 'dist' } })

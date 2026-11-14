@@ -586,11 +586,13 @@ function fromCache(request) {
 	return caches.open(CACHE).then((cache) => cache.match(request, { ignoreSearch: true, ignoreVary: true }))
 }
 
-// This build's copy of the page a navigation asked for: the precached page of that path,
-// else the app shell (client-side routes).
+// This build's copy of the page a navigation asked for: the precached page of that path
+// (a folder's index.html for a path ending in "/", as a static host serves it: a help page
+// at /help/ opens offline, not the app), else the app shell (client-side routes).
 function ownPage(url) {
+	const path = url.pathname.endsWith('/') ? url.pathname + 'index.html' : url.pathname
 	return caches.open(CACHE).then((cache) =>
-		(PAGES.includes(url.pathname) ? cache.match(url.pathname, MATCH) : Promise.resolve(undefined)).then(
+		(PAGES.includes(path) ? cache.match(path, MATCH) : Promise.resolve(undefined)).then(
 			(page) => page || cache.match(SHELL, MATCH),
 		),
 	)
