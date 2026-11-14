@@ -3,7 +3,9 @@
 //! Tauri plugin providing native SQLite storage for Kora.js applications.
 //!
 //! This plugin exposes SQLite operations via Tauri IPC commands, configured with
-//! WAL mode, foreign keys, and proper pragmas for optimal offline-first performance.
+//! WAL mode, foreign keys, and proper pragmas for optimal offline-first performance,
+//! and keeps sign-in credentials in the operating system's credential store
+//! (`createTauriCredentialStore` in `@korajs/tauri`).
 //!
 //! ## Setup
 //!
@@ -27,6 +29,7 @@
 //! ```
 
 mod commands;
+mod credentials;
 mod error;
 
 use commands::DbState;
@@ -51,6 +54,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::execute,
             commands::query,
             commands::migrate,
+            credentials::credential_get,
+            credentials::credential_set,
+            credentials::credential_delete,
         ])
         .build()
 }

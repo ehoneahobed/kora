@@ -246,6 +246,8 @@ When `VITE_SYNC_URL` is set, the setup screen is skipped and the app connects au
 
 Desktop apps use the same `@korajs/auth` client and sync-token flow as web apps. The Tauri frontend runs in a WebView, so `createKoraAuth`, `@korajs/auth/react`, token refresh, and sync authorization work normally.
 
+The WebView loads the app from its own origin (`tauri://localhost` on macOS and Linux, `http://tauri.localhost` on Windows), so every call to the server's auth routes is cross-origin. `createProductionServer` allows those origins (and `http://localhost` in development) for its HTTP routes and `/health`, with no credentials, since Kora Auth sends bearer tokens. A server older than canary 2026-11-14 does not, and sign-in from the desktop app fails with a network error. To allow another origin, such as a web build on its own domain, pass `allowedOrigins` or set `KORA_ALLOWED_ORIGINS`.
+
 Create an auth client that points at the same remote server that hosts your auth routes:
 
 ```typescript
@@ -256,20 +258,22 @@ export const authClient = createKoraAuth({
 })
 ```
 
-For production apps, pass a secure desktop credential store:
+Keep sessions in the operating system's credential store (Keychain on macOS, Credential Manager on Windows, the Secret Service on Linux) rather than WebView storage. `@korajs/tauri` provides one, through the same `kora-sqlite` plugin and its default permission; the template uses it:
 
-<!-- docs-check: continue -->
 ```typescript
-import type { AuthKeyValueStorage } from '@korajs/auth'
-
-// An adapter over a Tauri secure-storage plugin (getItem, setItem, removeItem; sync or async)
-declare const tauriSecureStore: AuthKeyValueStorage
+import { createAuthTokenStorage, createKoraAuth } from '@korajs/auth'
+import { createTauriCredentialStore } from '@korajs/tauri'
 
 export const secureAuthClient = createKoraAuth({
   serverUrl: 'https://acme-corp.example.com',
-  credentialStore: tauriSecureStore,
+  storage: createAuthTokenStorage({ store: createTauriCredentialStore(), durability: 'durable' }),
 })
 ```
+
+- Entries are kept under the app's bundle identifier, and keychain calls run off the UI thread.
+- A session an earlier version of the app saved in WebView storage moves to the keychain on first read, so upgrading signs nobody out.
+- Where there is no credential store (mobile builds today, a browser build of the app, a Linux desktop without a Secret Service), the store falls back to WebView storage and warns once. `store.location` reports `keychain` or `fallback`.
+- It needs Rust 1.88 or newer.
 
 Bind it to sync when creating the Kora app:
 
@@ -546,6 +550,7 @@ Check that Vite is running on port 5173. Tauri's dev config expects the frontend
 1. Make sure the sync server is running (`pnpm dev` starts it automatically)
 2. Check the console for connection errors
 3. Verify `VITE_SYNC_URL` in `.env` matches the sync server address
+4. If sign-in fails with a network error while the server answers in a browser, the server doesn't allow the app's origin: upgrade `@korajs/server`, or add the origin to `KORA_ALLOWED_ORIGINS`
 
 ### Database location
 

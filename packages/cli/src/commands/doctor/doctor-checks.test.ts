@@ -86,6 +86,31 @@ describe('doctor checks', () => {
 		expect(worker?.status).toBe('pass')
 	})
 
+	it('does not ask a Tauri app for the WASM worker', async () => {
+		const temp = await createTempDir()
+		temps.push(temp)
+		await mkdir(join(temp.path, 'src'), { recursive: true })
+		await mkdir(join(temp.path, 'src-tauri'), { recursive: true })
+		await writeFile(
+			join(temp.path, 'package.json'),
+			JSON.stringify({ name: 'desk', dependencies: { korajs: '0.4.0' } }),
+		)
+		await writeFile(join(temp.path, 'src-tauri', 'tauri.conf.json'), '{}')
+		await writeFile(
+			join(temp.path, 'src', 'schema.js'),
+			`export default {
+  version: 1,
+  collections: { todos: { fields: { title: { kind: 'string' } } } },
+  relations: {},
+}`,
+		)
+
+		const results = await runDoctorChecks({ projectRoot: temp.path, skipNetwork: true })
+		const worker = results.find((r) => r.id === 'worker')
+		expect(worker?.status).toBe('pass')
+		expect(worker?.message).toContain('native SQLite')
+	})
+
 	it('fails when canary packages come from different releases', async () => {
 		const temp = await createTempDir()
 		temps.push(temp)

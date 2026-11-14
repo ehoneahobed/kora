@@ -16,6 +16,8 @@ import type { FullResyncTarget, ServerStore } from '../store/server-store'
 import type { StoreInsights } from '../store/store-insights'
 import type { WsWebSocket } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
+import { corsPreflightHeaders, corsResponseHeaders, createOriginPolicy } from './cross-origin'
+import { withHostSettings } from './host-settings'
 import {
 	DEFAULT_MAX_MESSAGE_BYTES,
 	KoraSyncServer,
@@ -58,6 +60,14 @@ export interface ProductionServerConfig {
 	 */
 	httpRoutes?: ProductionHttpRoute[]
 	/**
+	 * Other origins whose pages may call `httpRoutes` (sign-in, app APIs) and `/health` from a
+	 * browser engine. Always allowed: native app shells (Tauri's `tauri://localhost` and
+	 * `http(s)://tauri.localhost`), the comma-separated `KORA_ALLOWED_ORIGINS` the host sets,
+	 * and, outside production, `http://localhost` on any port. Responses never allow
+	 * credentials (Kora Auth sends bearer tokens). WebSocket sync is not subject to CORS.
+	 */
+	allowedOrigins?: readonly string[]
+	/**
 	 * Optional token protection for operational endpoints.
 	 *
 	 * When a token is omitted, the matching endpoint group remains public for
@@ -85,7 +95,8 @@ export interface ProductionServerConfig {
 	 * Reverse proxies trusted to report the client address in `X-Forwarded-For`,
 	 * which becomes `request.ip` (the key `@korajs/auth` rate-limits sign-in by).
 	 * A hop count (`1` for a single load balancer in front) or a list of trusted
-	 * proxy IPs / CIDR ranges. When unset, the header is ignored and `request.ip`
+	 * proxy IPs / CIDR ranges. Defaults to `KORA_TRUST_PROXY` (the same, comma-separated).
+	 * When neither is set, the header is ignored and `request.ip`
 	 * is the socket address, so a client cannot pick its own rate-limit bucket.
 	 */
 	trustProxy?: TrustProxySetting
@@ -153,11 +164,11 @@ export const DEFAULT_MAX_BACKUP_BYTES = 256 * 1024 * 1024
 const INSIGHTS_CACHE_MS = 30_000
 
 export interface ProductionOperationalAuth {
-	/** Protects /__kora, /__kora/status, and /__kora/events. */
+	/** Protects /__kora, /__kora/status, and /__kora/events. Defaults to `KORA_ADMIN_TOKEN`. */
 	adminToken?: string
-	/** Protects /__kora/metrics. Falls back to adminToken when omitted. */
+	/** Protects /__kora/metrics. Defaults to `KORA_METRICS_TOKEN`, then adminToken. */
 	metricsToken?: string
-	/** Protects /__kora/backup/*. Falls back to adminToken when omitted. */
+	/** Protects /__kora/backup/*. Defaults to `KORA_BACKUP_TOKEN`, then adminToken. */
 	backupToken?: string
 	/**
 	 * Lets a hosting platform read `/__kora/insights` and nothing else. Defaults to the
@@ -326,7 +337,9 @@ export interface ProductionServer {
  * const url = await server.start()
  * ```
  */
-export function createProductionServer(config: ProductionServerConfig): ProductionServer {
+export function createProductionServer(appConfig: ProductionServerConfig): ProductionServer {
+	// KORA_TRUST_PROXY and the operational tokens the host sets fill what the app left out.
+	const config = withHostSettings(appConfig)
 	const port = config.port ?? (Number(process.env.PORT) || 3001)
 	const staticDir = config.staticDir ?? './dist'
 	const syncPath = config.syncPath ?? '/kora-sync'
@@ -338,6 +351,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const readBodiesByAddress = new Map<string, number>()
 	const readBodiesByPrincipal = new Map<string, number>()
 	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
+	const originPolicy = createOriginPolicy(config.allowedOrigins)
 
 	// Files go where the host says, unless the app wired blob handling itself.
 	const wiresBlobsItself =
@@ -845,6 +859,31 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				res.setHeader('Cross-Origin-Embedder-Policy', crossOriginEmbedderPolicy)
 
 				const url = new URL(req.url || '/', `http://${req.headers.host}`)
+				const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined
+				const crossOrigin = originPolicy.allows(origin) ? origin : null
+				const customRoute = config.httpRoutes?.find((route) =>
+					matchesRoutePrefix(url.pathname, route.path),
+				)
+
+				// ── Cross-origin calls from native app shells (cross-origin.ts) ──
+				if (crossOrigin && (customRoute || url.pathname === '/health')) {
+					const requestedMethod = req.headers['access-control-request-method']
+					if (req.method === 'OPTIONS' && requestedMethod) {
+						const requestedHeaders = req.headers['access-control-request-headers']
+						res.writeHead(
+							204,
+							corsPreflightHeaders(
+								crossOrigin,
+								Array.isArray(requestedHeaders) ? requestedHeaders.join(',') : requestedHeaders,
+							),
+						)
+						res.end()
+						return
+					}
+					for (const [name, value] of Object.entries(corsResponseHeaders(crossOrigin))) {
+						res.setHeader(name, value)
+					}
+				}
 
 				// ── Health check ──────────────────────────────────────────────
 				if (url.pathname === '/health') {
@@ -1139,9 +1178,6 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				}
 
 				// ── Custom HTTP routes (auth, webhooks, app APIs) ─────────────
-				const customRoute = config.httpRoutes?.find((route) =>
-					matchesRoutePrefix(url.pathname, route.path),
-				)
 				if (customRoute) {
 					const parsed = await readJsonBody(req)
 					if (parsed.tooLarge) {

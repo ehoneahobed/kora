@@ -273,6 +273,19 @@ async function resolveSchemaPath(
 }
 
 async function checkWorkerFile(projectRoot: string): Promise<DoctorCheckResult> {
+	// A Tauri app stores through native SQLite (the kora-sqlite plugin), never the WASM worker.
+	try {
+		await access(join(projectRoot, 'src-tauri', 'tauri.conf.json'))
+		return {
+			id: 'worker',
+			title: 'SQLite WASM worker',
+			status: 'pass',
+			message: 'Not needed: this Tauri app stores data in native SQLite.',
+		}
+	} catch {
+		// not a Tauri project
+	}
+
 	const candidates = [
 		join(projectRoot, 'src', 'kora-worker.ts'),
 		join(projectRoot, 'src', 'kora-worker.js'),
