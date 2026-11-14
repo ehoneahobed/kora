@@ -41,7 +41,13 @@ describe('summarizeSyncStatus', () => {
 		const summary = summarizeSyncStatus(
 			status({
 				status: 'syncing',
-				initialSync: { complete: false, receivedBatches: 1, totalBatches: 4, progress: 0.25 },
+				initialSync: {
+					complete: false,
+					receivedBatches: 1,
+					totalBatches: 4,
+					progress: 0.25,
+					first: true,
+				},
 			}),
 		)
 		expect(summary).toMatchObject({ state: 'downloading', downloading: true, progress: 0.25 })
@@ -49,10 +55,32 @@ describe('summarizeSyncStatus', () => {
 		expect(
 			summarizeSyncStatus(
 				status({
-					initialSync: { complete: true, receivedBatches: 4, totalBatches: 4, progress: 1 },
+					initialSync: {
+						complete: true,
+						receivedBatches: 4,
+						totalBatches: 4,
+						progress: 1,
+						first: true,
+					},
 				}),
 			).downloading,
 		).toBe(false)
+	})
+
+	test('the catch-up after a reconnect is syncing, not downloading: the data is already here', () => {
+		const summary = summarizeSyncStatus(
+			status({
+				status: 'syncing',
+				initialSync: {
+					complete: false,
+					receivedBatches: 0,
+					totalBatches: null,
+					progress: null,
+					first: false,
+				},
+			}),
+		)
+		expect(summary).toMatchObject({ downloading: false, title: 'Syncing' })
 	})
 
 	test('states someone must act on have the attention tone', () => {
