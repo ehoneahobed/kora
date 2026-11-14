@@ -35,6 +35,7 @@ import {
   useQueryState,
   useRichText,
   useSyncStatus,
+  useSyncSummary,
 } from '@korajs/react'
 const schema = defineSchema({
   version: 1,
@@ -510,6 +511,7 @@ function SyncIndicator() {
 
 The sync status summarized for an indicator, with the wording rules Kora's apps share. It re-renders when the status changes, like `useSyncStatus()`.
 
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
 ```typescript
 function useSyncSummary(): SyncSummary
 ```
