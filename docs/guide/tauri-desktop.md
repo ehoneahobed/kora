@@ -246,6 +246,8 @@ When `VITE_SYNC_URL` is set, the setup screen is skipped and the app connects au
 
 Desktop apps use the same `@korajs/auth` client and sync-token flow as web apps. The Tauri frontend runs in a WebView, so `createKoraAuth`, `@korajs/auth/react`, token refresh, and sync authorization work normally.
 
+The WebView loads the app from its own origin (`tauri://localhost` on macOS and Linux, `http://tauri.localhost` on Windows), so every call to the server's auth routes is cross-origin. `createProductionServer` allows those origins (and `http://localhost` in development) for its HTTP routes and `/health`, with no credentials, since Kora Auth sends bearer tokens. A server older than canary 2026-11-14 does not, and sign-in from the desktop app fails with a network error. To allow another origin, such as a web build on its own domain, pass `allowedOrigins` or set `KORA_ALLOWED_ORIGINS`.
+
 Create an auth client that points at the same remote server that hosts your auth routes:
 
 ```typescript
@@ -546,6 +548,7 @@ Check that Vite is running on port 5173. Tauri's dev config expects the frontend
 1. Make sure the sync server is running (`pnpm dev` starts it automatically)
 2. Check the console for connection errors
 3. Verify `VITE_SYNC_URL` in `.env` matches the sync server address
+4. If sign-in fails with a network error while the server answers in a browser, the server doesn't allow the app's origin: upgrade `@korajs/server`, or add the origin to `KORA_ALLOWED_ORIGINS`
 
 ### Database location
 

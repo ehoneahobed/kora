@@ -56,6 +56,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `shellMeta` | | Per-URL title, description and Open Graph tags for the app shell, so shared links preview the page they point at. See [Link previews](#link-previews-and-per-page-metadata). |
 | `spaFallback` | `'navigation'` | Which missing paths get the app shell: `'navigation'` (browser navigations and crawlers), `'strict'` (browser navigations only) or `'extensionless'` (any extensionless path). |
 | `operationalAuth` | | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups). With `NODE_ENV=production`, endpoints whose token is unset are **disabled** (`403 OPERATIONAL_ENDPOINT_DISABLED`; `allowPublic: true` serves them anyway); outside production they are public, with a startup warning (`server.operational_endpoints_unprotected`). |
+| `allowedOrigins` | | Other origins whose pages may call `httpRoutes` and `/health` from a browser engine. Always allowed: native app shells (Tauri's `tauri://localhost`, `http(s)://tauri.localhost`), the comma-separated `KORA_ALLOWED_ORIGINS`, and, outside production, `http://localhost` on any port. Never with credentials. |
 | `trustProxy` | none | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list); `request.ip` uses it. |
 | `maxRequestBodyBytes` | 1 MiB | Larger bodies of custom routes get `413` before they are buffered. |
 | `maxBackupBytes` | 256 MiB | Largest backup import. |

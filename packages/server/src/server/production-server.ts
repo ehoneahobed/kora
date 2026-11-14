@@ -16,6 +16,7 @@ import type { FullResyncTarget, ServerStore } from '../store/server-store'
 import type { StoreInsights } from '../store/store-insights'
 import type { WsWebSocket } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
+import { corsPreflightHeaders, corsResponseHeaders, createOriginPolicy } from './cross-origin'
 import {
 	DEFAULT_MAX_MESSAGE_BYTES,
 	KoraSyncServer,
@@ -57,6 +58,14 @@ export interface ProductionServerConfig {
 	 * Express, Hono, or another HTTP framework.
 	 */
 	httpRoutes?: ProductionHttpRoute[]
+	/**
+	 * Other origins whose pages may call `httpRoutes` (sign-in, app APIs) and `/health` from a
+	 * browser engine. Always allowed: native app shells (Tauri's `tauri://localhost` and
+	 * `http(s)://tauri.localhost`), the comma-separated `KORA_ALLOWED_ORIGINS` the host sets,
+	 * and, outside production, `http://localhost` on any port. Responses never allow
+	 * credentials (Kora Auth sends bearer tokens). WebSocket sync is not subject to CORS.
+	 */
+	allowedOrigins?: readonly string[]
 	/**
 	 * Optional token protection for operational endpoints.
 	 *
@@ -338,6 +347,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const readBodiesByAddress = new Map<string, number>()
 	const readBodiesByPrincipal = new Map<string, number>()
 	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
+	const originPolicy = createOriginPolicy(config.allowedOrigins)
 
 	// Files go where the host says, unless the app wired blob handling itself.
 	const wiresBlobsItself =
@@ -845,6 +855,31 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				res.setHeader('Cross-Origin-Embedder-Policy', crossOriginEmbedderPolicy)
 
 				const url = new URL(req.url || '/', `http://${req.headers.host}`)
+				const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined
+				const crossOrigin = originPolicy.allows(origin) ? origin : null
+				const customRoute = config.httpRoutes?.find((route) =>
+					matchesRoutePrefix(url.pathname, route.path),
+				)
+
+				// ── Cross-origin calls from native app shells (cross-origin.ts) ──
+				if (crossOrigin && (customRoute || url.pathname === '/health')) {
+					const requestedMethod = req.headers['access-control-request-method']
+					if (req.method === 'OPTIONS' && requestedMethod) {
+						const requestedHeaders = req.headers['access-control-request-headers']
+						res.writeHead(
+							204,
+							corsPreflightHeaders(
+								crossOrigin,
+								Array.isArray(requestedHeaders) ? requestedHeaders.join(',') : requestedHeaders,
+							),
+						)
+						res.end()
+						return
+					}
+					for (const [name, value] of Object.entries(corsResponseHeaders(crossOrigin))) {
+						res.setHeader(name, value)
+					}
+				}
 
 				// ── Health check ──────────────────────────────────────────────
 				if (url.pathname === '/health') {
@@ -1139,9 +1174,6 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				}
 
 				// ── Custom HTTP routes (auth, webhooks, app APIs) ─────────────
-				const customRoute = config.httpRoutes?.find((route) =>
-					matchesRoutePrefix(url.pathname, route.path),
-				)
 				if (customRoute) {
 					const parsed = await readJsonBody(req)
 					if (parsed.tooLarge) {
