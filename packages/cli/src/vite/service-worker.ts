@@ -26,7 +26,9 @@ export {
  * - It injects a registration script into `index.html` with a "new version available"
  *   flow: the new worker waits, the page shows a reload prompt (or dispatches
  *   `kora:update-available` for the app to show its own), and only an accepted update
- *   activates it and reloads, so old and new assets never mix in one page. On a first
+ *   activates it and reloads, so old and new assets never mix in one page. An accepted update
+ *   waits until the app has no write still committing (`__KORA_WRITES__`, published by korajs),
+ *   dispatching `kora:update-waiting` meanwhile, so a reload never loses a write on screen. On a first
  *   visit it registers the worker only after the app's first data, and the install reuses
  *   the HTTP cache, so the precache never competes with the app or downloads it twice
  *   (first-visit parity, docs/design/first-visit-parity.md section 5.8).
@@ -842,9 +844,20 @@ if ('serviceWorker' in navigator && window.isSecureContext && /^https?:$/.test(l
 		if (registration.installing || registration.waiting) return publishShell('installing', null, [])
 		publishShell('not-installed', null, [])
 	}
+	// A reload while a write is still committing can lose what the user just saw saved (a sale
+	// on screen whose transaction had not finished). The app publishes its unsettled writes on
+	// __KORA_WRITES__ (korajs writes-signal); the reload waits until there are none.
+	const writesSettled = async () => {
+		const writes = globalThis.__KORA_WRITES__
+		if (!writes || writes.v !== 1 || typeof writes.pending !== 'function') return
+		while (writes.pending() > 0) {
+			window.dispatchEvent(new CustomEvent('kora:update-waiting', { detail: { pendingWrites: writes.pending() } }))
+			await writes.settled()
+		}
+	}
 	navigator.serviceWorker.addEventListener('controllerchange', () => {
 		// Reload only for an update the user accepted, never for the first install's claim.
-		if (accepted) location.reload()
+		if (accepted) void writesSettled().then(() => location.reload())
 		else checkShell()
 	})
 	const offer = (worker) => {
@@ -852,7 +865,9 @@ if ('serviceWorker' in navigator && window.isSecureContext && /^https?:$/.test(l
 		if (!navigator.serviceWorker.controller) return
 		const update = () => {
 			accepted = true
-			worker.postMessage({ type: 'KORA_SW_SKIP_WAITING' })
+			// The new version activates only once no write is committing, so the page never runs
+			// on a mix of old and new files while it waits.
+			void writesSettled().then(() => worker.postMessage({ type: 'KORA_SW_SKIP_WAITING' }))
 		}
 		const event = new CustomEvent('kora:update-available', { detail: { update }, cancelable: true })
 		const handled = !window.dispatchEvent(event)

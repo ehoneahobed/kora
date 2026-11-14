@@ -266,27 +266,19 @@ opens, so show a skeleton until `useQueryState(...).ready` is true (or pass `wai
 
 ### Show Sync Status, Not Connection Status
 
-Users care about whether their data is saved, not whether a WebSocket is connected. Frame sync indicators in terms of data state:
+Users care about whether their data is saved, not whether a WebSocket is connected. `useSyncSummary()` frames the status that way, with the wording rules Kora's own apps use: offline is calm (`working` tone, "Everything is saved on this device"), nothing is called synced before the server confirms it, and the `attention` tone is kept for states someone must act on:
 
 ```tsx
+import { useSyncSummary } from '@korajs/react'
+
 function StatusBar() {
-  const status = useSyncStatus()
-
-  if (status.status === 'synced') {
-    return <span>All changes saved</span>
-  }
-
-  if (status.pendingOperations > 0) {
-    return <span>Saving {status.pendingOperations} changes...</span>
-  }
-
-  if (status.status === 'offline') {
-    return <span>Working offline: changes will sync when connected</span>
-  }
-
-  return null
+  const sync = useSyncSummary()
+  // sync.tone: 'ok' | 'working' | 'attention'; sync.state: 'synced', 'offline', 'downloading', ...
+  return <span className={`status ${sync.tone}`} title={sync.detail}>{sync.title}</span>
 }
 ```
+
+`sync.downloading` is true until the first download from the server has finished: show "Downloading…" then, never an empty state or a first-run setup, or a new device could create data that already exists. Outside React, `summarizeSyncStatus(app.sync.status)` from `korajs` returns the same summary.
 
 ### Let Users Keep Working
 

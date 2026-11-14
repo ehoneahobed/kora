@@ -1,6 +1,6 @@
 ---
 title: React API
-description: "@korajs/react API reference: KoraProvider, useQuery, useQueryState, useMutation, useSyncStatus, createKoraHooks, useRichText, usePresence, and useCollaborators."
+description: "@korajs/react API reference: KoraProvider, useQuery, useQueryState, useMutation, useSyncStatus, useSyncSummary, createKoraHooks, useRichText, usePresence, and useCollaborators."
 ---
 
 # React API Reference
@@ -35,6 +35,7 @@ import {
   useQueryState,
   useRichText,
   useSyncStatus,
+  useSyncSummary,
 } from '@korajs/react'
 const schema = defineSchema({
   version: 1,
@@ -505,6 +506,35 @@ function SyncIndicator() {
 ```
 
 ---
+
+## useSyncSummary()
+
+The sync status summarized for an indicator, with the wording rules Kora's apps share. It re-renders when the status changes, like `useSyncStatus()`.
+
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
+```typescript
+function useSyncSummary(): SyncSummary
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `state` | `'local-only' \| 'downloading' \| 'synced' \| 'saving' \| 'offline' \| 'reconnecting' \| 'sign-in-required' \| 'locked' \| 'clock-error' \| 'update-required' \| 'storage-at-risk' \| 'blocked' \| 'error'` | What to render |
+| `tone` | `'ok' \| 'working' \| 'attention'` | `working` covers offline and saving (data safe on the device); `attention` only when someone must act |
+| `title` | `string` | One or two words: "Synced", "Offline" |
+| `detail` | `string` | One line about the data; never claims the server has what it has not confirmed |
+| `pending` | `number` | Writes saved on the device, not yet confirmed |
+| `lastSyncedAt` | `number \| null` | When the server last confirmed everything |
+| `downloading` | `boolean` | The first download has not finished: show "Downloading…", not an empty state or a first-run setup |
+| `progress` | `number \| null` | First-download progress (0 to 1) when known |
+
+```tsx
+function SyncChip() {
+  const sync = useSyncSummary()
+  return <span className={`chip ${sync.tone}`} title={sync.detail}>{sync.title}</span>
+}
+```
+
+Outside React, `summarizeSyncStatus(status, { syncConfigured })` from `korajs` (or `@korajs/sync`) returns the same summary.
 
 ## createKoraHooks()
 

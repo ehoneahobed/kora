@@ -366,6 +366,10 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 			controlled?: boolean
 			/** The browser has requestIdleCallback (Chromium); absent: Safari. */
 			idleCallbacks?: boolean
+			/** A new version is installed and waiting (an update to offer). */
+			waiting?: { postMessage(message: { type: string }): void }
+			/** `globalThis.__KORA_WRITES__` when the script runs. */
+			writes?: { v: 1; pending(): number; settled(): Promise<void> }
 		} = {},
 	) {
 		const win = Object.assign(new EventTarget(), { isSecureContext: options.secure ?? true })
@@ -399,7 +403,7 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 			active:
 				options.registration === 'active' || options.registration === undefined ? active : null,
 			installing: options.registration === 'installing' ? new EventTarget() : null,
-			waiting: null,
+			waiting: options.waiting ?? null,
 			update: async () => undefined,
 		})
 		const registered = options.registration !== 'none' && options.registration !== 'rejects'
@@ -418,9 +422,11 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 		const g: {
 			__KORA_SHELL__?: ShellValue
 			__KORA_FIRST_DATA__?: { v: number; state: string }
+			__KORA_WRITES__?: { v: 1; pending(): number; settled(): Promise<void> }
 			requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number
 		} = {}
 		if (options.firstData) g.__KORA_FIRST_DATA__ = { v: 1, state: options.firstData }
+		if (options.writes) g.__KORA_WRITES__ = options.writes
 		if (options.idleCallbacks === true) {
 			g.requestIdleCallback = (callback, idleOptions) => {
 				idleCallbacks.push({ callback, timeout: idleOptions?.timeout })
@@ -610,6 +616,59 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 		await vi.waitFor(() => expect(s.sent).toHaveLength(2))
 		await Promise.resolve()
 		expect(s.events).toHaveLength(count)
+	})
+
+	test('an accepted update activates only once no write is committing', async () => {
+		let pendingWrites = 1
+		let finishWrite: () => void = () => undefined
+		const settledPromise = new Promise<void>((resolve) => {
+			finishWrite = () => {
+				pendingWrites = 0
+				resolve()
+			}
+		})
+		const toWaiting: Array<{ type: string }> = []
+		const s = setup({
+			controlled: true,
+			waiting: { postMessage: (message) => toWaiting.push(message) },
+			writes: { v: 1, pending: () => pendingWrites, settled: () => settledPromise },
+		})
+		const offers: Array<{ update(): void }> = []
+		const waits: number[] = []
+		s.win.addEventListener('kora:update-available', (event) => {
+			event.preventDefault()
+			offers.push((event as CustomEvent<{ update(): void }>).detail)
+		})
+		s.win.addEventListener('kora:update-waiting', (event) => {
+			waits.push((event as CustomEvent<{ pendingWrites: number }>).detail.pendingWrites)
+		})
+		s.load()
+		await vi.waitFor(() => expect(offers).toHaveLength(1))
+		offers[0]?.update()
+		await Promise.resolve()
+		await Promise.resolve()
+		// A sale is still being written: the new version must not take over yet.
+		expect(toWaiting).toEqual([])
+		expect(waits).toEqual([1])
+		finishWrite()
+		await vi.waitFor(() => expect(toWaiting).toEqual([{ type: 'KORA_SW_SKIP_WAITING' }]))
+	})
+
+	test('with no writes signal (no Kora app on the page) an accepted update activates at once', async () => {
+		const toWaiting: Array<{ type: string }> = []
+		const s = setup({
+			controlled: true,
+			waiting: { postMessage: (message) => toWaiting.push(message) },
+		})
+		const offers: Array<{ update(): void }> = []
+		s.win.addEventListener('kora:update-available', (event) => {
+			event.preventDefault()
+			offers.push((event as CustomEvent<{ update(): void }>).detail)
+		})
+		s.load()
+		await vi.waitFor(() => expect(offers).toHaveLength(1))
+		offers[0]?.update()
+		await vi.waitFor(() => expect(toWaiting).toEqual([{ type: 'KORA_SW_SKIP_WAITING' }]))
 	})
 
 	/** Microtasks only: lets promise chains of the script run, no timers. */

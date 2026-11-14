@@ -39,6 +39,15 @@ export {
 	SYNC_STATUSES,
 } from './types'
 
+// === Status summary (indicator copy shared by Kora apps) ===
+export { summarizeSyncStatus } from './status/summarize'
+export type {
+	SummarizeSyncOptions,
+	SyncSummary,
+	SyncSummaryState,
+	SyncTone,
+} from './status/summarize'
+
 // === Scope Filtering ===
 export { filterOperationsByScope, operationMatchesScope } from './scopes/scope-filter'
 export type { ScopeSnapshotOptions } from './scopes/scope-snapshot'
