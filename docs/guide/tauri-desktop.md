@@ -258,20 +258,22 @@ export const authClient = createKoraAuth({
 })
 ```
 
-For production apps, pass a secure desktop credential store:
+Keep sessions in the operating system's credential store (Keychain on macOS, Credential Manager on Windows, the Secret Service on Linux) rather than WebView storage. `@korajs/tauri` provides one, through the same `kora-sqlite` plugin and its default permission; the template uses it:
 
-<!-- docs-check: continue -->
 ```typescript
-import type { AuthKeyValueStorage } from '@korajs/auth'
-
-// An adapter over a Tauri secure-storage plugin (getItem, setItem, removeItem; sync or async)
-declare const tauriSecureStore: AuthKeyValueStorage
+import { createAuthTokenStorage, createKoraAuth } from '@korajs/auth'
+import { createTauriCredentialStore } from '@korajs/tauri'
 
 export const secureAuthClient = createKoraAuth({
   serverUrl: 'https://acme-corp.example.com',
-  credentialStore: tauriSecureStore,
+  storage: createAuthTokenStorage({ store: createTauriCredentialStore(), durability: 'durable' }),
 })
 ```
+
+- Entries are kept under the app's bundle identifier, and keychain calls run off the UI thread.
+- A session an earlier version of the app saved in WebView storage moves to the keychain on first read, so upgrading signs nobody out.
+- Where there is no credential store (mobile builds today, a browser build of the app, a Linux desktop without a Secret Service), the store falls back to WebView storage and warns once. `store.location` reports `keychain` or `fallback`.
+- It needs Rust 1.88 or newer.
 
 Bind it to sync when creating the Kora app:
 

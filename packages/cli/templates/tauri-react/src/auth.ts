@@ -1,4 +1,10 @@
-import { type AuthClient, createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import {
+	type AuthClient,
+	createAuthTokenStorage,
+	createKoraAuth,
+	createKoraAuthSync,
+} from '@korajs/auth'
+import { createTauriCredentialStore } from '@korajs/tauri'
 import schema from './schema'
 
 // This module is loaded after the first paint (see AppShell.tsx and AuthBridge.tsx): the task
@@ -7,6 +13,9 @@ import schema from './schema'
 export function createDesktopAuthClient(syncUrl: string | null): AuthClient {
 	return createKoraAuth({
 		serverUrl: getAuthServerUrl(syncUrl),
+		// Sessions live in the operating system's credential store (Keychain, Credential Manager,
+		// Secret Service), not in WebView storage.
+		storage: createAuthTokenStorage({ store: createTauriCredentialStore(), durability: 'durable' }),
 	})
 }
 

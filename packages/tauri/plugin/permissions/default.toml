@@ -1,11 +1,14 @@
 "$schema" = "schemas/schema.json"
 
 [default]
-description = "Default permissions for the Kora SQLite storage plugin. Grants access to all database operations."
+description = "Default permissions for the Kora SQLite storage plugin: all database operations, and the app's own sign-in credentials in the operating system's credential store."
 permissions = [
     "allow-open",
     "allow-close",
     "allow-execute",
     "allow-query",
     "allow-migrate",
+    "allow-credential-get",
+    "allow-credential-set",
+    "allow-credential-delete",
 ]
