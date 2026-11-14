@@ -120,7 +120,12 @@ describe('validateRecord', () => {
 		test('treats null on an optional field as no value', () => {
 			const items = simpleTodosCollection()
 			if (!items) return
-			const result = validateRecord('items', items, { name: 'a', count: 1, category: null, notes: null }, 'insert')
+			const result = validateRecord(
+				'items',
+				items,
+				{ name: 'a', count: 1, category: null, notes: null },
+				'insert',
+			)
 			expect('category' in result).toBe(false)
 			expect('notes' in result).toBe(false)
 		})
@@ -128,7 +133,12 @@ describe('validateRecord', () => {
 		test('applies the default when a field with a default is null', () => {
 			const items = simpleTodosCollection()
 			if (!items) return
-			const result = validateRecord('items', items, { name: 'a', count: 1, active: null, tags: null }, 'insert')
+			const result = validateRecord(
+				'items',
+				items,
+				{ name: 'a', count: 1, active: null, tags: null },
+				'insert',
+			)
 			expect(result.active).toBe(true)
 			expect(result.tags).toEqual([])
 		})
