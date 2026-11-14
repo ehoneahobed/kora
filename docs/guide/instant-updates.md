@@ -37,25 +37,12 @@ The write itself is not changed: same operation, same id, same order, stored the
 
 Two consequences matter to your UI.
 
-**A shown row is not saved.** Only the write's promise resolving means the write is committed. Until then, closing the tab, a crash or a worker restart loses it, exactly as it would have before the row was visible. If your app shows save state, drive it from the promise, not from the presence of the row. Keep a count of writes whose promise has not resolved and warn on unload while it is above zero:
+**A shown row is not saved.** Only the write's promise resolving means the write is committed. Until then, closing the tab, a crash or a worker restart loses it, exactly as it would have before the row was visible. If your app shows save state, drive it from the promise, not from the presence of the row. The store counts writes that have not settled (`app.getStore().pendingWriteCount()`, and `whenWritesSettled()` to wait for them), and the offline shell's update reload already waits for zero. To warn on unload, check the same count:
 
 ```typescript
-let unsaved = 0
-
-async function save(write: Promise<unknown>): Promise<void> {
-  unsaved++
-  try {
-    await write
-  } finally {
-    unsaved--
-  }
-}
-
 addEventListener('beforeunload', (event) => {
-  if (unsaved > 0) event.preventDefault()
+  if ((app.getStore()?.pendingWriteCount() ?? 0) > 0) event.preventDefault()
 })
-
-void save(app.todos.update(todoId, { completed: true }))
 ```
 
 **A row can disappear.** If the transaction fails (a restrict constraint, a record deleted remotely, a quota error), the prediction is removed and the row leaves the query results. The write's promise rejects with the error, so handle it:

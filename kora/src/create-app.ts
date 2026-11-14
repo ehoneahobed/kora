@@ -31,6 +31,7 @@ import type {
 	TypedKoraConfig,
 } from './types'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
+import { publishWritesSignal } from './writes-signal'
 
 /**
  * Creates a new Kora application instance.
@@ -795,6 +796,8 @@ export function createApp<const S extends SchemaInput>(
 	// download never competes with the WASM and the first sync batch.
 	let stopFirstData: () => void = () => {}
 	if (!inert && typeof window !== 'undefined') {
+		// How many writes are still committing, for the shell's update reload (writes-signal.ts).
+		publishWritesSignal(getStore)
 		// `pending` is published now, before anything else can look: the shell's registration
 		// script waits on it. The rest of the signal (judging the sync status) loads later.
 		const page = globalThis as { __KORA_FIRST_DATA__?: unknown }

@@ -236,7 +236,12 @@ export type { BlobRef, BlobRefMetadata } from '@korajs/core'
 export { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 
 // === @korajs/sync re-exports ===
-export { EncryptionKeyError, SyncEngine, WebSocketTransport } from '@korajs/sync'
+export {
+	EncryptionKeyError,
+	SyncEngine,
+	WebSocketTransport,
+	summarizeSyncStatus,
+} from '@korajs/sync'
 export type {
 	EncryptionLockState,
 	EncryptionStatus,
@@ -248,6 +253,9 @@ export type {
 	SyncStatus,
 	SyncStatusInfo,
 	SyncStore,
+	SyncSummary,
+	SyncSummaryState,
+	SyncTone,
 } from '@korajs/sync'
 
 // In development the access compiler loads with this entry, so a schema defined with

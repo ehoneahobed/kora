@@ -5242,6 +5242,20 @@ export class Store implements OperationLog {
 		return this.writeGate.run(scope, fn)
 	}
 
+	/**
+	 * Writes this store admitted that have not settled yet: local writes, transactions and
+	 * applied sync batches. A reload while this is above zero can lose a write the user
+	 * already saw (instant updates), so updates and unload guards wait for zero.
+	 */
+	pendingWriteCount(): number {
+		return this.writeGate.pendingCount()
+	}
+
+	/** Resolves once every write admitted so far, and any admitted meanwhile, has settled. Never rejects. */
+	whenWritesSettled(): Promise<void> {
+		return this.writeGate.drain()
+	}
+
 	/** Whether this store refuses writes because a newer build superseded its tab. */
 	isWriteRefused(): boolean {
 		return this.writeGate.isClosed()
