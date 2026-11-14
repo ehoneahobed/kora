@@ -168,6 +168,12 @@ export interface SyncStatusInfo {
 		receivedBatches: number
 		totalBatches: number | null
 		progress: number | null
+		/**
+		 * This session's catch-up started with nothing from the server (delivery watermark 0): the
+		 * device's first download. False for the catch-up after a reconnect or restart, when the
+		 * device already holds its data.
+		 */
+		first?: boolean
 	}
 	deliveryWatermark?: number
 	serverFrontier?: number | null

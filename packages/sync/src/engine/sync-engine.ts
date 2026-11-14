@@ -728,6 +728,8 @@ export class SyncEngine {
 	/** Resume cursor for paginated initial sync (persisted across reconnects) */
 	private resumeDeltaCursor: DeltaCursor | null = null
 	private initialSyncTotalBatches = 0
+	/** Delivery watermark when this session's catch-up began: 0 means the device's first download. */
+	private sessionStartWatermark: number | null = null
 
 	/**
 	 * First-visit parity S3: the scratch replica a large initial stream is applied into
@@ -1496,6 +1498,7 @@ export class SyncEngine {
 					this.initialSyncTotalBatches > 0
 						? Math.min(1, this.deltaBatchesReceived / this.initialSyncTotalBatches)
 						: null,
+				first: (this.sessionStartWatermark ?? this.position.watermark) === 0,
 			},
 			deliveryWatermark: this.position.watermark,
 			serverFrontier: this.serverFrontier,
@@ -2884,6 +2887,7 @@ export class SyncEngine {
 		this.deltaSendComplete = false
 		this.pendingDeltaBatchAcks.clear()
 		this.initialSyncTotalBatches = 0
+		this.sessionStartWatermark = this.position.watermark
 
 		// Rebase must finish BEFORE the delta exchange starts so only the
 		// re-stamped operation ids ever reach the wire.

@@ -37,8 +37,9 @@ export interface SyncSummary {
 	/** When the server last confirmed everything (null: never). */
 	lastSyncedAt: number | null
 	/**
-	 * The first download from the server has not finished: an empty list may only mean "not
-	 * here yet". Show "Downloading…" rather than an empty state or a first-run setup.
+	 * The device's first download from the server has not finished: an empty list may only mean
+	 * "not here yet". Show "Downloading…" rather than an empty state or a first-run setup. False
+	 * for the catch-up after a reconnect or restart (the device already holds its data).
 	 */
 	downloading: boolean
 	/** Progress of the first download, 0 to 1, when the server announced its size. */
@@ -100,7 +101,8 @@ export function summarizeSyncStatus(
 	}
 	const waiting = pending > 0 ? `${changes(pending)} saved on this device` : null
 	const initial = info.initialSync
-	const downloading = initial !== undefined && !initial.complete
+	// Only the first download: a reconnect's catch-up is ordinary syncing, the data is already here.
+	const downloading = initial !== undefined && !initial.complete && initial.first === true
 	switch (info.status) {
 		case 'connected':
 		case 'syncing':
