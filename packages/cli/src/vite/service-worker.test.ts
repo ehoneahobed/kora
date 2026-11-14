@@ -67,6 +67,26 @@ describe('collectPrecache', () => {
 		])
 	})
 
+	test('lazy files are left out of the precache but still change the version', () => {
+		const files = {
+			'index.html': '<html></html>',
+			'guide/index.html': '<html>guide</html>',
+			'guide/img/a.jpg': 'a1',
+		}
+		const before = collectPrecache(buildDir(files), '/', 'sw.js', ['/guide/img'])
+		expect(before.urls).toEqual(['/guide/index.html', '/index.html'])
+		expect(before.digests['/guide/img/a.jpg']).toBeUndefined()
+		const after = collectPrecache(buildDir({ ...files, 'guide/img/a.jpg': 'a2' }), '/', 'sw.js', [
+			'/guide/img',
+		])
+		expect(after.version).not.toBe(before.version)
+		// The prefix is a path segment: /guide/imgs is not under /guide/img.
+		expect(
+			collectPrecache(buildDir({ ...files, 'guide/imgs/b.jpg': 'b' }), '/', 'sw.js', ['/guide/img'])
+				.urls,
+		).toContain('/guide/imgs/b.jpg')
+	})
+
 	test('byte-identical files are all precached, the shortest URL fetched for the others', () => {
 		// The templates copy the hashed WASM to sqlite3.wasm, the name the SQLite runtime
 		// fetches; Vite's hash may contain '-' (sqlite3-1f8bVu-G.wasm), which isHashedName does
@@ -247,7 +267,11 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 	const page = (build: string, name = 'index') =>
 		`<html><head><meta name="kora-shell" content="1"></head>${name} ${build}</html>`
 
-	function worker(precached: Record<string, string>, network: Record<string, string> | null) {
+	function worker(
+		precached: Record<string, string>,
+		network: Record<string, string> | null,
+		lazy: string[] = [],
+	) {
 		type Handler = (event: unknown) => void
 		const handlers = new Map<string, Handler>()
 		const cache = new Map<string, string>()
@@ -270,6 +294,7 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 			precache: Object.keys(precached),
 			shellUrl: '/index.html',
 			bypass: [...DEFAULT_SW_BYPASS],
+			lazy,
 			navigationTimeoutMs: 4000,
 		})
 		const fetchFn = async (req: { url: string }) => {
@@ -300,6 +325,10 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 			{ error: () => respond('', 'error') },
 		)
 		return {
+			/** What the server serves from now on (null: offline). */
+			setNetwork(next: Record<string, string> | null): void {
+				network = next
+			},
 			async install(): Promise<void> {
 				let done: unknown = undefined
 				installing = true
@@ -366,6 +395,16 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 		expect(await sw.get('/report', 'navigate')).toBe('<html>server-rendered report</html>')
 		expect(await sw.get('/export.csv', 'navigate')).toBe('a,b')
 		expect(await sw.get('/api/items')).toBe('[]')
+	})
+
+	test('a lazy file is cached the first time it is fetched, then served offline', async () => {
+		const sw = worker(v1Files, { '/guide/img/till.jpg': 'picture v1' }, ['/guide/img'])
+		await sw.install()
+		expect(await sw.get('/guide/img/till.jpg')).toBe('picture v1')
+		sw.setNetwork(null)
+		expect(await sw.get('/guide/img/till.jpg')).toBe('picture v1')
+		// Never fetched before: not there offline (it was never downloaded).
+		await expect(sw.get('/guide/img/other.jpg')).rejects.toThrow('Failed to fetch')
 	})
 
 	test("offline, a folder path opens the folder's precached index.html, not the app", async () => {
