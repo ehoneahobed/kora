@@ -16,6 +16,12 @@ import {
 export interface AuthSyncClient {
 	getAccessToken(): Promise<string | null>
 	/**
+	 * Loads the stored session. Sync waits while the client is `loading`, so the binding calls
+	 * this itself (it is idempotent): an app that never initializes its client still restores a
+	 * signed-in device after a restart.
+	 */
+	initialize?(): Promise<void>
+	/**
 	 * Force a refresh even if the cached token looks valid locally. Called after
 	 * the sync server ends a session with `AUTH_EXPIRED` / `AUTH_REVOKED`.
 	 */
@@ -199,7 +205,14 @@ export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSync
 	}
 
 	binding.resolveSyncState = async (): Promise<AuthSyncState> => {
-		if (authClient.state === 'loading') return { state: 'loading' }
+		if (authClient.state === 'loading') {
+			// Nothing else may load the stored session (an app without the auth provider), and
+			// sync would wait for it forever. The client notifies onAuthChange when it is done.
+			authClient.initialize?.().catch(() => {
+				// The client reports its own failure through its state.
+			})
+			return { state: 'loading' }
+		}
 		const { claims, token } = await resolveClaims()
 		const userId = readString(claims, 'sub')
 		if (!userId) {
