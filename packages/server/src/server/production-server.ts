@@ -17,6 +17,7 @@ import type { StoreInsights } from '../store/store-insights'
 import type { WsWebSocket } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
 import { corsPreflightHeaders, corsResponseHeaders, createOriginPolicy } from './cross-origin'
+import { withHostSettings } from './host-settings'
 import {
 	DEFAULT_MAX_MESSAGE_BYTES,
 	KoraSyncServer,
@@ -94,7 +95,8 @@ export interface ProductionServerConfig {
 	 * Reverse proxies trusted to report the client address in `X-Forwarded-For`,
 	 * which becomes `request.ip` (the key `@korajs/auth` rate-limits sign-in by).
 	 * A hop count (`1` for a single load balancer in front) or a list of trusted
-	 * proxy IPs / CIDR ranges. When unset, the header is ignored and `request.ip`
+	 * proxy IPs / CIDR ranges. Defaults to `KORA_TRUST_PROXY` (the same, comma-separated).
+	 * When neither is set, the header is ignored and `request.ip`
 	 * is the socket address, so a client cannot pick its own rate-limit bucket.
 	 */
 	trustProxy?: TrustProxySetting
@@ -162,11 +164,11 @@ export const DEFAULT_MAX_BACKUP_BYTES = 256 * 1024 * 1024
 const INSIGHTS_CACHE_MS = 30_000
 
 export interface ProductionOperationalAuth {
-	/** Protects /__kora, /__kora/status, and /__kora/events. */
+	/** Protects /__kora, /__kora/status, and /__kora/events. Defaults to `KORA_ADMIN_TOKEN`. */
 	adminToken?: string
-	/** Protects /__kora/metrics. Falls back to adminToken when omitted. */
+	/** Protects /__kora/metrics. Defaults to `KORA_METRICS_TOKEN`, then adminToken. */
 	metricsToken?: string
-	/** Protects /__kora/backup/*. Falls back to adminToken when omitted. */
+	/** Protects /__kora/backup/*. Defaults to `KORA_BACKUP_TOKEN`, then adminToken. */
 	backupToken?: string
 	/**
 	 * Lets a hosting platform read `/__kora/insights` and nothing else. Defaults to the
@@ -335,7 +337,9 @@ export interface ProductionServer {
  * const url = await server.start()
  * ```
  */
-export function createProductionServer(config: ProductionServerConfig): ProductionServer {
+export function createProductionServer(appConfig: ProductionServerConfig): ProductionServer {
+	// KORA_TRUST_PROXY and the operational tokens the host sets fill what the app left out.
+	const config = withHostSettings(appConfig)
 	const port = config.port ?? (Number(process.env.PORT) || 3001)
 	const staticDir = config.staticDir ?? './dist'
 	const syncPath = config.syncPath ?? '/kora-sync'
