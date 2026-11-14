@@ -114,6 +114,45 @@ describe('validateRecord', () => {
 				),
 			).toThrow(SchemaValidationError)
 		})
+
+		// A form's "None" choice sends null. An update already treats null as clearing the field;
+		// an insert treats it as no value, the same as leaving the field out.
+		test('treats null on an optional field as no value', () => {
+			const items = simpleTodosCollection()
+			if (!items) return
+			const result = validateRecord(
+				'items',
+				items,
+				{ name: 'a', count: 1, category: null, notes: null },
+				'insert',
+			)
+			expect('category' in result).toBe(false)
+			expect('notes' in result).toBe(false)
+		})
+
+		test('refuses null for a field with a default (RT-101), saying how to get the default', () => {
+			const items = simpleTodosCollection()
+			if (!items) return
+			expect(() =>
+				validateRecord('items', items, { name: 'a', count: 1, active: null }, 'insert'),
+			).toThrow(/Field "active" in collection "items" cannot be null: it has a default/)
+		})
+
+		test('refuses null for a required field, saying so', () => {
+			const items = simpleTodosCollection()
+			if (!items) return
+			expect(() => validateRecord('items', items, { name: null, count: 1 }, 'insert')).toThrow(
+				/Required field "name" in collection "items" cannot be null/,
+			)
+		})
+
+		test('names the received type in errors (null and arrays are not "object")', () => {
+			const items = simpleTodosCollection()
+			if (!items) return
+			expect(() => validateRecord('items', items, { name: ['x'], count: 1 }, 'insert')).toThrow(
+				/must be a string, got array/,
+			)
+		})
 	})
 
 	describe('update operations', () => {

@@ -80,6 +80,21 @@ export function validateRecord(
 			continue
 		}
 
+		// An explicit null on an insert: an optional field with no default is left empty (a form's
+		// "None" choice), as null clears a field on an update. A required field, or one with a
+		// default, refuses it (RT-101): its value is never silently replaced or dropped.
+		if (value === null && hasValue) {
+			if (descriptor.required || descriptor.defaultValue !== undefined) {
+				throw new SchemaValidationError(
+					descriptor.required
+						? `Required field "${fieldName}" in collection "${collection}" cannot be null. Give it a value, or declare it .optional()`
+						: `Field "${fieldName}" in collection "${collection}" cannot be null: it has a default. Leave it out to get the default`,
+					{ collection, field: fieldName },
+				)
+			}
+			continue
+		}
+
 		if (!hasValue || value === undefined) {
 			if (descriptor.defaultValue !== undefined) {
 				// Deep-copy default arrays/objects to prevent shared mutations
@@ -151,7 +166,7 @@ function validateFieldValue(
 		case 'string': {
 			if (typeof value !== 'string') {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be a string, got ${typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" must be a string, got ${describeType(value)}`,
 					{ collection, field: fieldName, expectedType: 'string', receivedType: typeof value },
 				)
 			}
@@ -163,7 +178,7 @@ function validateFieldValue(
 			// and no store column holds it.
 			if (typeof value !== 'number' || !Number.isFinite(value)) {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be a finite number, got ${typeof value === 'number' ? String(value) : typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" must be a finite number, got ${typeof value === 'number' ? String(value) : describeType(value)}`,
 					{ collection, field: fieldName, expectedType: 'number', receivedType: typeof value },
 				)
 			}
@@ -173,7 +188,7 @@ function validateFieldValue(
 		case 'boolean': {
 			if (typeof value !== 'boolean') {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be a boolean, got ${typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" must be a boolean, got ${describeType(value)}`,
 					{ collection, field: fieldName, expectedType: 'boolean', receivedType: typeof value },
 				)
 			}
@@ -202,7 +217,7 @@ function validateFieldValue(
 		case 'enum': {
 			if (typeof value !== 'string') {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be a string (enum), got ${typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" must be a string (enum), got ${describeType(value)}`,
 					{ collection, field: fieldName, expectedType: 'enum', receivedType: typeof value },
 				)
 			}
@@ -223,7 +238,7 @@ function validateFieldValue(
 		case 'array': {
 			if (!Array.isArray(value)) {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be an array, got ${typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" must be an array, got ${describeType(value)}`,
 					{ collection, field: fieldName, expectedType: 'array', receivedType: typeof value },
 				)
 			}
@@ -245,7 +260,7 @@ function validateFieldValue(
 					}
 					if (!matchesJsType(item, expectedType)) {
 						throw new SchemaValidationError(
-							`Field "${fieldName}[${i}]" in collection "${collection}" must be a ${descriptor.itemKind}, got ${typeof item}`,
+							`Field "${fieldName}[${i}]" in collection "${collection}" must be a ${descriptor.itemKind}, got ${describeType(item)}`,
 							{
 								collection,
 								field: `${fieldName}[${i}]`,
@@ -270,7 +285,7 @@ function validateFieldValue(
 				typeof value !== 'string'
 			) {
 				throw new SchemaValidationError(
-					`Field "${fieldName}" in collection "${collection}" must be a Uint8Array, ArrayBuffer, or string for richtext, got ${typeof value}`,
+					`Field "${fieldName}" in collection "${collection}" must be a Uint8Array, ArrayBuffer, or string for richtext, got ${describeType(value)}`,
 					{
 						collection,
 						field: fieldName,
