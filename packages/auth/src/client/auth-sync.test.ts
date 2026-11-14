@@ -83,6 +83,23 @@ describe('createKoraAuthSync', () => {
 		expect(authClient.getAccessToken).not.toHaveBeenCalled()
 	})
 
+	test('loads the stored session of a client nobody initialized, so a restart stays signed in', async () => {
+		const authClient = {
+			state: 'loading' as 'loading' | 'authenticated',
+			initialize: vi.fn(async () => {
+				authClient.state = 'authenticated'
+			}),
+			getAccessToken: vi.fn().mockResolvedValue(makeToken({ sub: 'till-1', dev: 'device-1' })),
+		}
+		const binding = createKoraAuthSync({ authClient })
+		await expect(binding.resolveSyncState?.()).resolves.toEqual({ state: 'loading' })
+		expect(authClient.initialize).toHaveBeenCalledTimes(1)
+		await expect(binding.resolveSyncState?.()).resolves.toMatchObject({
+			state: 'authenticated',
+			userId: 'till-1',
+		})
+	})
+
 	test('resolveScopeMap builds map from JWT claims and schema', async () => {
 		const token = makeToken({
 			sub: 'user-abc',
