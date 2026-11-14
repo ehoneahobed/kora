@@ -1,5 +1,155 @@
 # @korajs/test
 
+## 1.0.0-beta.15
+
+### Minor Changes
+
+- 85954a4: New subpath `@korajs/test/playwright`: offline helpers for Playwright end-to-end tests, learned from koraforms. `goOffline`/`goOnline`, `firstVisitOffline`, `killTab` (CDP `Page.crash`, Chromium only), `openProfile`/`restartProfile` (relaunch the same persistent user data directory), `skewClock` (offsets `Date.now()`, `new Date()` and `Date()` only), `throttleNetwork` (CDP presets `slow-4g`, `fast-3g`, `slow-3g`, `2g`, `offline`, `none`), `blockServiceWorker`, `waitForOfflineStatus`/`readOfflineStatus`/`hasReason` (read `app.offline.status()` through a configurable accessor, default `app.offline`), and the offline-readiness contract as two helpers: `assertReadyMeansOffline` (when the status reads `ready`, reload offline and assert the shell, the data and a write that survives another reload) and `expectNeverReady` (records whether `ready` was ever observed while a negative scenario runs, in Node and in an in-page probe).
+
+  `playwright-core` is an optional peer dependency used for types only; nothing is imported from it at runtime, and the main `@korajs/test` entry does not load the new subpath.
+
+- ba4eaa7: Things apps had to work out for themselves now work out of the box, found by running Kora apps on Kora Cloud:
+
+  - **File storage without code.** `createProductionServer` keeps the bytes behind `t.blob()` fields where the host says (`KORA_BLOB_STORE_URL`, or `KORA_BLOB_DIR`), and sweeps unused bytes daily. Set `blobStore` to choose a store in code, or `false` to keep none. An app that wires blob callbacks itself is unchanged.
+  - **Unused-file sweeps never take a new upload.** `collectBlobGarbage` keeps unreferenced blobs written within the last day (`graceMs`), because a device uploads a blob before the record that points at it. This applies to stores that know write times: `FilesystemBlobStore` now does, and a re-upload refreshes it. `@korajs/store/blob-object` exports the server-side helpers (`toServerBlobCallbacks`, `collectBlobGarbage`).
+  - **Settings declared in `.env.example`.** Tags in comments mark what production needs (`[required]`), credentials (`[secret]`) and local-only settings (`[development]`). `parseEnvExample` and `missingRequiredEnv` in `@korajs/core` read them, `kora doctor` reports them (`--production` fails on a missing required one), and templates ship a tagged file with the file-store settings.
+  - **Testing access rules across users.** `new TestServer(schema, { auth: true })` and `new TestDevice({ user: 'alice', ... })` sign devices in, so access rules apply as in production, without assembling devices from internals.
+  - **Quieter logs.** The Postgres auth stores no longer print "already exists, skipping" notices on every start.
+  - **Generated `AGENTS.md`** covers file storage, settings, multi-user tests and deploying.
+
+- 941c67e: Offline readiness knows whether the signed-in session survives an offline reload (A3). `AuthSyncBinding` gains `resolveOfflineRestore()`, which `createKoraAuthSync` implements from the stored tokens: restorable only with both tokens stored, on storage that survives a reload, with a refresh token that has not expired and an offline grace (`maxOfflineGraceMs`, measured from the stored refresh token's issue time) that has not run out. A wall clock set back reports `clock-rollback`, and a 30 second watchdog re-checks while the session is restorable. `AuthTokenStorage` gains an optional `durability` (`durable`, `session`, `memory`): the default `localStorage` store is durable, `createMemoryAuthTokenStorage` and `sessionStorage` are not, and a custom store that does not say is `unknown`, so `app.offline` is never `ready` on an assumption. `createAuthTokenStorage({ store, durability })` declares it.
+
+  `createApp({ offline: { auth } })` declares restorability for apps with their own sign-in (a bare `sync.auth` token function cannot know). `app.offline.status().auth` is now `restorable`, `not-restorable`, `unknown`, `loading` or `n/a`, and `ready` flips off when the session's limit passes.
+
+- dabd17d: `TestServer` exposes `access` (`grant`, `revoke`, `transfer`) and takes `accessSweepIntervalMs`, so a test can add and remove collaborators and check what their devices receive. `TestDevice.sync()` now flushes writes made before the first sync, as it does on later syncs. After `kora deploy --platform kora-cloud`, the CLI lists settings production still needs (with what each is for, from `.env.example`) and any problems Kora Cloud found in the code, with where to fix them.
+
+### Patch Changes
+
+- 714ebd2: Blob pulls no longer hang on a lost message. A blob chunk request was sent only while the sync engine was `streaming`, so a pull started while the initial sync was still arriving (when its rows are already visible) was silently dropped; it then waited 30 s and failed with a plain `Error`, and neither a lost answer nor a reconnect led to a retry.
+
+  - Blob chunk messages go out as soon as the handshake is accepted (`syncing` or `streaming`); servers since 1.0.0-beta.13 already accept them then. `BlobChunkChannel.send` returns whether the message was sent, and `onReady(handler)` runs after each accepted handshake.
+  - `createRemoteChunkProvider` re-sends an unanswered request under the same request id after 5 s, then a wait doubling to 30 s (20% jitter), re-sends every pending request when the connection is ready again, and fails only after 2 minutes without any answer (`deadlineMs`; `timeoutMs` is a deprecated alias). Failures reject with `BlobTransferError` (a `KoraError`: `BLOB_CHUNK_TIMEOUT`, `BLOB_CHUNK_UNAVAILABLE`, `BLOB_CHUNK_CANCELLED`, with `hash`, `attempts` (requests actually sent: tries made offline are not counted), `lastReason`); `receiveBlob` and `fetchBlobManifest` report a chunk nobody holds as `BLOB_CHUNK_UNAVAILABLE`. The provider takes an injectable `clock` and `random`, and `close()` cancels pending requests and clears their timers (called on `app.close()`).
+  - New events `blob:request-retried`, `blob:request-failed` and `blob:handler-error`, recorded by DevTools. A blob channel handler that throws no longer stops the other handlers (or the message from reaching the chunk provider); its error is emitted as `blob:handler-error`, or logged when the engine has no emitter.
+  - The sync server's blob relay always answers a connected requester: "not held" once every peer it asked said not held or left, and when a request expires (counted from its first arrival, so client re-sends do not extend it, on a timer rather than when the next request arrives); `throttled` (with `retryAfterMs`) over the per-session pending cap, when bytes are ready but the session may not receive them, and for a request id pending for another session. Counters are kept per answer kind (`BlobChunkRelay.getStats()`: each delivered answer once under its kind, a request whose requester left once under `requesterGone`), and the pending-cap and duplicate-id cases are logged.
+
+  No wire or protocol change: every answer is a `blob-chunk-response` of a shape servers already send (`throttled` since 1.0.0-beta.13, whose clients retry on it). An older client against a new server gets an answer instead of silence (a beta.12 client reads `throttled` as "not held", as it already does for the request budget); a new client against an older server recovers through its retries.
+
+- d2fbd96: The parity contract gets a throttled-CPU (4x) ratchet: P8 (+450 ms cold, +100 ms warm), P2 and P3 (+50 ms) and K2 (150 ms) are measured-level allowances that only go down; every 1x limit is unchanged.
+- d35eebf: The 4x CPU allowance for warm P8 (total blocking time) is +200 ms instead of +100 ms: a slower nightly host measured the warm cells 12 to 41 ms over.
+- d2650f3: Remove the beta.12 pairwise merge pipeline. `experimental.legacyMerge` and `ExperimentalOptions` are gone, a database that ran with the option re-materializes with the fold on its next open, and `MergeAwareSyncStore` no longer takes a merge engine.
+
+  `@korajs/merge` no longer exports `MergeEngine`, `mergeField`, `lastWriteWins`, `addWinsSet`, `mergeObject`, `mergeAtomicOps`, the `.merge()` strategy functions, or the `MergeInput`, `MergeResult` and `FieldMergeResult` types, and `korajs` no longer re-exports `MergeEngine`. The cross-record constraint checks, referential integrity and rich-text helpers stay.
+
+- c5de1d2: `createTestNetwork` and `createMixedTestNetwork` no longer leave their `kora-test-*` temporary directory behind. A network whose creation fails (a device that refuses to open, for example) now closes what it started and removes its directory before the error propagates; `close()` removes the directory even when closing a device or the server throws (that error is still raised, and a failure to remove the directory is reported instead of ignored); and a network that is never closed is closed (its devices and server) and then has its directory removed when the process is about to exit (`beforeExit`), so a platform that cannot remove a directory whose database files are open (Windows) can remove it. A removal that fails is retried once after closing, and a directory that still cannot be removed is kept for a last attempt at `exit` rather than forgotten.
+- e608042: Warm P4 and P5 get a +25 ms allowance at every CPU rate: on a warm 4g visit the first navigation overlaps the runtime booting (3 to 4 ms over the old limit, every night). A ratchet that only goes down.
+- Updated dependencies [191930a]
+- Updated dependencies [0c1f8f3]
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [4ddcff5]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [5a2e9df]
+- Updated dependencies [962db5d]
+- Updated dependencies [003d7bf]
+- Updated dependencies [2a267d4]
+- Updated dependencies [0b461fa]
+- Updated dependencies [047b788]
+- Updated dependencies [8411be3]
+- Updated dependencies [34b477d]
+- Updated dependencies [eb2b41c]
+- Updated dependencies [a5c61ff]
+- Updated dependencies [28ec1ef]
+- Updated dependencies [714ebd2]
+- Updated dependencies [70e0611]
+- Updated dependencies [4237195]
+- Updated dependencies [d988dda]
+- Updated dependencies [b91b0ee]
+- Updated dependencies [12ad88c]
+- Updated dependencies [19cd5d9]
+- Updated dependencies [eeeb0ee]
+- Updated dependencies [d6ec116]
+- Updated dependencies [0c98891]
+- Updated dependencies [5a17942]
+- Updated dependencies [1b3be4a]
+- Updated dependencies [ba4eaa7]
+- Updated dependencies [180923d]
+- Updated dependencies [fa1a971]
+- Updated dependencies [d36239c]
+- Updated dependencies [b8f9e6f]
+- Updated dependencies [d8fbc4e]
+- Updated dependencies [f16c664]
+- Updated dependencies [ed1877a]
+- Updated dependencies [16ed395]
+- Updated dependencies [622e628]
+- Updated dependencies [c5ef367]
+- Updated dependencies [6470e48]
+- Updated dependencies [ebf38cd]
+- Updated dependencies [9afd6a0]
+- Updated dependencies [d45441e]
+- Updated dependencies [4d5f2a2]
+- Updated dependencies [3caff5e]
+- Updated dependencies [daf696c]
+- Updated dependencies [c9defbd]
+- Updated dependencies [d19c7f7]
+- Updated dependencies [95f5a26]
+- Updated dependencies [39c24c6]
+- Updated dependencies [92f08d3]
+- Updated dependencies [dec63c6]
+- Updated dependencies [ea9f219]
+- Updated dependencies [941c67e]
+- Updated dependencies [a5b3933]
+- Updated dependencies [ab20522]
+- Updated dependencies [2b9b8b5]
+- Updated dependencies [0173675]
+- Updated dependencies [89cb4c4]
+- Updated dependencies [0d60975]
+- Updated dependencies [aa834a9]
+- Updated dependencies [fdebfac]
+- Updated dependencies [385a5bd]
+- Updated dependencies [35d91bd]
+- Updated dependencies [e9bba9b]
+- Updated dependencies [afddc01]
+- Updated dependencies [60a925a]
+- Updated dependencies [7775735]
+- Updated dependencies [678e2ff]
+- Updated dependencies [e3b41ec]
+- Updated dependencies [d2650f3]
+- Updated dependencies [f03e493]
+- Updated dependencies [87e09ca]
+- Updated dependencies [30d3bd7]
+- Updated dependencies [c893d28]
+- Updated dependencies [c893d28]
+- Updated dependencies [c893d28]
+- Updated dependencies [c893d28]
+- Updated dependencies [54075f1]
+- Updated dependencies [0b461fa]
+- Updated dependencies [2c44930]
+- Updated dependencies [b378fb9]
+- Updated dependencies [4f1cbb0]
+- Updated dependencies [5d66138]
+- Updated dependencies [22f5d75]
+- Updated dependencies [0b4fc32]
+- Updated dependencies [a9726dc]
+- Updated dependencies [fe4d3cb]
+- Updated dependencies [49643a5]
+- Updated dependencies [9ba9573]
+- Updated dependencies [8816154]
+- Updated dependencies [1c9dbe0]
+- Updated dependencies [ab5e75b]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [ad6fce2]
+- Updated dependencies [df7a430]
+- Updated dependencies [b7f964a]
+  - @korajs/store@1.0.0-beta.15
+  - korajs@1.0.0-beta.15
+  - @korajs/core@1.0.0-beta.15
+  - @korajs/sync@1.0.0-beta.15
+  - @korajs/server@1.0.0-beta.15
+  - @korajs/merge@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes
