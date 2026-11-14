@@ -268,6 +268,8 @@ function validateUpdateStateMachine(
 | Member | Description |
 |--------|-------------|
 | `app.storeInfo()` | `{ baseName, databaseName, authUserId, persistence, durable, isolationState }`, without reading records. |
+| `app.setReadOnly(reason \| null)` | Makes the app read-only: every local write (insert, update, delete, `app.mutation`, `app.transaction`, and writes made before `app.ready`) throws `StoreReadOnlyError` (`STORE_READ_ONLY`, with the `reason`) before anything is recorded. Reads, subscriptions and incoming sync carry on. `null` (or a blank reason) makes it writable again. Per app instance, not saved: for example while an admin previews the app as another person. |
+| `app.readOnlyReason()` | The reason the app is read-only, or `null`. |
 | `app.storage.listDatabases()` / `app.storage.deleteDatabase(name, { force? })` | Manage this origin's local databases. See [Storage Configuration](/guide/storage-configuration#managing-local-databases). |
 | `app.exportBackup()` / `app.importBackup()` | See [Backup and Restore](/guide/backup-restore). |
 

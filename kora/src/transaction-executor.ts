@@ -25,6 +25,8 @@ export function createTransactionExecutor(
 		if (!store) {
 			throw new Error('Store not initialized. Await app.ready before using transactions.')
 		}
+		// Refused before the transaction starts, also when it would be relayed to another tab.
+		store.assertWritable()
 
 		const collectionNames = Object.keys(config.schema.collections)
 

@@ -6,6 +6,7 @@ import type {
 	Store,
 	WriteOptions,
 } from '@korajs/store'
+import { StoreReadOnlyError } from '@korajs/store/lite'
 import { DeferredQueryBuilder, type DeferredQueryHost } from './deferred-query'
 import type { PreReadyWriteQueue } from './pre-ready-writes'
 
@@ -15,6 +16,8 @@ export interface CollectionAccessorHost extends DeferredQueryHost {
 	getStore(): Store | null
 	/** Where hook writes wait for the store. */
 	queue: PreReadyWriteQueue
+	/** Why the app is read-only (writes queued before `ready` are refused too), or null. */
+	readOnlyReason?: () => string | null
 }
 
 /**
@@ -48,12 +51,18 @@ export function createCollectionAccessor(
 	// the next one (`await a.insert(); await b.insert()`) is past its synchronous part, and
 	// must not be refused halfway.
 	const allowed = (): boolean => preReadyWritesAllowed() || host.queue.acceptsDirectWrites
+	// A read-only app refuses a write at once, rather than queue it to fail when the store opens.
+	const assertWritable = (): void => {
+		const reason = host.readOnlyReason?.() ?? null
+		if (reason !== null) throw new StoreReadOnlyError(reason)
+	}
 
 	return {
 		async insert(data: Record<string, unknown>, options?: WriteOptions) {
 			const store = host.getStore()
 			if (store) return store.collection(collectionName).insert(data, options)
 			if (!allowed()) throw notReady('insert into')
+			assertWritable()
 			return (await host.queue.enqueue(
 				collectionName,
 				'insert',
@@ -65,6 +74,7 @@ export function createCollectionAccessor(
 			const store = host.getStore()
 			if (store) return store.collection(collectionName).insertMany(rows, options)
 			if (!allowed()) throw notReady('insert into')
+			assertWritable()
 			return (await host.queue.enqueue(
 				collectionName,
 				'insertMany',
@@ -82,6 +92,7 @@ export function createCollectionAccessor(
 			const store = host.getStore()
 			if (store) return store.collection(collectionName).update(id, data, options)
 			if (!allowed()) throw notReady('update')
+			assertWritable()
 			return (await host.queue.enqueue(
 				collectionName,
 				'update',
@@ -93,6 +104,7 @@ export function createCollectionAccessor(
 			const store = host.getStore()
 			if (store) return store.collection(collectionName).delete(id, options)
 			if (!allowed()) throw notReady('delete from')
+			assertWritable()
 			await host.queue.enqueue(collectionName, 'delete', [id], options)
 		},
 		where(conditions: Record<string, unknown>): QueryBuilder {

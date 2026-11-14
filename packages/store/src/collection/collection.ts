@@ -109,6 +109,8 @@ export class Collection {
 	}
 
 	async insert(data: Record<string, unknown>, options?: WriteOptions): Promise<CollectionRecord> {
+		// Checked here too: a write relayed to another tab must still respect this tab's state.
+		this.assertLocalWriteAllowed?.()
 		if (this.mutationHandler) {
 			return this.mutationHandler.insert(this.name, data, options)
 		}
@@ -123,6 +125,7 @@ export class Collection {
 		rows: readonly Record<string, unknown>[],
 		options?: WriteOptions,
 	): Promise<CollectionRecord[]> {
+		this.assertLocalWriteAllowed?.()
 		if (this.mutationHandler?.insertMany) {
 			return this.mutationHandler.insertMany(this.name, rows, options)
 		}
@@ -144,6 +147,7 @@ export class Collection {
 		data: Record<string, unknown>,
 		options?: WriteOptions,
 	): Promise<CollectionRecord> {
+		this.assertLocalWriteAllowed?.()
 		if (this.mutationHandler) {
 			return this.mutationHandler.update(this.name, id, data, options)
 		}
@@ -151,6 +155,7 @@ export class Collection {
 	}
 
 	async delete(id: string, options?: WriteOptions): Promise<void> {
+		this.assertLocalWriteAllowed?.()
 		if (this.mutationHandler) {
 			await this.mutationHandler.delete(this.name, id, options)
 			return

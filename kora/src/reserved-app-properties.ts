@@ -22,6 +22,8 @@ export const RESERVED_APP_PROPERTIES = [
 	'getSyncEngine',
 	'getQueryStoreCache',
 	'storeInfo',
+	'setReadOnly',
+	'readOnlyReason',
 	'close',
 	'transaction',
 	'mutation',
