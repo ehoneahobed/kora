@@ -66,6 +66,10 @@ export default defineConfig({
   and `public/` files) are cache first, so the active build never mixes in a newer
   deploy's bytes. Other hashed assets are cache first; everything else (API calls, for
   example) is network first with a cache fallback.
+- **Cached on first use:** large files most visits never need, such as a help guide's
+  pictures, can be left out of the first download with `koraServiceWorker({ lazy:
+  ['/guide/img'] })`. Each is cached the first time it is fetched and then opens offline
+  too. A page linked as a folder (`/guide/`) opens its `index.html` offline.
 - **Never cached:** the sync endpoint (`/kora-sync`), auth routes (`/auth`), and
   `/__kora`, `/health`. Change the list with `koraServiceWorker({ bypass: [...] })`.
 - **Updates:** a new deploy installs in the background and waits. The page shows "A new

@@ -49,6 +49,14 @@ export interface KoraServiceWorkerOptions {
 	 */
 	bypass?: string[]
 	/**
+	 * URL path prefixes of built files left out of the precache and cached the first time
+	 * they are fetched instead (then served from the cache, offline too). For large files most
+	 * visits never need, such as a help guide's pictures: the first visit downloads only the
+	 * shell. A change to them still makes a new version, so a deploy refreshes them.
+	 * Example: `['/guide/img']`. Defaults to none.
+	 */
+	lazy?: string[]
+	/**
 	 * Show the built-in "new version available" banner. Defaults to true. Set false to show
 	 * your own UI: listen for the `kora:update-available` window event and call
 	 * `event.detail.update()` when the user accepts.
@@ -139,6 +147,7 @@ export const FIRST_DATA_EVENT = 'kora:first-data'
 export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraVitePlugin {
 	const fileName = options.fileName ?? 'sw.js'
 	const bypass = options.bypass ?? [...DEFAULT_SW_BYPASS]
+	const lazy = options.lazy ?? []
 	const updatePrompt = options.updatePrompt ?? true
 	const navigationTimeoutMs = options.navigationTimeoutMs ?? 4000
 	const injectBuildId = options.buildId ?? true
@@ -199,7 +208,12 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 				// Only the worker this plugin generates is left out of the hash.
 				if (injectBuildId) stampOutputBuildId(outDir, [fileName])
 				if (!existsSync(join(outDir, 'index.html'))) return
-				const { urls, version, digests, aliases } = collectPrecache(outDir, config.base, fileName)
+				const { urls, version, digests, aliases, lazyDigests } = collectPrecache(
+					outDir,
+					config.base,
+					fileName,
+					lazy,
+				)
 				writeFileSync(
 					join(outDir, fileName),
 					serviceWorkerSource({
@@ -209,6 +223,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 						aliases,
 						shellUrl: `${config.base}index.html`,
 						bypass,
+						lazy: lazyDigests,
 						navigationTimeoutMs,
 					}),
 				)
@@ -233,19 +248,24 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
  * @param outDir - Absolute build directory
  * @param base - Vite `base` (URL prefix ending in `/`)
  * @param swFileName - The worker's own file name, excluded from the list
+ * @param lazy - URL path prefixes left out of the list (cached on first use), still part of
+ *   the version so a change to them makes a new one
  * @returns Precache URLs (sorted), a 16-hex-digit content version, the SHA-256 (hex) of
  *   each URL's file, which the worker embeds as `DIGESTS` to verify what it stores, and the
- *   aliases (URL to the URL whose identical bytes it is stored from)
+ *   aliases (URL to the URL whose identical bytes it is stored from), and the SHA-256 of
+ *   each lazy file, which the worker checks before storing one on first use
  */
 export function collectPrecache(
 	outDir: string,
 	base: string,
 	swFileName = 'sw.js',
+	lazy: readonly string[] = [],
 ): {
 	urls: string[]
 	version: string
 	digests: Record<string, string>
 	aliases: Record<string, string>
+	lazyDigests: Record<string, string>
 } {
 	const files: { path: string; digest: string }[] = []
 	const walk = (dir: string): void => {
@@ -269,12 +289,21 @@ export function collectPrecache(
 	}
 	walk(outDir)
 
-	const kept = files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+	const all = files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+	const isLazy = (path: string): boolean =>
+		lazy.some((prefix) => {
+			const url = `${base}${path}`
+			return url === prefix || url.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`)
+		})
+	const kept = all.filter((f) => !isLazy(f.path))
 
+	// Over every file, lazy ones included: a changed picture is a new version.
 	const version = createHash('sha256')
-	for (const f of kept) version.update(`${f.path}\0${f.digest}\n`)
+	for (const f of all) version.update(`${f.path}\0${f.digest}\n`)
 	const digests: Record<string, string> = {}
 	for (const f of kept) digests[`${base}${f.path}`] = f.digest
+	const lazyDigests: Record<string, string> = {}
+	for (const f of all) if (isLazy(f.path)) lazyDigests[`${base}${f.path}`] = f.digest
 
 	// One download per distinct content: the shortest URL of each group is fetched.
 	const fetchedFor = new Map<string, string>()
@@ -294,6 +323,7 @@ export function collectPrecache(
 		version: version.digest('hex').slice(0, 16),
 		digests,
 		aliases,
+		lazyDigests,
 	}
 }
 
@@ -325,6 +355,11 @@ interface WorkerSourceInput {
 	aliases?: Record<string, string>
 	shellUrl: string
 	bypass: string[]
+	/**
+	 * The build's lazy files (see {@link KoraServiceWorkerOptions.lazy}): URL to the SHA-256 of
+	 * its bytes. One is stored on first use only when its bytes are this build's.
+	 */
+	lazy?: Record<string, string>
 	navigationTimeoutMs: number
 }
 
@@ -353,7 +388,9 @@ interface WorkerSourceInput {
  *     downloads) pass through. Offline or timed out: this build's copy or shell;
  *   - files this build precached: cache first (this build's bytes, the unhashed
  *     `sqlite3.wasm` and public files included, never a newer deploy's);
- *   - other content-hashed files: cache first (their bytes can never change);
+ *   - other content-hashed files, and the build's `lazy` files: cache first, stored the
+ *     first time they are fetched. A lazy file is stored only when its bytes match this
+ *     build's digest, so a newer deploy's copy is served but never kept in this version;
  *   - everything else: network first, falling back to the cache.
  * - message `KORA_SW_STATUS` (the page's shell check, design section 7): replies
  *   `{ v: 1, version, complete, missing, misses, sameBuild }` after checking every precached
@@ -367,6 +404,8 @@ const CACHE = ${JSON.stringify(SW_CACHE_PREFIX)} + VERSION
 const PRECACHE = ${JSON.stringify(input.precache)}
 const SHELL = ${JSON.stringify(input.shellUrl)}
 const BYPASS = ${JSON.stringify(input.bypass)}
+// Lazy file URL -> the SHA-256 of this build's bytes (stored on first use, when they match).
+const LAZY = ${JSON.stringify(input.lazy ?? {})}
 const NAVIGATION_TIMEOUT_MS = ${JSON.stringify(input.navigationTimeoutMs)}
 const PRECACHED = new Set(PRECACHE)
 const PAGES = PRECACHE.filter((url) => /\.html?$/i.test(url))
@@ -586,11 +625,13 @@ function fromCache(request) {
 	return caches.open(CACHE).then((cache) => cache.match(request, { ignoreSearch: true, ignoreVary: true }))
 }
 
-// This build's copy of the page a navigation asked for: the precached page of that path,
-// else the app shell (client-side routes).
+// This build's copy of the page a navigation asked for: the precached page of that path
+// (a folder's index.html for a path ending in "/", as a static host serves it: a help page
+// at /help/ opens offline, not the app), else the app shell (client-side routes).
 function ownPage(url) {
+	const path = url.pathname.endsWith('/') ? url.pathname + 'index.html' : url.pathname
 	return caches.open(CACHE).then((cache) =>
-		(PAGES.includes(url.pathname) ? cache.match(url.pathname, MATCH) : Promise.resolve(undefined)).then(
+		(PAGES.includes(path) ? cache.match(path, MATCH) : Promise.resolve(undefined)).then(
 			(page) => page || cache.match(SHELL, MATCH),
 		),
 	)
@@ -682,7 +723,10 @@ self.addEventListener('fetch', (event) => {
 		return
 	}
 
-	if (isHashed(url.pathname)) {
+	const lazyDigest = Object.prototype.hasOwnProperty.call(LAZY, url.pathname)
+		? LAZY[url.pathname]
+		: undefined
+	if (isHashed(url.pathname) || lazyDigest !== undefined) {
 		event.respondWith(
 			fromCache(request).then(
 				(cached) =>
@@ -691,7 +735,14 @@ self.addEventListener('fetch', (event) => {
 						(response) => {
 							if (response.ok && response.type === 'basic') {
 								const copy = response.clone()
-								caches.open(CACHE).then((cache) => cache.put(request, copy))
+								// A hashed name's bytes never change. A lazy file's URL can already serve a
+								// newer deploy: those bytes are served but never stored in this version.
+								const keep = lazyDigest === undefined ? Promise.resolve(copy) : verified(copy, lazyDigest)
+								event.waitUntil(
+									keep
+										.then((ok) => ok && caches.open(CACHE).then((cache) => cache.put(request, ok)))
+										.catch(() => undefined),
+								)
 							}
 							return response
 						},
