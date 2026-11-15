@@ -1,4 +1,11 @@
-const COMMANDS: &[&str] = &["open", "close", "execute", "query", "migrate",
+const COMMANDS: &[&str] = &[
+    "open",
+    "close",
+    "execute",
+    "query",
+    "migrate",
+    "inspect",
+    "delete",
     "credential_get",
     "credential_set",
     "credential_delete",

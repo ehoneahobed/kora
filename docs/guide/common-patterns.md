@@ -473,6 +473,10 @@ for (const database of await app.storage.listDatabases()) {
 await app.storage.deleteDatabase('kora-db')
 ```
 
+Never clear local data by deleting records: a delete is an operation that syncs, so it removes the
+records from the server and every other device too. `deleteDatabase` erases only this device's copy,
+in browsers and in Tauri apps.
+
 Pass `{ force: true }` only when losing unsynced writes is acceptable. See
 [Storage Configuration](/guide/storage-configuration#managing-local-databases).
 

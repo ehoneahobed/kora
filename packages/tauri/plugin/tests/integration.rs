@@ -63,7 +63,11 @@ fn test_open_sets_wal_mode() {
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();
     // In-memory databases fall back to 'memory' when WAL is requested
-    assert!(mode == "wal" || mode == "memory", "expected wal or memory, got {}", mode);
+    assert!(
+        mode == "wal" || mode == "memory",
+        "expected wal or memory, got {}",
+        mode
+    );
 }
 
 #[test]
@@ -129,9 +133,11 @@ fn test_insert_and_select() {
     .unwrap();
 
     let (title, completed): (String, i64) = conn
-        .query_row("SELECT title, completed FROM todos WHERE id = ?1", ["rec-1"], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+        .query_row(
+            "SELECT title, completed FROM todos WHERE id = ?1",
+            ["rec-1"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .unwrap();
 
     assert_eq!(title, "Hello");
@@ -156,9 +162,11 @@ fn test_update_record() {
     .unwrap();
 
     let (title, completed): (String, i64) = conn
-        .query_row("SELECT title, completed FROM todos WHERE id = ?1", ["rec-1"], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+        .query_row(
+            "SELECT title, completed FROM todos WHERE id = ?1",
+            ["rec-1"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .unwrap();
 
     assert_eq!(title, "Updated");
@@ -181,9 +189,11 @@ fn test_delete_record() {
         .unwrap();
 
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM todos WHERE id = ?1", ["rec-1"], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM todos WHERE id = ?1",
+            ["rec-1"],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(count, 0);
 }
@@ -316,7 +326,8 @@ fn test_migration_adds_column() {
 
     // Add a new column (migration)
     conn.execute_batch("BEGIN").unwrap();
-    conn.execute_batch("ALTER TABLE todos ADD COLUMN notes TEXT").unwrap();
+    conn.execute_batch("ALTER TABLE todos ADD COLUMN notes TEXT")
+        .unwrap();
     conn.execute_batch("COMMIT").unwrap();
 
     // Verify the new column exists and can be written to
@@ -356,7 +367,8 @@ fn test_safe_alter_table_ignores_duplicate_column() {
     conn.execute_batch(DDL_TODOS).unwrap();
 
     // First add a column
-    conn.execute_batch("ALTER TABLE todos ADD COLUMN priority TEXT DEFAULT 'medium'").unwrap();
+    conn.execute_batch("ALTER TABLE todos ADD COLUMN priority TEXT DEFAULT 'medium'")
+        .unwrap();
 
     // Try adding the same column again — the plugin's safe-alter pattern
     // should ignore the "duplicate column name" error
@@ -413,9 +425,8 @@ fn test_all_sql_types_roundtrip() {
 #[test]
 fn test_null_values() {
     let conn = open_kora_db();
-    conn.execute_batch(
-        "CREATE TABLE nullable (id TEXT PRIMARY KEY, value TEXT)",
-    ).unwrap();
+    conn.execute_batch("CREATE TABLE nullable (id TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
 
     conn.execute(
         "INSERT INTO nullable (id, value) VALUES (?1, ?2)",
@@ -424,9 +435,11 @@ fn test_null_values() {
     .unwrap();
 
     let value: Option<String> = conn
-        .query_row("SELECT value FROM nullable WHERE id = ?1", ["rec-1"], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT value FROM nullable WHERE id = ?1",
+            ["rec-1"],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(value, None);
 }
@@ -434,7 +447,8 @@ fn test_null_values() {
 #[test]
 fn test_blob_as_hex() {
     let conn = open_kora_db();
-    conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)").unwrap();
+    conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+        .unwrap();
 
     let input: Vec<u8> = vec![0x00, 0xFF, 0xAB, 0xCD];
     conn.execute(
@@ -549,7 +563,11 @@ fn test_bulk_insert_and_count() {
     assert_eq!(total, 100);
 
     let completed: i64 = conn
-        .query_row("SELECT COUNT(*) FROM todos WHERE completed = 1", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM todos WHERE completed = 1",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(completed, 50);
 }

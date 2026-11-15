@@ -177,17 +177,19 @@ export interface StoreInfo {
 export type LocalDatabaseInfo = import('@korajs/store/sqlite-wasm').LocalDatabaseRecord
 
 /**
- * Explicit management of this origin's local (browser) databases, for example
- * the per-user databases of `store.namespaceByAuthUser` on a shared device.
- * Kora never evicts a database automatically.
+ * Explicit management of this device's local databases (browser storage, or the Tauri app's
+ * data directory), for example the per-user databases of `store.namespaceByAuthUser` on a
+ * shared device. Kora never evicts a database automatically.
  */
 export interface StorageApi {
 	/** Databases Kora created or opened on this origin. Empty outside browsers. */
 	listDatabases(): Promise<LocalDatabaseInfo[]>
 	/**
-	 * Permanently delete a local database. Refuses with `StorageInUseError` while
-	 * any tab has it open (close the app first) and with `UnsyncedDataError` while
-	 * it holds operations the server never acknowledged, unless `force` is set.
+	 * Permanently delete a local database: this device's copy only, writing nothing that
+	 * syncs. Refuses with `StorageInUseError` while any tab (or, in a Tauri app, this app)
+	 * has it open (close the app first) and with `UnsyncedDataError` while it holds
+	 * operations the server never acknowledged, unless `force` is set. In a Tauri app it
+	 * deletes the database file and SQLite's companion files.
 	 *
 	 * @returns true when a database was deleted, false when none existed
 	 */
