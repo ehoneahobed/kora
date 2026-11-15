@@ -76,6 +76,9 @@ describe('collectPrecache', () => {
 		const before = collectPrecache(buildDir(files), '/', 'sw.js', ['/guide/img'])
 		expect(before.urls).toEqual(['/guide/index.html', '/index.html'])
 		expect(before.digests['/guide/img/a.jpg']).toBeUndefined()
+		expect(before.lazyDigests).toEqual({
+			'/guide/img/a.jpg': createHash('sha256').update('a1').digest('hex'),
+		})
 		const after = collectPrecache(buildDir({ ...files, 'guide/img/a.jpg': 'a2' }), '/', 'sw.js', [
 			'/guide/img',
 		])
@@ -246,12 +249,15 @@ describe('bundled templates', () => {
  * worker (RT-109).
  */
 describe('generated worker: one build per active worker (RT-109)', () => {
+	const sha = (body: string) => createHash('sha256').update(body).digest('hex')
 	interface FakeResponse {
 		ok: boolean
 		type: string
 		body: string
 		headers: { get(name: string): string | null }
+		redirected: boolean
 		text(): Promise<string>
+		arrayBuffer(): Promise<ArrayBuffer>
 		clone(): FakeResponse
 	}
 	const respond = (body: string, contentType: string): FakeResponse => ({
@@ -259,7 +265,9 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 		type: 'basic',
 		body,
 		headers: { get: (name) => (name.toLowerCase() === 'content-type' ? contentType : null) },
+		redirected: false,
 		text: async () => body,
+		arrayBuffer: async () => new TextEncoder().encode(body).buffer as ArrayBuffer,
 		clone: () => respond(body, contentType),
 	})
 	const typeOf = (path: string): string =>
@@ -269,9 +277,10 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 
 	function worker(
 		precached: Record<string, string>,
-		network: Record<string, string> | null,
-		lazy: string[] = [],
+		initialNetwork: Record<string, string> | null,
+		lazy: Record<string, string> = {},
 	) {
+		let network = initialNetwork
 		type Handler = (event: unknown) => void
 		const handlers = new Map<string, Handler>()
 		const cache = new Map<string, string>()
@@ -345,13 +354,19 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 			},
 			async get(path: string, mode: 'navigate' | 'no-cors' = 'no-cors'): Promise<string> {
 				let result: Promise<FakeResponse | undefined> = Promise.resolve(undefined)
+				const extended: Promise<unknown>[] = []
 				handlers.get('fetch')?.({
 					request: { method: 'GET', mode, url: `https://app.test${path}` },
 					respondWith: (p: Promise<FakeResponse>) => {
 						result = p
 					},
+					waitUntil: (p: Promise<unknown>) => {
+						extended.push(p)
+					},
 				})
-				return (await result)?.body ?? '<not handled>'
+				const body = (await result)?.body ?? '<not handled>'
+				await Promise.all(extended)
+				return body
 			},
 		}
 	}
@@ -398,13 +413,33 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 	})
 
 	test('a lazy file is cached the first time it is fetched, then served offline', async () => {
-		const sw = worker(v1Files, { '/guide/img/till.jpg': 'picture v1' }, ['/guide/img'])
+		const lazy = { '/guide/img/till.jpg': sha('picture v1'), '/guide/img/other.jpg': sha('other') }
+		const sw = worker(v1Files, { '/guide/img/till.jpg': 'picture v1' }, lazy)
 		await sw.install()
 		expect(await sw.get('/guide/img/till.jpg')).toBe('picture v1')
 		sw.setNetwork(null)
 		expect(await sw.get('/guide/img/till.jpg')).toBe('picture v1')
 		// Never fetched before: not there offline (it was never downloaded).
 		await expect(sw.get('/guide/img/other.jpg')).rejects.toThrow('Failed to fetch')
+	})
+
+	test("a lazy file's newer-deploy bytes are served but never stored in this version", async () => {
+		const lazy = { '/guide/img/till.jpg': sha('picture v1') }
+		const sw = worker(v1Files, { '/guide/img/till.jpg': 'picture v2' }, lazy)
+		await sw.install()
+		expect(await sw.get('/guide/img/till.jpg')).toBe('picture v2')
+		sw.setNetwork(null)
+		await expect(sw.get('/guide/img/till.jpg')).rejects.toThrow('Failed to fetch')
+	})
+
+	test('a file under a lazy folder that the build does not have is not cached', async () => {
+		const lazy = { '/guide/img/till.jpg': sha('picture v1') }
+		const sw = worker(v1Files, { '/guide/img/new.jpg': 'not this build' }, lazy)
+		await sw.install()
+		expect(await sw.get('/guide/img/new.jpg')).toBe('not this build')
+		sw.setNetwork(null)
+		// Network first like any other request, with nothing cached to fall back on.
+		expect(await sw.get('/guide/img/new.jpg')).toBe('')
 	})
 
 	test("offline, a folder path opens the folder's precached index.html, not the app", async () => {
