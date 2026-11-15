@@ -54,6 +54,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::execute,
             commands::query,
             commands::migrate,
+            commands::inspect,
+            commands::delete,
             credentials::credential_get,
             credentials::credential_set,
             credentials::credential_delete,

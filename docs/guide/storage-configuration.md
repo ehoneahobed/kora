@@ -149,7 +149,21 @@ for (const db of await app.storage.listDatabases()) {
 const deleted = await app.storage.deleteDatabase('kora-db:user-123')
 ```
 
-Pass `{ force: true }` to delete despite unsynced writes. `app.storeInfo()` reports the current
+Pass `{ force: true }` to delete despite unsynced writes. The database's default blob store (its
+files, `<name>-blobs` in OPFS) is deleted with it; a custom `blob.store` is yours to manage.
+
+In a Tauri app (native SQLite), `deleteDatabase` deletes the database file and SQLite's companion
+files from the app's data directory, with the same refusals. To erase this device's copy (a
+"reset this device" button), close the app first. Nothing is written that syncs, so the server
+and other devices keep their data:
+
+```typescript
+const { databaseName } = app.storeInfo()
+await app.close()
+await app.storage.deleteDatabase(databaseName)
+```
+
+`app.storeInfo()` reports the current
 database's name, backend, whether it is durable and its isolation state, without exposing records.
 A collection named `storage` must be reached through `app.collections.storage`.
 

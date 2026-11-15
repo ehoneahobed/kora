@@ -64,10 +64,7 @@ pub fn open<R: Runtime>(
             .app_data_dir()
             .map_err(|e| Error::Plugin(format!("Failed to get app data dir: {}", e)))?;
         std::fs::create_dir_all(&data_dir)?;
-        data_dir
-            .join(&path)
-            .to_string_lossy()
-            .into_owned()
+        data_dir.join(&path).to_string_lossy().into_owned()
     };
 
     let conn = Connection::open(&db_path)?;
@@ -101,6 +98,107 @@ pub fn open<R: Runtime>(
     log::info!("Opened Kora database: {}", db_path);
     connections.insert(path, conn);
     Ok(())
+}
+
+/// What `inspect` reports about a database file.
+#[derive(serde::Serialize)]
+pub struct DatabaseFileState {
+    /// This app has the database open (`open` was called and not closed).
+    pub open: bool,
+    /// The database file exists in the app's data directory.
+    pub exists: bool,
+}
+
+/// A database name a caller may delete: relative to the app's data directory, never a parent
+/// or absolute path (which `PathBuf::join` would follow out of it), never `:memory:`.
+pub fn validate_database_path(path: &str) -> Result<(), Error> {
+    use std::path::Component;
+    let candidate = std::path::Path::new(path);
+    let inside = !path.is_empty()
+        && path != ":memory:"
+        && candidate
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if inside {
+        Ok(())
+    } else {
+        Err(Error::Plugin(format!(
+            "\"{}\" is not a database file in the app's data directory",
+            path
+        )))
+    }
+}
+
+/// Delete a database file and SQLite's companion files (`-wal`, `-shm`, `-journal`).
+/// Returns whether the database file existed.
+pub fn delete_database_files(db_path: &std::path::Path) -> Result<bool, Error> {
+    let existed = db_path.exists();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut companion = db_path.as_os_str().to_owned();
+        companion.push(suffix);
+        match std::fs::remove_file(std::path::PathBuf::from(companion)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    // The main file last: until it is gone, the database is still whole.
+    match std::fs::remove_file(db_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::Io(error)),
+    }
+    Ok(existed)
+}
+
+fn data_dir_path<R: Runtime>(app: &AppHandle<R>, path: &str) -> Result<std::path::PathBuf, Error> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| Error::Plugin(format!("Failed to get app data dir: {}", e)))?;
+    Ok(data_dir.join(path))
+}
+
+/// Whether a database is open in this app, and whether its file exists.
+#[tauri::command]
+pub fn inspect<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, DbState>,
+    path: String,
+) -> Result<DatabaseFileState, Error> {
+    validate_database_path(&path)?;
+    let connections = state
+        .connections
+        .lock()
+        .map_err(|e| Error::Plugin(format!("Failed to acquire lock: {}", e)))?;
+    Ok(DatabaseFileState {
+        open: connections.contains_key(&path),
+        exists: data_dir_path(&app, &path)?.exists(),
+    })
+}
+
+/// Permanently delete a closed database (`app.storage.deleteDatabase`). Refuses while the
+/// database is open: close the app first. Returns whether a database file existed.
+#[tauri::command]
+pub fn delete<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, DbState>,
+    path: String,
+) -> Result<bool, Error> {
+    validate_database_path(&path)?;
+    // Held for the whole delete, so no `open` of this database can start halfway.
+    let connections = state
+        .connections
+        .lock()
+        .map_err(|e| Error::Plugin(format!("Failed to acquire lock: {}", e)))?;
+    if connections.contains_key(&path) {
+        return Err(Error::InUse(path));
+    }
+    let existed = delete_database_files(&data_dir_path(&app, &path)?)?;
+    if existed {
+        log::info!("Deleted Kora database: {}", path);
+    }
+    Ok(existed)
 }
 
 /// Close a database connection.
@@ -170,11 +268,7 @@ pub fn query(
         param_refs.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn.prepare(&sql)?;
-    let column_names: Vec<String> = stmt
-        .column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
 
     let rows = stmt.query_map(param_slice.as_slice(), |row| {
         let mut map = HashMap::new();
@@ -182,12 +276,10 @@ pub fn query(
             let value: JsonValue = match row.get_ref(i) {
                 Ok(rusqlite::types::ValueRef::Null) => JsonValue::Null,
                 Ok(rusqlite::types::ValueRef::Integer(n)) => JsonValue::Number(n.into()),
-                Ok(rusqlite::types::ValueRef::Real(f)) => {
-                    match serde_json::Number::from_f64(f) {
-                        Some(n) => JsonValue::Number(n),
-                        None => JsonValue::Null,
-                    }
-                }
+                Ok(rusqlite::types::ValueRef::Real(f)) => match serde_json::Number::from_f64(f) {
+                    Some(n) => JsonValue::Number(n),
+                    None => JsonValue::Null,
+                },
                 Ok(rusqlite::types::ValueRef::Text(s)) => {
                     JsonValue::String(String::from_utf8_lossy(s).into_owned())
                 }
@@ -241,5 +333,71 @@ pub fn migrate(
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::{delete_database_files, validate_database_path};
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kora-sqlite-delete-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_names_inside_the_data_directory_can_be_deleted() {
+        assert!(validate_database_path("kora-db.db").is_ok());
+        assert!(validate_database_path("tenants/a.db").is_ok());
+        for refused in [
+            "",
+            ":memory:",
+            "../other.db",
+            "/etc/passwd",
+            "a/../../b.db",
+            "./a.db",
+        ] {
+            assert!(
+                validate_database_path(refused).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_removes_the_database_and_its_companion_files() {
+        let dir = scratch_dir("files");
+        let db = dir.join("kora-db.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        std::fs::write(dir.join("kora-db.db-journal"), b"").unwrap();
+        std::fs::write(dir.join("other.db"), b"keep").unwrap();
+
+        assert!(delete_database_files(&db).unwrap());
+        for name in [
+            "kora-db.db",
+            "kora-db.db-wal",
+            "kora-db.db-shm",
+            "kora-db.db-journal",
+        ] {
+            assert!(!dir.join(name).exists(), "{name} should be gone");
+        }
+        assert!(
+            dir.join("other.db").exists(),
+            "other databases are untouched"
+        );
+        // Nothing left: reports that no database existed.
+        assert!(!delete_database_files(&db).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,6 +1,13 @@
 import { KoraError, type KoraEventEmitter, quoteIdent } from '@korajs/core'
-import { StoragePersistence, type WriteDurabilityState } from '@korajs/store'
+import {
+	StorageInUseError,
+	StoragePersistence,
+	UnsyncedDataError,
+	type WriteDurabilityState,
+} from '@korajs/store'
 import { hasUnsyncedOwnOperations } from '@korajs/store/internal'
+import { detectAdapterType, importOptionalPeer } from './adapter-resolver'
+import { deleteDefaultBlobStore } from './blob/resolve-blob-store'
 import type {
 	AuthSyncBinding,
 	KoraConfig,
@@ -91,6 +98,11 @@ export function createStorageApi(
 			return listLocalDatabases()
 		},
 		async deleteDatabase(name: string, options: { force?: boolean } = {}): Promise<boolean> {
+			if (usesTauriSqlite(config)) {
+				const deleted = await deleteTauriDatabase(name, config, options.force === true)
+				await deleteDefaultBlobStore(config.blob, name)
+				return deleted
+			}
 			const workerUrl = config.store?.workerUrl
 			if (!workerUrl || typeof indexedDB === 'undefined') {
 				throw new KoraError(
@@ -100,13 +112,64 @@ export function createStorageApi(
 				)
 			}
 			const { deleteLocalDatabase } = await import('@korajs/store/sqlite-wasm')
-			return deleteLocalDatabase(name, {
+			const deleted = await deleteLocalDatabase(name, {
 				workerUrl,
 				force: options.force === true,
 				workerResponseTimeoutMs: config.store?.workerResponseTimeoutMs,
 				hasUnsyncedOperations: (db) => hasUnsyncedOperations(db, config.sync !== undefined),
 			})
+			// Only after the database is gone (its refusals come first): its files go with it.
+			await deleteDefaultBlobStore(config.blob, name)
+			return deleted
 		},
+	}
+}
+
+/** Whether this app stores its database with native SQLite through the Tauri plugin. */
+function usesTauriSqlite(config: KoraConfig): boolean {
+	const adapter = config.store?.adapter
+	return (
+		adapter === 'tauri-sqlite' || (adapter === undefined && detectAdapterType() === 'tauri-sqlite')
+	)
+}
+
+/** The parts of `@korajs/tauri` deleting a database needs (an optional peer). */
+export interface TauriDatabaseFiles {
+	inspectTauriDatabase(path: string): Promise<{ open: boolean; exists: boolean }>
+	readTauriDatabase<T>(path: string, read: (db: DatabaseReader) => Promise<T>): Promise<T>
+	deleteTauriDatabase(path: string): Promise<boolean>
+	TauriDatabaseInUseError: new (...args: never[]) => Error
+}
+
+/**
+ * `deleteDatabase` for a Tauri app: the same contract as in a browser. Refuses while the
+ * app has the database open and while it holds operations the server never acknowledged
+ * (unless `force`); erases the file and SQLite's companion files, writing nothing that syncs.
+ */
+export async function deleteTauriDatabase(
+	name: string,
+	config: KoraConfig,
+	force: boolean,
+	loadTauri: () => Promise<TauriDatabaseFiles> = () =>
+		importOptionalPeer<TauriDatabaseFiles>('@korajs/tauri'),
+): Promise<boolean> {
+	const tauri = await loadTauri()
+	// The file name the Tauri adapter opens for this database (see createAdapter).
+	const path = `${name}.db`
+	const state = await tauri.inspectTauriDatabase(path)
+	if (state.open) throw new StorageInUseError(name)
+	if (!state.exists) return false
+	if (!force) {
+		const unsynced = await tauri.readTauriDatabase(path, (db) =>
+			hasUnsyncedOperations(db, config.sync !== undefined),
+		)
+		if (unsynced) throw new UnsyncedDataError(name)
+	}
+	try {
+		return await tauri.deleteTauriDatabase(path)
+	} catch (error) {
+		if (error instanceof tauri.TauriDatabaseInUseError) throw new StorageInUseError(name)
+		throw error
 	}
 }
 

@@ -12,6 +12,10 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The prefix `STORAGE_IN_USE:` lets the JavaScript side raise `StorageInUseError`.
+    #[error("STORAGE_IN_USE: database {0} is open; close it before deleting it")]
+    InUse(String),
+
     #[error("Plugin error: {0}")]
     Plugin(String),
 }

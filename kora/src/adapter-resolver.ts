@@ -3,7 +3,7 @@ import type { StorageAdapter, VersionGate } from '@korajs/store'
 import type { AdapterType } from './types'
 
 /** Dynamic import that bundlers cannot statically analyze (optional peer packages). */
-function importOptionalPeer<T>(specifier: string): Promise<T> {
+export function importOptionalPeer<T>(specifier: string): Promise<T> {
 	const dynamicImport = new Function('specifier', 'return import(specifier)') as (
 		s: string,
 	) => Promise<T>

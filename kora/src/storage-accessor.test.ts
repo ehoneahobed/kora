@@ -4,7 +4,13 @@ import { StoragePersistence } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createApp } from './create-app'
-import { createStorageApi, hasUnsyncedOperations, wireStoragePersistence } from './storage-accessor'
+import {
+	type TauriDatabaseFiles,
+	createStorageApi,
+	deleteTauriDatabase,
+	hasUnsyncedOperations,
+	wireStoragePersistence,
+} from './storage-accessor'
 import type { AuthSyncBinding } from './types'
 
 const schema = defineSchema({
@@ -106,6 +112,101 @@ describe('app.storage outside browsers', () => {
 		const api = createStorageApi({ schema })
 		await expect(api.listDatabases()).resolves.toEqual([])
 		await expect(api.deleteDatabase('x')).rejects.toMatchObject({ code: 'STORAGE_UNSUPPORTED' })
+	})
+})
+
+describe('app.storage.deleteDatabase in a Tauri app (native SQLite)', () => {
+	class FakeInUse extends Error {}
+	// The plugin's view of the app data directory: one database file, open or not.
+	function fakeTauri(file: { open: boolean; db: BetterSqlite3Adapter | null }) {
+		const calls: string[] = []
+		const tauri: TauriDatabaseFiles = {
+			async inspectTauriDatabase(path) {
+				calls.push(`inspect ${path}`)
+				return { open: file.open, exists: file.db !== null }
+			},
+			async readTauriDatabase(path, read) {
+				calls.push(`read ${path}`)
+				if (!file.db) throw new Error('no file')
+				return read(file.db)
+			},
+			async deleteTauriDatabase(path) {
+				calls.push(`delete ${path}`)
+				if (file.open) throw new FakeInUse()
+				const existed = file.db !== null
+				file.db = null
+				return existed
+			},
+			TauriDatabaseInUseError: FakeInUse,
+		}
+		return { tauri, calls }
+	}
+	const synced = { schema, sync: { url: 'wss://example.test/kora-sync' } }
+
+	test('deletes a closed, fully synced database file, writing nothing that syncs', async () => {
+		const db = new BetterSqlite3Adapter(':memory:')
+		await db.open(schema)
+		await db.execute(insertOp) // left the queue: the server has it
+		const file = { open: false, db: db as BetterSqlite3Adapter | null }
+		const { tauri, calls } = fakeTauri(file)
+		await expect(deleteTauriDatabase('kora-db', synced, false, async () => tauri)).resolves.toBe(
+			true,
+		)
+		expect(calls).toEqual(['inspect kora-db.db', 'read kora-db.db', 'delete kora-db.db'])
+		expect(file.db).toBeNull()
+		await db.close()
+	})
+
+	test('refuses while the app has the database open', async () => {
+		const { tauri, calls } = fakeTauri({ open: true, db: null })
+		await expect(
+			deleteTauriDatabase('kora-db', synced, false, async () => tauri),
+		).rejects.toMatchObject({
+			code: 'STORAGE_IN_USE',
+		})
+		expect(calls).toEqual(['inspect kora-db.db'])
+	})
+
+	test('refuses while writes the server never acknowledged remain, unless forced', async () => {
+		const db = new BetterSqlite3Adapter(':memory:')
+		await db.open(schema)
+		await db.execute("INSERT INTO _kora_sync_queue (id, payload) VALUES ('op-1', '{}')")
+		const file = { open: false, db: db as BetterSqlite3Adapter | null }
+		const { tauri } = fakeTauri(file)
+		await expect(
+			deleteTauriDatabase('kora-db', synced, false, async () => tauri),
+		).rejects.toMatchObject({
+			code: 'UNSYNCED_DATA',
+		})
+		expect(file.db).not.toBeNull()
+		await expect(deleteTauriDatabase('kora-db', synced, true, async () => tauri)).resolves.toBe(
+			true,
+		)
+		await db.close()
+	})
+
+	test('reports false when no database file exists', async () => {
+		const { tauri, calls } = fakeTauri({ open: false, db: null })
+		await expect(deleteTauriDatabase('kora-db', synced, false, async () => tauri)).resolves.toBe(
+			false,
+		)
+		expect(calls).toEqual(['inspect kora-db.db'])
+	})
+
+	test("the plugin's in-use refusal surfaces as StorageInUseError", async () => {
+		const db = new BetterSqlite3Adapter(':memory:')
+		await db.open(schema)
+		const file = { open: false, db: db as BetterSqlite3Adapter | null }
+		const { tauri } = fakeTauri(file)
+		tauri.deleteTauriDatabase = async () => {
+			throw new FakeInUse()
+		}
+		await expect(
+			deleteTauriDatabase('kora-db', synced, true, async () => tauri),
+		).rejects.toMatchObject({
+			code: 'STORAGE_IN_USE',
+		})
+		await db.close()
 	})
 })
 

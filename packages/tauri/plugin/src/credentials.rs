@@ -21,9 +21,7 @@ fn classify(error: keyring::Error) -> Error {
     match error {
         keyring::Error::NoDefaultStore
         | keyring::Error::NoStorageAccess(_)
-        | keyring::Error::PlatformFailure(_) => {
-            Error::Plugin(format!("{UNAVAILABLE}: {error}"))
-        }
+        | keyring::Error::PlatformFailure(_) => Error::Plugin(format!("{UNAVAILABLE}: {error}")),
         other => Error::Plugin(format!("CREDENTIAL_ERROR: {other}")),
     }
 }
@@ -59,7 +57,12 @@ pub async fn credential_set<R: Runtime>(
     value: String,
 ) -> Result<(), Error> {
     let service = app.config().identifier.clone();
-    blocking(move || entry(&service, &key)?.set_password(&value).map_err(classify)).await
+    blocking(move || {
+        entry(&service, &key)?
+            .set_password(&value)
+            .map_err(classify)
+    })
+    .await
 }
 
 /// Remove the credential under `key`; removing one that is not there succeeds.

@@ -14,3 +14,10 @@ export {
 	type TauriCredentialStoreOptions,
 	type FallbackCredentialStorage,
 } from './credential-store'
+export {
+	inspectTauriDatabase,
+	readTauriDatabase,
+	deleteTauriDatabase,
+	TauriDatabaseInUseError,
+	type TauriDatabaseFileState,
+} from './database-files'
