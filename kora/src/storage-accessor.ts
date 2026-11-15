@@ -7,6 +7,7 @@ import {
 } from '@korajs/store'
 import { hasUnsyncedOwnOperations } from '@korajs/store/internal'
 import { detectAdapterType, importOptionalPeer } from './adapter-resolver'
+import { deleteDefaultBlobStore } from './blob/resolve-blob-store'
 import type {
 	AuthSyncBinding,
 	KoraConfig,
@@ -97,7 +98,11 @@ export function createStorageApi(
 			return listLocalDatabases()
 		},
 		async deleteDatabase(name: string, options: { force?: boolean } = {}): Promise<boolean> {
-			if (usesTauriSqlite(config)) return deleteTauriDatabase(name, config, options.force === true)
+			if (usesTauriSqlite(config)) {
+				const deleted = await deleteTauriDatabase(name, config, options.force === true)
+				await deleteDefaultBlobStore(config.blob, name)
+				return deleted
+			}
 			const workerUrl = config.store?.workerUrl
 			if (!workerUrl || typeof indexedDB === 'undefined') {
 				throw new KoraError(
@@ -107,12 +112,15 @@ export function createStorageApi(
 				)
 			}
 			const { deleteLocalDatabase } = await import('@korajs/store/sqlite-wasm')
-			return deleteLocalDatabase(name, {
+			const deleted = await deleteLocalDatabase(name, {
 				workerUrl,
 				force: options.force === true,
 				workerResponseTimeoutMs: config.store?.workerResponseTimeoutMs,
 				hasUnsyncedOperations: (db) => hasUnsyncedOperations(db, config.sync !== undefined),
 			})
+			// Only after the database is gone (its refusals come first): its files go with it.
+			await deleteDefaultBlobStore(config.blob, name)
+			return deleted
 		},
 	}
 }
