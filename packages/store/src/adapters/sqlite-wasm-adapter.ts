@@ -29,6 +29,7 @@ import type {
 import { restoreDumpStatements } from './database-dump'
 import type { DatabaseDump } from './database-dump'
 import { storageChannelName as storageChannelNameFor } from './opfs-names'
+import { discardPrewarmedWorker } from './prewarmed-worker'
 import { Mutex } from './sqlite-wasm-channel'
 import type {
 	WebWorkerBridge,
@@ -348,6 +349,16 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
+		try {
+			await this.openInner(schema)
+		} catch (error) {
+			// A worker the app started for this tab is not used after a failed or refused open.
+			if (this.workerUrl) discardPrewarmedWorker(this.workerUrl)
+			throw error
+		}
+	}
+
+	private async openInner(schema: SchemaDefinition): Promise<void> {
 		if (this.opened) return
 
 		const versionGate = this.versionGate
@@ -453,6 +464,8 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			return response
 		}
 
+		// A follower uses the leader's worker: one the app started for this tab is not needed.
+		discardPrewarmedWorker(workerUrl)
 		const followerBridge = new FollowerBroadcastBridge(
 			session.channelName,
 			this.workerResponseTimeoutMs,

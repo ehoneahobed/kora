@@ -686,3 +686,79 @@ describe('Store schema migrations: atomic versions and syncing backfills (STORE-
 		await store.close().catch(() => {})
 	})
 })
+
+describe('Store open: DDL fingerprint and the one-time constraint relaxation', () => {
+	const v1 = defineSchema({
+		version: 1,
+		collections: { products: { fields: { name: t.string() } } },
+	})
+	const v2 = defineSchema({
+		version: 2,
+		collections: { products: { fields: { name: t.string(), sku: t.string().optional() } } },
+		migrations: { 2: migrate().addField('products', 'sku', t.string().optional()) },
+	})
+
+	test('a migration clears the DDL fingerprint first, so the next open applies the full DDL', async () => {
+		const dbPath = nextDbPath()
+		const first = new Store({
+			schema: v1,
+			adapter: new BetterSqlite3Adapter(dbPath),
+			nodeId: 'node-1',
+		})
+		await first.open()
+		await first.close()
+		// What the SQLite WASM worker leaves after an open (this adapter does not keep one).
+		const seed = new BetterSqlite3Adapter(dbPath)
+		await seed.open(v1)
+		await seed.execute(
+			'CREATE TABLE IF NOT EXISTS _kora_ddl_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+		)
+		await seed.execute(
+			"INSERT OR REPLACE INTO _kora_ddl_state (key, value) VALUES ('fingerprint', 'v1-ddl')",
+		)
+		await seed.close()
+
+		const adapter = new BetterSqlite3Adapter(dbPath)
+		const migrated = new Store({ schema: v2, adapter, nodeId: 'node-1' })
+		await migrated.open()
+		expect(await adapter.query('SELECT * FROM _kora_ddl_state')).toEqual([])
+		await migrated.close()
+	})
+
+	test('the same schema keeps the fingerprint', async () => {
+		const dbPath = nextDbPath()
+		const first = new Store({
+			schema: v1,
+			adapter: new BetterSqlite3Adapter(dbPath),
+			nodeId: 'node-1',
+		})
+		await first.open()
+		await first.close()
+		const seed = new BetterSqlite3Adapter(dbPath)
+		await seed.open(v1)
+		await seed.execute(
+			'CREATE TABLE IF NOT EXISTS _kora_ddl_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+		)
+		await seed.execute(
+			"INSERT OR REPLACE INTO _kora_ddl_state (key, value) VALUES ('fingerprint', 'v1-ddl')",
+		)
+		await seed.close()
+
+		const adapter = new BetterSqlite3Adapter(dbPath)
+		const reopened = new Store({ schema: v1, adapter, nodeId: 'node-1' })
+		await reopened.open()
+		expect(await adapter.query('SELECT value FROM _kora_ddl_state')).toEqual([{ value: 'v1-ddl' }])
+		await reopened.close()
+	})
+
+	test('the constraint relaxation runs until it has completed once, then is skipped', async () => {
+		const dbPath = nextDbPath()
+		const adapter = new BetterSqlite3Adapter(dbPath)
+		const store = new Store({ schema: v1, adapter, nodeId: 'node-1' })
+		await store.open()
+		expect(
+			await adapter.query("SELECT value FROM _kora_meta WHERE key = 'value_domain_relaxed'"),
+		).toEqual([{ value: '1' }])
+		await store.close()
+	})
+})

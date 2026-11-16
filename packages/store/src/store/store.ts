@@ -38,6 +38,7 @@ import {
 	notifyWriteObserver,
 	recordMatchesCollectionScope,
 } from '@korajs/core/internal'
+import { DDL_STATE_TABLE_SQL } from '../adapters/ddl-state'
 import { readBackupManifest as readManifest } from '../backup/backup'
 import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } from '../backup/types'
 import { Collection } from '../collection/collection'
@@ -501,6 +502,9 @@ function isSnapshotSuperseded(error: unknown): boolean {
 /** `_kora_meta` key prefix of a view's delivery anchor; the view signature follows it. */
 const DELIVERY_ANCHOR_META_PREFIX = 'delivery_anchor:'
 
+/** Meta key: every collection table was relaxed (RT-101); later opens skip the check. */
+const VALUE_DOMAIN_RELAXED_META_KEY = 'value_domain_relaxed'
+
 export class Store implements OperationLog {
 	private writeDurabilityFailing = false
 	private writeDurabilitySince = 0
@@ -728,6 +732,18 @@ export class Store implements OperationLog {
 			await this.adapter.close().catch(() => undefined)
 			throw this.schemaAhead(stored)
 		}
+		if (stored > 0 && stored < this.schema.version) {
+			// A migration will run (it can rebuild tables, dropping their indexes): clear the DDL
+			// fingerprint first, so the next open re-applies the full DDL even if this one stops
+			// part way (see applyDdlUnlessUnchanged in the SQLite WASM worker).
+			await this.adapter.execute(DDL_STATE_TABLE_SQL)
+			await this.adapter.execute('DELETE FROM _kora_ddl_state')
+			// A migration can bring back a table an older release wrote (a collection re-added):
+			// check every table again.
+			await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [
+				VALUE_DOMAIN_RELAXED_META_KEY,
+			])
+		}
 		if (storedFormat < KORA_STORAGE_FORMAT) {
 			// Written once per format change, by the first build that uses it; never lowered.
 			await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
@@ -762,7 +778,16 @@ export class Store implements OperationLog {
 		// Tables created before beta.13 restate enum membership and requiredness as CHECK /
 		// NOT NULL constraints that cannot evolve with the schema: rebuild them once without
 		// (RT-101). Validation is the single authority for the value domain.
-		await relaxValueDomainConstraints(this.adapter, this.schema)
+		// Once every table is relaxed it stays relaxed (this release creates no such
+		// constraints), so later opens skip reading every table's catalog. A database an earlier
+		// release wrote has no mark and is checked.
+		if ((await this.readMeta(VALUE_DOMAIN_RELAXED_META_KEY)) !== '1') {
+			await relaxValueDomainConstraints(this.adapter, this.schema)
+			await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+				VALUE_DOMAIN_RELAXED_META_KEY,
+				'1',
+			])
+		}
 		// Indexes named under the old, colliding scheme are replaced (STORE-15).
 		await dropLegacyIndexes(this.adapter, this.schema)
 
@@ -879,7 +904,6 @@ export class Store implements OperationLog {
 			)
 			this.collections.set(name, col)
 		}
-
 		await this.finishStorageEvidence(evidence, createdByThisOpen)
 	}
 

@@ -11,6 +11,7 @@ import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
 import {
 	LOG_QUARANTINE_TABLE,
+	LOG_TRUSTED_META_KEY,
 	checkOperationRow,
 	recoverTimestamp,
 	scanLogIntegrity,
@@ -182,6 +183,59 @@ describe('scanLogIntegrity', () => {
 		])
 		expect(report.clean).toBe(false)
 		expect(report.quarantined).toEqual([])
+	})
+
+	test('after one repaired scan the open-time quick scan trusts the log; the full scan still checks every row', async () => {
+		adapter = await createTestAdapter()
+		await insertRow(adapter, row({ id: 'a', sequence_number: 1, timestamp: ONCE }))
+		const first = await scanLogIntegrity(adapter, minimalSchema, {
+			mode: 'quick',
+			localNodeIds: [],
+		})
+		expect(first.repaired.map((r) => r.operationId)).toEqual(['a'])
+		const [mark] = await adapter.query<{ value: string }>(
+			'SELECT value FROM _kora_meta WHERE key = ?',
+			[LOG_TRUSTED_META_KEY],
+		)
+		expect(mark?.value).toBe('1')
+
+		// Every writer in this release stores canonical rows; a raw damaged insert (not something
+		// Kora does) is what the full check is for.
+		await insertRow(adapter, row({ id: 'raw', sequence_number: 2, timestamp: ONCE }))
+		const quick = await scanLogIntegrity(adapter, minimalSchema, {
+			mode: 'quick',
+			localNodeIds: [],
+		})
+		expect(quick.checkedRows).toBe(0)
+		const full = await scanLogIntegrity(adapter, minimalSchema, { mode: 'full', localNodeIds: [] })
+		expect(full.repaired.map((r) => r.operationId)).toEqual(['raw'])
+	})
+
+	test('a database without the mark (written or restored by an earlier release) is checked on open', async () => {
+		adapter = await createTestAdapter()
+		await scanLogIntegrity(adapter, minimalSchema, { mode: 'quick', localNodeIds: [] })
+		await adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [LOG_TRUSTED_META_KEY])
+		await insertRow(adapter, row({ id: 'beta12', timestamp: ONCE }))
+		const report = await scanLogIntegrity(adapter, minimalSchema, {
+			mode: 'quick',
+			localNodeIds: [],
+		})
+		expect(report.repaired.map((r) => r.operationId)).toEqual(['beta12'])
+	})
+
+	test('a report-only scan marks nothing: the next scan still finds what it reported', async () => {
+		adapter = await createTestAdapter()
+		await insertRow(adapter, row({ id: 'damaged', timestamp: ONCE }))
+		await scanLogIntegrity(adapter, minimalSchema, {
+			mode: 'quick',
+			repair: false,
+			localNodeIds: [],
+		})
+		const report = await scanLogIntegrity(adapter, minimalSchema, {
+			mode: 'quick',
+			localNodeIds: [],
+		})
+		expect(report.repaired.map((r) => r.operationId)).toEqual(['damaged'])
 	})
 
 	test('a canonical log is clean', async () => {

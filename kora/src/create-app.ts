@@ -1,9 +1,10 @@
 import {
+	KoraError,
 	OFFLINE_STATUS_OPENING,
 	OFFLINE_STATUS_SERVER_RENDER,
 	OFFLINE_STATUS_UNKNOWN,
-} from '@korajs/core/bindings'
-import { KoraError, type SchemaInput } from '@korajs/core/lite'
+	type SchemaInput,
+} from '@korajs/core/lite'
 import { SimpleEventEmitter, currentWriteObserver, runWithWriteObserver } from '@korajs/core/lite'
 import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store/lite'
@@ -32,6 +33,43 @@ import type {
 } from './types'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
 import { publishWritesSignal } from './writes-signal'
+
+/**
+ * Start the SQLite WASM worker while the runtime chunk loads: it loads SQLite (WASM download and
+ * compile) in parallel instead of after the version gate and the tab election, and touches no
+ * storage until the adapter, if this tab leads the database, sends it the open (an unclaimed
+ * worker is stopped). Only where that adapter will be chosen (see detectAdapterType).
+ */
+function prewarmStorageWorker(config: KoraConfig): void {
+	const url = config.store?.workerUrl
+	const g = globalThis as Record<string | symbol, unknown>
+	if (
+		!url ||
+		(config.store?.adapter ?? 'sqlite-wasm') !== 'sqlite-wasm' ||
+		typeof Worker === 'undefined' ||
+		g.FileSystemHandle === undefined ||
+		g.__TAURI_INTERNALS__ !== undefined
+	) {
+		return
+	}
+	try {
+		const key = Symbol.for('kora.prewarmedSqliteWorkers')
+		const workers = (g[key] ??= new Map<string, Worker>()) as Map<string, Worker>
+		const href = new URL(String(url), globalThis.location?.href).href
+		if (workers.has(href)) return
+		const worker = new Worker(href, { type: 'module' })
+		workers.set(href, worker)
+		// Never claimed (no store opened it): stop it rather than keep SQLite in memory.
+		setTimeout(() => {
+			if (workers.get(href) === worker) {
+				workers.delete(href)
+				worker.terminate()
+			}
+		}, 60_000)
+	} catch {
+		// The adapter creates its own worker as before.
+	}
+}
 
 /**
  * Creates a new Kora application instance.
@@ -205,14 +243,21 @@ export function createApp<const S extends SchemaInput>(
 	const start = (): Promise<void> => {
 		if (inertFailure) return inertFailure
 		if (started) return started
+		prewarmStorageWorker(config)
 		const attempt = (async () => {
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
-			const { createRuntimeApp } = await loadRuntimeModule()
 			// Production builds do not validate at `createApp` (the validator is not registered):
 			// the same checks run here, from their own chunk, and a bad option ends `ready` with
-			// the error naming it. Development already threw it at the call.
-			if (!(globalThis as ConfigValidatorSlot)[CONFIG_VALIDATOR_SLOT]) {
-				const { validateCreateAppConfig } = await import('./validate-config')
+			// the error naming it. Development already threw it at the call. The two chunks load
+			// at the same time (one after the other cost a second round trip on every start).
+			const needsValidation = !(globalThis as ConfigValidatorSlot)[CONFIG_VALIDATOR_SLOT]
+			const validation = needsValidation ? import('./validate-config') : null
+			// Settled on its own so a failed validator chunk is reported after the runtime's own
+			// failure handling, not as an unhandled rejection.
+			validation?.catch(() => undefined)
+			const { createRuntimeApp } = await loadRuntimeModule()
+			if (validation) {
+				const { validateCreateAppConfig } = await validation
 				validateCreateAppConfig(config)
 			}
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')

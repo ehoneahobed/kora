@@ -1,5 +1,6 @@
-/// <reference lib="dom" />
 import { BridgeTerminatedError, RequestAbortedError, WorkerTimeoutError } from '../errors'
+/// <reference lib="dom" />
+import { takePrewarmedWorker } from './prewarmed-worker'
 
 // === Message Protocol ===
 
@@ -175,7 +176,8 @@ export class WebWorkerBridge implements WorkerBridge {
 	 */
 	constructor(workerUrl: string | URL, timeoutMs = 30000, options: WebWorkerBridgeOptions = {}) {
 		this.timeoutMs = timeoutMs
-		this.worker = new Worker(workerUrl, { type: 'module' })
+		// A worker the app started early (already loading SQLite) is used when there is one.
+		this.worker = takePrewarmedWorker(workerUrl) ?? new Worker(workerUrl, { type: 'module' })
 		this.worker.onmessage = (event: MessageEvent<WorkerResponse | WorkerEventMessage>) => {
 			const message = event.data
 			if (message.type === 'event') {

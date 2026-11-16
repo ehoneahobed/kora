@@ -19,11 +19,14 @@ import type {
 	WorkerInboundMessage,
 	WorkerResponse,
 } from './sqlite-wasm-channel'
-import { createSqliteWasmCore } from './sqlite-wasm-worker-core'
+import { createSqliteWasmCore, prewarmSqlite3 } from './sqlite-wasm-worker-core'
 
 declare const self: DedicatedWorkerGlobalScope
 
 let relay: WorkerRpcRelay | null = null
+
+// Load SQLite while the page decides whether this tab leads the database (see prewarm-worker).
+prewarmSqlite3()
 
 const core = createSqliteWasmCore({
 	postEvent: (event) => {

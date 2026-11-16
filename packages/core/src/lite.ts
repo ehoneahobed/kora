@@ -26,3 +26,8 @@ export { preReadyWritesAllowed, runAllowingPreReadyWrites } from './writes/pre-r
 export { buildScopeMap } from './scopes/build-scope-map'
 export { extractScopeValuesFromClaims } from './scopes/extract-scope-from-claims'
 export type { SchemaInput } from './schema/define'
+export {
+	OFFLINE_STATUS_OPENING,
+	OFFLINE_STATUS_SERVER_RENDER,
+	OFFLINE_STATUS_UNKNOWN,
+} from './offline/offline-status-constants'
