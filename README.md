@@ -55,7 +55,7 @@ cd my-app
 pnpm dev
 ```
 
-Choose from 13 templates across React, Vue, Svelte and Tauri, each with and without sync (the web ones with or without Tailwind). The recommended default is **React + Tailwind with a SQLite sync server**. Skip the prompts with `--yes`. The [Getting Started](https://ehoneahobed.github.io/kora/getting-started) tutorial walks through a scaffolded app.
+Choose from 13 templates: React, Vue and Svelte, each with and without sync and with or without Tailwind, plus a Tauri desktop template (React). The recommended default is **React + Tailwind with a SQLite sync server**. Skip the prompts with `--yes`. The [Getting Started](https://korajs.dev/getting-started) tutorial walks through a scaffolded app.
 
 ### Or start from scratch
 
@@ -113,7 +113,7 @@ Without `autoConnect: true`, call `await app.sync?.connect()` after `app.ready`.
 kora deploy
 ```
 
-Generates a Dockerfile, bundles your server, builds your client, and deploys to Fly.io, Railway or AWS. See the [Deployment guide](https://ehoneahobed.github.io/kora/guide/deployment).
+Generates a Dockerfile, bundles your server, builds your client, and deploys to Fly.io, Railway or AWS. See the [Deployment guide](https://korajs.dev/guide/deployment).
 
 ### React hooks
 
@@ -190,6 +190,7 @@ packages/
   svelte/           @korajs/svelte     Svelte stores
   tauri/            @korajs/tauri      Tauri desktop integration
   auth/             @korajs/auth       Authentication, sessions, MFA, RBAC
+  spaces/           @korajs/spaces     Sharing: invitations, roles, members (new in beta.15)
   devtools/         @korajs/devtools   Browser DevTools extension
   cli/              @korajs/cli        CLI tooling, templates, scaffolding
   create-kora-app/  create-kora-app    npx entry point (delegates to the CLI)
@@ -405,7 +406,7 @@ server.start().then(() => {
 ```
 
 For anything beyond a test, use `createProductionServer` with a SQLite or Postgres store and an
-auth provider: see [Production Server](https://ehoneahobed.github.io/kora/guide/production-server).
+auth provider: see [Production Server](https://korajs.dev/guide/production-server).
 Then each tester's app points to the deployed URL: `sync: { url: 'wss://your-server.example.com', autoConnect: true }`.
 
 **Option D: Quick remote testing with ngrok**
@@ -443,19 +444,19 @@ Share the web app tunnel URL. Testers open it in their browsers and their change
 
 ## Documentation
 
-Full documentation is available at **[ehoneahobed.github.io/kora](https://ehoneahobed.github.io/kora/)**.
+Full documentation is available at **[korajs.dev](https://korajs.dev/)**.
 
 Covers:
-- [Getting Started](https://ehoneahobed.github.io/kora/getting-started): a scaffolded app, a migration, the core API
-- [Upgrading to beta.13](https://ehoneahobed.github.io/kora/guide/upgrading-to-beta13): every breaking change from 1.0.0-beta.12 and the code change it needs
-- [Schema Design](https://ehoneahobed.github.io/kora/guide/schema-design): field types, the value domain, relations, migrations
-- [Conflict Resolution](https://ehoneahobed.github.io/kora/guide/conflict-resolution): the per-field fold, constraints, resolvers
-- [Sync Configuration](https://ehoneahobed.github.io/kora/guide/sync-configuration) and [Sync Protocol](https://ehoneahobed.github.io/kora/guide/sync-protocol)
-- [Storage Configuration](https://ehoneahobed.github.io/kora/guide/storage-configuration): OPFS, IndexedDB, multi-tab, persistence
-- [Authentication](https://ehoneahobed.github.io/kora/guide/authentication) and [Sync Encryption](https://ehoneahobed.github.io/kora/guide/sync-encryption)
-- [Production Server](https://ehoneahobed.github.io/kora/guide/production-server) and [Deployment](https://ehoneahobed.github.io/kora/guide/deployment)
-- [Error Codes](https://ehoneahobed.github.io/kora/api/errors): every error code with cause and fix
-- [API Reference](https://ehoneahobed.github.io/kora/api/): every package
+- [Getting Started](https://korajs.dev/getting-started): a scaffolded app, a migration, the core API
+- [Upgrading to beta.13](https://korajs.dev/guide/upgrading-to-beta13): every breaking change from 1.0.0-beta.12 and the code change it needs
+- [Schema Design](https://korajs.dev/guide/schema-design): field types, the value domain, relations, migrations
+- [Conflict Resolution](https://korajs.dev/guide/conflict-resolution): the per-field fold, constraints, resolvers
+- [Sync Configuration](https://korajs.dev/guide/sync-configuration) and [Sync Protocol](https://korajs.dev/guide/sync-protocol)
+- [Storage Configuration](https://korajs.dev/guide/storage-configuration): OPFS, IndexedDB, multi-tab, persistence
+- [Authentication](https://korajs.dev/guide/authentication) and [Sync Encryption](https://korajs.dev/guide/sync-encryption)
+- [Production Server](https://korajs.dev/guide/production-server) and [Deployment](https://korajs.dev/guide/deployment)
+- [Error Codes](https://korajs.dev/api/errors): every error code with cause and fix
+- [API Reference](https://korajs.dev/api/): every package
 
 To run docs locally: `pnpm docs:dev`
 
