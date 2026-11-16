@@ -55,7 +55,8 @@ export class QueryBuilder<T = CollectionRecord> {
 	}
 
 	/**
-	 * Add WHERE conditions (AND semantics, merged with existing conditions).
+	 * Add WHERE conditions (AND semantics). Conditions on new fields are added to the
+	 * existing ones; a condition on a field that already has one replaces it.
 	 *
 	 * A field whose value is `undefined` adds no condition (it does not remove an
 	 * earlier one); `null` matches missing values (`IS NULL`). Non-finite numbers are
@@ -151,8 +152,8 @@ export class QueryBuilder<T = CollectionRecord> {
 	}
 
 	/**
-	 * Subscribe to query results. Callback is called immediately with current results,
-	 * then again whenever the results change due to mutations.
+	 * Subscribe to query results. The callback is called with the current results once the
+	 * initial query resolves (asynchronously), then again whenever the results change.
 	 *
 	 * @returns An unsubscribe function
 	 */

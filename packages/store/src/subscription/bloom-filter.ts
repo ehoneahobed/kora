@@ -5,7 +5,7 @@
  * mutation might affect any subscription requires scanning all subscriptions.
  * This bloom filter provides a fast O(k) pre-check: if the filter says "definitely
  * not present", we can skip the subscription entirely. If it says "maybe present",
- * we fall through to the precise collection/field matching.
+ * we fall through to the precise per-subscription collection matching.
  *
  * Uses FNV-1a for hashing and Kirsch-Mitzenmacker double hashing to derive k
  * hash functions from two base hashes.
@@ -19,7 +19,7 @@ const FNV_PRIME = 0x01000193
  * Compute FNV-1a 32-bit hash of a string.
  *
  * FNV-1a is a non-cryptographic hash function optimized for speed and distribution.
- * It processes one byte at a time: XOR then multiply, which gives better avalanche
+ * It processes one UTF-16 code unit at a time: XOR then multiply, which gives better avalanche
  * behavior than the original FNV-1 (multiply then XOR).
  *
  * @param input - The string to hash
