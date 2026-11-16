@@ -2927,8 +2927,10 @@ export class ClientSession {
 			const userId =
 				this.authContext && this.authContext.anonymous !== true ? this.authContext.userId : null
 			this.accessPrincipal = { userId }
-			if (msg.lastDeliverySequence === undefined) {
+			if (deliveryWatermarkField(msg.lastDeliverySequence) === null) {
 				// Re-scoping rides on the gap-free delivery stream (watermark clients only).
+				// A `null` (or any non-count) must not pass: it would fall back to the
+				// version-vector delta, which never applies the access history gate.
 				this.sendError(
 					'CLIENT_TOO_OLD',
 					'This server enforces access rules, which need the delivery watermark. Upgrade the app to Kora 1.0.0-beta.15 or later.',
@@ -3037,7 +3039,7 @@ export class ClientSession {
 		}
 
 		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
-		this.clientDeliveryWatermark = msg.lastDeliverySequence ?? null
+		this.clientDeliveryWatermark = deliveryWatermarkField(msg.lastDeliverySequence)
 		// The anchor that goes with whichever watermark this session resumes from.
 		let clientDeliveryAnchor = deliveryAnchorField(msg.lastDeliveryAnchor)
 		this.clientAccessRulesKey = typeof msg.accessRulesKey === 'string' ? msg.accessRulesKey : null
@@ -7609,4 +7611,12 @@ function endUnit(unit: DeliverableOperation[]): void {
 /** A reported delivery anchor, or null when absent or not an operation id. */
 function deliveryAnchorField(value: unknown): string | null {
 	return typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : null
+}
+
+/**
+ * A reported delivery watermark, or null when absent or not a non-negative safe integer
+ * (the decoder does not check the field: a `null` or a string must not count as one).
+ */
+function deliveryWatermarkField(value: unknown): number | null {
+	return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
 }

@@ -310,6 +310,22 @@ describe('access rules enforcement', () => {
 		expect(error && 'code' in error ? error.code : null).toBe('CLIENT_TOO_OLD')
 	})
 
+	test('a null or non-count watermark does not pass for one (no version-vector history)', async () => {
+		const harness = await createHarness(schema, auth)
+		for (const [user, node, value] of [
+			['ann', 'ann-node', null],
+			['bob', 'bob-node', '5'],
+			['ann', 'ann-node-2', -1],
+		] as const) {
+			const client = await harness.login(user, node, {
+				supportsScopeDisjunction: true,
+				lastDeliverySequence: value,
+			} as unknown as Partial<SyncMessage>)
+			const error = client.messages.find((m) => m.type === 'error')
+			expect(error && 'code' in error ? error.code : null).toBe('CLIENT_TOO_OLD')
+		}
+	})
+
 	test('writes that look empty still need a rule (restore, atomic intents, no-op updates)', async () => {
 		const { harness, ann } = await setup()
 		const bob = await harness.login('bob', 'bob-node', CAPABLE)
