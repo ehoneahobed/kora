@@ -1213,9 +1213,16 @@ async function runCell(
 			// changed scope) re-bases positions and markers together, so for these droppers the row
 			// is compared by its ORDER against every marker (before, at, after), which is what the
 			// replay reads; every other column and every other dropper compare exactly.
+			// Registering a query subset switches the delivery view like a scope change (it drops
+			// a staged stream and resyncs the new view), so it re-bases too. Since #167 added
+			// yields inside staged apply it can land mid-apply, where it re-bases a quarantined row
+			// (position 0 instead of 66 in quarantinedStaged at adapter.transaction:ret).
 			const rebased =
 				field === 'quarantine' &&
-				(dropper === 'fullResync' || dropper === 'unsubscribe' || dropper === 'updateScope')
+				(dropper === 'fullResync' ||
+					dropper === 'unsubscribe' ||
+					dropper === 'updateScope' ||
+					dropper === 'registerSubset')
 			const view = (device: DeviceState): string =>
 				JSON.stringify(device[field], (key, value: unknown) => {
 					if (!rebased || key !== 'position') return value
