@@ -88,15 +88,6 @@ function getSqlite3(): Promise<Sqlite3Api> {
 	return sqlite3Promise
 }
 
-/**
- * Start loading SQLite now (the WASM download and compile), before any request: a worker is
- * created only to serve a database, and the load is the longest step of its first open.
- * Touches no storage. A failed load is retried by the first open.
- */
-export function prewarmSqlite3(): void {
-	void getSqlite3().catch(() => undefined)
-}
-
 /** Options for {@link createSqliteWasmCore}. */
 export interface SqliteWasmCoreOptions {
 	/** Posts unsolicited status (blocking state) to the tab that owns this worker. */
