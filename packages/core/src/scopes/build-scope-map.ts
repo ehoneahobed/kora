@@ -1,6 +1,5 @@
 import type { SchemaDefinition } from '../types'
 import {
-	collectSchemaScopeValueKeys,
 	getCollectionScopeBindings,
 	hasSchemaSyncRules,
 	isCollectionSyncScoped,

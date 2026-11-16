@@ -8,7 +8,6 @@ import type {
 	Constraint,
 	CustomResolver,
 	FieldDescriptor,
-	RelationDefinition,
 	SchemaDefinition,
 	StateMachineDefinition,
 	SyncRuleDefinition,

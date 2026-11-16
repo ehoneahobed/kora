@@ -1,11 +1,11 @@
 import { KoraError } from '../errors/errors'
-import type { CollectionDefinition, RelationDefinition, SchemaDefinition } from '../types'
+import type { CollectionDefinition, SchemaDefinition } from '../types'
 import {
 	ACCESS_COMPILER_SLOT,
 	type AccessCompileArgs,
 	type AccessCompilerSlot,
 } from './access-slot-key'
-import type { AccessConfigInput, AccessDefinition, CollectionAccessInput } from './define-access'
+import type { AccessConfigInput, CollectionAccessInput } from './define-access'
 
 /**
  * Thrown when `schema.access` is read before anything that can compile it has loaded.
