@@ -71,4 +71,23 @@ describe('KoraRichText', () => {
 			expect(getByTestId('value').textContent).toBe('Hello')
 		})
 	})
+
+	it('gives the snippet the unsaved-changes API of useRichText', async () => {
+		const helloBody = encodeText('Hello')
+		const notes = {
+			findById: vi.fn(async () => ({ id: 'rec-1', body: helloBody })),
+			update: vi.fn(),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: helloBody }])),
+		} as unknown as CollectionAccessor
+
+		const { getByTestId } = render(RichTextFlow, { props: { store: createMockStore({ notes }) } })
+
+		await waitFor(() => {
+			expect(getByTestId('value').textContent).toBe('Hello')
+		})
+		expect(getByTestId('unsaved').textContent).toBe('false')
+		expect(getByTestId('save-api').textContent).toBe('function/function')
+	})
 })

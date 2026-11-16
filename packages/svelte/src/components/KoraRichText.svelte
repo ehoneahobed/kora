@@ -72,6 +72,9 @@ $effect(() => {
 			cursors: [...snapshot.cursors],
 			setCursor: (anchor, head) => controller.setCursor(anchor, head),
 			clearCursor: () => controller.clearCursor(),
+			hasUnsavedChanges: snapshot.hasUnsavedChanges,
+			retrySave: () => controller.retrySave(),
+			getUnsavedState: () => controller.getUnsavedState(),
 		}
 	}
 
