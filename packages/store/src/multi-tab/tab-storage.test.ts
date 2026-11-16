@@ -12,6 +12,7 @@ type ChannelHandler = (event: { data: unknown }) => void
 class MockBroadcastChannel {
 	static channels = new Map<string, Set<MockBroadcastChannel>>()
 	private readonly handlers = new Set<ChannelHandler>()
+	private closed = false
 
 	constructor(public readonly name: string) {
 		const set = MockBroadcastChannel.channels.get(name) ?? new Set()
@@ -20,6 +21,8 @@ class MockBroadcastChannel {
 	}
 
 	postMessage(data: unknown): void {
+		// Like a real BroadcastChannel: posting on a closed channel throws.
+		if (this.closed) throw new DOMException('BroadcastChannel is closed', 'InvalidStateError')
 		const set = MockBroadcastChannel.channels.get(this.name) ?? new Set()
 		for (const peer of set) {
 			if (peer !== this) {
@@ -39,6 +42,7 @@ class MockBroadcastChannel {
 	}
 
 	close(): void {
+		this.closed = true
 		const set = MockBroadcastChannel.channels.get(this.name)
 		set?.delete(this)
 	}
@@ -457,6 +461,58 @@ describe('multi-tab tab storage RPC', () => {
 			follower.terminate()
 			stopServing()
 			stopRelay()
+		})
+
+		test('a relayed request that settles after the relay stopped is not answered (no throw on the closed channel)', async () => {
+			const channelName = 'kora-storage-relay-stopped-db'
+			let answer: (response: { id: number; type: 'success' }) => void = () => {}
+			const worker = {
+				send: vi.fn(
+					() =>
+						new Promise<{ id: number; type: 'success' }>((resolve) => {
+							answer = resolve
+						}),
+				),
+				terminate: vi.fn(),
+			}
+			const stopRelay = startLeaderRpcRelay(channelName, worker)
+			const follower = new MockBroadcastChannel(channelName)
+			follower.postMessage({
+				type: 'kora-worker-request',
+				requestId: 'r1',
+				clientId: 'c1',
+				request: { id: 1, type: 'query', sql: 'SELECT 1' },
+			})
+			expect(worker.send).toHaveBeenCalledOnce()
+
+			stopRelay()
+			answer({ id: 1, type: 'success' })
+			await Promise.resolve()
+			await Promise.resolve()
+			await Promise.resolve()
+			follower.close()
+		})
+
+		test('a barrier that settles after the leader stopped serving is not answered (no throw on the closed channel)', async () => {
+			const channelName = 'kora-storage-barrier-stopped-db'
+			let finish: () => void = () => {}
+			const run = vi.fn(
+				() =>
+					new Promise<void>((resolve) => {
+						finish = resolve
+					}),
+			)
+			const stopServing = serveSnapshotBarriers(channelName, run)
+			const follower = new MockBroadcastChannel(channelName)
+			follower.postMessage({ type: 'kora-snapshot-barrier-request', requestId: 'r1' })
+			expect(run).toHaveBeenCalledOnce()
+
+			stopServing()
+			finish()
+			// Let the run's continuation (which used to post on the closed channel) execute.
+			await Promise.resolve()
+			await Promise.resolve()
+			follower.close()
 		})
 
 		test("carry the leader's failure (code, message, quota) back to the follower", async () => {
