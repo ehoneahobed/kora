@@ -1,5 +1,5 @@
 import type { Operation, SchemaDefinition } from '@korajs/core'
-import { quoteIdent } from '@korajs/core'
+import { KoraError, quoteIdent } from '@korajs/core'
 import { deserializeOperationWithCollection } from '../serialization/serializer'
 import type { StorageAdapter } from '../types'
 import type { OperationRow } from '../types'
@@ -216,7 +216,7 @@ export function readAuditExportManifest(data: Uint8Array): AuditExportManifest {
 	const sections = parseSections(data)
 	const manifestContent = findSection(sections, 'manifest')
 	if (!manifestContent) {
-		throw new Error('Invalid audit export: missing manifest section')
+		throw new KoraError('Invalid audit export: missing manifest section', 'INVALID_AUDIT_EXPORT')
 	}
 	return JSON.parse(new TextDecoder().decode(manifestContent)) as AuditExportManifest
 }

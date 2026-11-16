@@ -1,3 +1,4 @@
+import { KoraError } from '@korajs/core'
 import * as Y from 'yjs'
 import {
 	type KoraBytesValue,
@@ -49,7 +50,10 @@ export function encodeRichtext(value: RichtextInput | KoraBytesValue): Uint8Arra
 		return decoded instanceof Uint8Array ? decoded : null
 	}
 
-	throw new Error('Richtext value must be a string, Uint8Array, ArrayBuffer, null, or undefined.')
+	throw new KoraError(
+		'Richtext value must be a string, Uint8Array, ArrayBuffer, null, or undefined.',
+		'INVALID_RICHTEXT_VALUE',
+	)
 }
 
 /**
@@ -72,8 +76,9 @@ export function decodeRichtext(value: unknown): Uint8Array | null {
 		return new Uint8Array(value)
 	}
 
-	throw new Error(
+	throw new KoraError(
 		'Richtext storage value must be Uint8Array, ArrayBuffer, Buffer, null, or undefined.',
+		'INVALID_RICHTEXT_VALUE',
 	)
 }
 

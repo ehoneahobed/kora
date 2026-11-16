@@ -1,5 +1,7 @@
 /// <reference lib="dom" />
 
+import { PersistenceError } from '../errors'
+
 const DEFAULT_DEBOUNCE_MS = 500
 
 /** What a snapshot write is told about the snapshot it takes. */
@@ -152,7 +154,9 @@ export class IndexedDbPersistenceScheduler {
 		const target = this.scheduledGeneration
 		if (this.strictGeneration >= target) return
 		if (this.disposed) {
-			throw new Error('IndexedDB persistence was disposed before the writes were persisted')
+			throw new PersistenceError(
+				'IndexedDB persistence was disposed before the writes were persisted',
+			)
 		}
 		if (this.timer !== null) {
 			clearTimeout(this.timer)
@@ -177,7 +181,7 @@ export class IndexedDbPersistenceScheduler {
 		if (this.strictGeneration < target) {
 			throw this.lastFlushError instanceof Error
 				? this.lastFlushError
-				: new Error('IndexedDB snapshot was not persisted')
+				: new PersistenceError('IndexedDB snapshot was not persisted')
 		}
 	}
 

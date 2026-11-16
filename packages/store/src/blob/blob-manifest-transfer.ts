@@ -1,4 +1,4 @@
-import { type BlobRef, type BlobRefMetadata, hashBlob } from '@korajs/core'
+import { type BlobRef, type BlobRefMetadata, KoraError, hashBlob } from '@korajs/core'
 import { type BlobManifest, chunkBlob } from './blob-chunking'
 import type { ChunkProvider } from './blob-transfer'
 import { BlobTransferError } from './blob-transfer-error'
@@ -34,17 +34,20 @@ export function serializeBlobManifest(manifest: BlobManifest): Uint8Array {
 export function parseBlobManifest(bytes: Uint8Array): BlobManifest {
 	const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes))
 	if (typeof parsed !== 'object' || parsed === null) {
-		throw new Error('Invalid blob manifest: not an object')
+		throw new KoraError('Invalid blob manifest: not an object', 'INVALID_BLOB_MANIFEST')
 	}
 	const obj = parsed as Record<string, unknown>
 	if (typeof obj.blobHash !== 'string') {
-		throw new Error('Invalid blob manifest: missing blobHash')
+		throw new KoraError('Invalid blob manifest: missing blobHash', 'INVALID_BLOB_MANIFEST')
 	}
 	if (typeof obj.size !== 'number' || typeof obj.chunkSize !== 'number') {
-		throw new Error('Invalid blob manifest: missing size or chunkSize')
+		throw new KoraError('Invalid blob manifest: missing size or chunkSize', 'INVALID_BLOB_MANIFEST')
 	}
 	if (!Array.isArray(obj.chunkHashes) || obj.chunkHashes.some((h) => typeof h !== 'string')) {
-		throw new Error('Invalid blob manifest: chunkHashes must be an array of strings')
+		throw new KoraError(
+			'Invalid blob manifest: chunkHashes must be an array of strings',
+			'INVALID_BLOB_MANIFEST',
+		)
 	}
 	const manifest: BlobManifest = {
 		blobHash: obj.blobHash,
@@ -137,15 +140,17 @@ export async function fetchBlobManifest(
  * {@link putBlobForTransfer}. Fetches and verifies the manifest by the ref's
  * `manifestHash`.
  *
- * @throws {Error} If the ref has no `manifestHash` (it was not stored for transfer)
+ * @throws {KoraError} `BLOB_MANIFEST_MISSING` if the ref has no `manifestHash` (it was not stored for transfer)
  */
 export async function resolveBlobManifest(
 	provider: ChunkProvider,
 	ref: BlobRef,
 ): Promise<BlobManifest> {
 	if (ref.manifestHash === undefined) {
-		throw new Error(
+		throw new KoraError(
 			`Blob ${ref.hash} has no manifest to resolve. Store it with putBlobForTransfer (or app.blobs.put) so its reference carries a manifestHash, or pull with an explicit manifest.`,
+			'BLOB_MANIFEST_MISSING',
+			{ blobHash: ref.hash },
 		)
 	}
 	return fetchBlobManifest(provider, ref.manifestHash)

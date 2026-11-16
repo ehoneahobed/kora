@@ -1,3 +1,4 @@
+import { AdapterError } from '../errors'
 import type { StorageAdapter, Transaction } from '../types'
 
 interface SequenceRow {
@@ -25,7 +26,10 @@ export async function allocateNextSequenceInTransaction(
 	)
 	const seq = rows[0]?.sequence_number
 	if (seq === undefined) {
-		throw new Error(`Failed to allocate sequence number for node "${nodeId}" in transaction`)
+		throw new AdapterError(
+			`Failed to allocate sequence number for node "${nodeId}" in transaction`,
+			{ nodeId },
+		)
 	}
 	return seq
 }

@@ -1072,20 +1072,24 @@ export class Store implements OperationLog {
 	/**
 	 * Get a Collection instance for CRUD operations.
 	 * @throws {StoreNotOpenError} If the store is not open
-	 * @throws {Error} If the collection name is not in the schema
+	 * @throws {KoraError} `UNKNOWN_COLLECTION` if the collection name is not in the schema
 	 */
 	collection(name: string): CollectionAccessor {
 		this.ensureOpen()
 		const col = this.collections.get(name)
 		if (!col) {
-			throw new Error(
+			throw new KoraError(
 				`Unknown collection "${name}". Available: ${[...this.collections.keys()].join(', ')}`,
+				'UNKNOWN_COLLECTION',
+				{ collection: name },
 			)
 		}
 
 		const definition = this.schema.collections[name]
 		if (!definition) {
-			throw new Error(`Collection definition not found for "${name}"`)
+			throw new KoraError(`Collection definition not found for "${name}"`, 'UNKNOWN_COLLECTION', {
+				collection: name,
+			})
 		}
 
 		const gate = this.writeGate
