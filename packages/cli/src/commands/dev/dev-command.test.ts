@@ -185,6 +185,20 @@ describe('dev command', () => {
 		expect(processManagerSpawnMock).toHaveBeenCalledWith(expect.objectContaining({ label: 'vite' }))
 	})
 
+	test('says sync is disabled by kora.config.ts, not --no-sync, when the config turns it off', async () => {
+		const { devCommand } = await import('./dev-command')
+		findProjectRootMock.mockResolvedValue(tempDir.path)
+		findSchemaFileMock.mockResolvedValue(null)
+		loadKoraConfigMock.mockResolvedValue({ dev: { sync: false } })
+		const logger = createLoggerMock()
+		logger.step.mockClear()
+
+		await devCommand.run({ args: defaultArgs() })
+
+		expect(logger.step).toHaveBeenCalledWith('  Sync server disabled in kora.config.ts')
+		expect(logger.step).not.toHaveBeenCalledWith('  Sync server disabled via --no-sync')
+	})
+
 	test('--no-watch skips schema watcher startup', async () => {
 		const { devCommand } = await import('./dev-command')
 		findProjectRootMock.mockResolvedValue(tempDir.path)

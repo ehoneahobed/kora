@@ -8,5 +8,6 @@ export default defineConfig({
 			enabled: true,
 			debounceMs: 300,
 		},
+		sync: false,
 	},
 })
