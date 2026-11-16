@@ -2211,7 +2211,9 @@ export class SyncEngine {
 	/** Atomically replace the manifest used by static query-subset mode. */
 	setQuerySubsets(subsets: SyncQuerySubset[]): void {
 		if ((this.config.querySubsets?.mode ?? 'reactive') !== 'static')
-			throw new Error('setQuerySubsets() requires sync.querySubsets.mode = "static"')
+			throw new SyncError('setQuerySubsets() requires sync.querySubsets.mode = "static"', {
+				mode: this.config.querySubsets?.mode ?? 'reactive',
+			})
 		const previousSignature = this.deliverySignature()
 		const previousEffective = this.getActiveQuerySubsets()
 		this.staticQuerySubsets = dedupeQuerySubsets(subsets)
@@ -4237,7 +4239,9 @@ export class SyncEngine {
 			if (moved()) return stale()
 			try {
 				if (!this.store.applyCollectionNarrowing) {
-					throw new Error('The configured sync store does not support access narrowing')
+					throw new SyncError('The configured sync store does not support access narrowing', {
+						collection,
+					})
 				}
 				const hidden = await this.store.applyCollectionNarrowing(
 					collection,
@@ -5739,7 +5743,7 @@ export class SyncEngine {
 	): Promise<void> {
 		if (applyToStore) {
 			if (!this.store.applyScopeRetraction) {
-				throw new Error('The configured sync store does not support scope retractions')
+				throw new SyncError('The configured sync store does not support scope retractions')
 			}
 			// The hide waits for the database (an unbounded wait while a transaction is open): the
 			// store asks, inside its own transaction and before it writes, whether the delivery

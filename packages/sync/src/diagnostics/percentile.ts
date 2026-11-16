@@ -1,3 +1,5 @@
+import { SyncError } from '@korajs/core'
+
 /**
  * Sliding window percentile calculator.
  *
@@ -18,7 +20,9 @@ export class SlidingWindowPercentile {
 	 */
 	constructor(maxSize: number) {
 		if (maxSize < 1) {
-			throw new Error(`SlidingWindowPercentile maxSize must be >= 1, got ${maxSize}`)
+			throw new SyncError(`SlidingWindowPercentile maxSize must be >= 1, got ${maxSize}`, {
+				maxSize,
+			})
 		}
 		this.maxSize = maxSize
 		this.samples = new Array<number>(maxSize)
