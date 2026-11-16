@@ -1,4 +1,5 @@
 import { createPendingStore } from '@korajs/core/bindings'
+import { KoraError } from '@korajs/core/lite'
 import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store/lite'
 import type { SyncEngine } from '@korajs/sync'
@@ -121,9 +122,10 @@ function KoraProvider({
 	}
 
 	if (!contextValue) {
-		throw new Error(
+		throw new KoraError(
 			'KoraProvider requires either an "app" or "store" prop. ' +
 				'Pass a KoraApp from createApp() or a Store instance.',
+			'KORA_NOT_PROVIDED',
 		)
 	}
 
@@ -133,9 +135,10 @@ function KoraProvider({
 function useKoraContext(): KoraContextValue {
 	const context = useContext(KoraContext)
 	if (context === null) {
-		throw new Error(
+		throw new KoraError(
 			'useKoraContext must be used within a <KoraProvider>. ' +
-				'Wrap your component tree with <KoraProvider store={store}>.',
+				'Wrap your component tree with <KoraProvider app={app}>.',
+			'KORA_NOT_PROVIDED',
 		)
 	}
 	return context

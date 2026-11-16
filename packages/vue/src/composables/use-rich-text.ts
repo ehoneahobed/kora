@@ -1,4 +1,5 @@
 import { isPendingStore } from '@korajs/core/bindings'
+import { KoraError } from '@korajs/core/lite'
 import { asRichTextSyncEngine, createRichTextController } from '@korajs/store'
 import type { CollectionAccessor } from '@korajs/store'
 import type { AwarenessUser } from '@korajs/sync'
@@ -93,7 +94,10 @@ export function useRichText(
 
 	const controller = (): NonNullable<typeof controllerRef.value> => {
 		if (!controllerRef.value) {
-			throw new Error('useRichText controller is not initialized')
+			throw new KoraError(
+				'useRichText() has no editor binding: its component scope was disposed.',
+				'RICHTEXT_NOT_BOUND',
+			)
 		}
 		return controllerRef.value
 	}

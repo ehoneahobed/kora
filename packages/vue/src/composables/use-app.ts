@@ -1,3 +1,4 @@
+import { KoraError } from '@korajs/core/lite'
 import { useKoraContext } from '../context'
 import type { KoraAppLike } from '../types'
 
@@ -7,8 +8,9 @@ import type { KoraAppLike } from '../types'
 export function useApp<T extends KoraAppLike = KoraAppLike>(): T {
 	const { app } = useKoraContext()
 	if (!app) {
-		throw new Error(
+		throw new KoraError(
 			'useApp() requires <KoraProvider :app="app">. Pass your createApp() result to the provider.',
+			'KORA_NOT_PROVIDED',
 		)
 	}
 	return app as T

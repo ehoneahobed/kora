@@ -1,4 +1,5 @@
 import { createPendingStore } from '@korajs/core/bindings'
+import { KoraError } from '@korajs/core/lite'
 import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store/lite'
 import type { SyncEngine } from '@korajs/sync'
@@ -163,8 +164,9 @@ export const KoraProvider = defineComponent({
 			}
 
 			if (!resolvedStore.value && !renderEarly()) {
-				throw new Error(
+				throw new KoraError(
 					'KoraProvider requires either an "app" or "store" prop. Pass createApp() or a Store instance.',
+					'KORA_NOT_PROVIDED',
 				)
 			}
 
