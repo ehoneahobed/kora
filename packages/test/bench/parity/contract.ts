@@ -83,9 +83,9 @@ export function evaluateCell(
 		limitP50 = baseline.median + 50 + extra
 		limitP95 = baseline.p95 + 50 + extra
 	} else if (metric === 'P9') {
-		// Bytes: a ratchet (decision 2026-11-06, Obed). The original +20 KiB is not reachable: the
-		// critical path is ~12 modules of 1 to 3 KiB each and no safe cut closes the last 9 KiB.
-		// Measured +29 KiB at the head of #162; it only goes down, in a commit that says why.
+		// Bytes: a ratchet. The original +20 KiB is not reachable: the critical path is about 12
+		// modules of 1 to 3 KiB each and no safe cut closes the last 9 KiB (measured +29 KiB). It
+		// only goes down, in a commit that says why.
 		limitP50 = baseline.median + P9_ALLOWANCE_KIB
 		limitP95 = baseline.p95 + P9_ALLOWANCE_KIB
 	} else {
@@ -102,15 +102,27 @@ export function evaluateCell(
 	return { baseline, kora, limitP50, limitP95, pass }
 }
 
+/**
+ * Warm first data ratchet (P2 and P3 on a warm device), in milliseconds: 1x CPU, then throttled.
+ * A returning device renders from its own database: it never reads through, because a server
+ * answer would miss the device's unsent writes. Its first data therefore waits for SQLite WASM to
+ * load and the local database to open, which on a shared runner ends 150 to 250 ms after the
+ * baseline's first fetch at 1x. Measured +57 to +109 ms over the +100 ms floor at 1x and about
+ * +250 ms at 4x; the allowances are that level plus margin. They only go down, in a commit that
+ * says why. Closing them needs first data that does not wait for the store, such as a local
+ * snapshot of the first screen's answers (docs/design/first-visit-parity.md, Known limits).
+ */
+export const WARM_FIRST_DATA_ALLOWANCE_MS = { normal: 175, throttled: 350 } as const
+
 /** Warm navigation allowance for the runtime booting under the first navigation (ms, any CPU rate). */
 export const WARM_NAVIGATION_BOOT_ALLOWANCE_MS = 25
 
 /**
- * Throttled-CPU ratchet (decision 2026-11-07, Obed): at 4x CPU the staged first sync still
+ * Throttled-CPU ratchet: at 4x CPU the staged first sync still
  * leaves a burst of about 11 main-thread tasks of 55 to 105 ms in the first seconds of a
  * fast-network first visit (the worker round trips of the fold, the message clone and
  * decode), which 1x does not show. Every 1x cell keeps the original limits. The allowances
- * below are the measured 4x level of the manual nightlies of 2026-11-07 plus margin; they only
+ * below are the measured 4x level plus margin; they only
  * go down, in a commit that says why. The way to close them is fewer worker round trips per
  * delivery batch, or moving the fold off the main thread (docs/design/first-visit-parity.md).
  */
@@ -119,7 +131,7 @@ export function cpuAllowanceMs(
 	temperature: Temperature,
 	cpu: number,
 ): number {
-	// Warm navigation (decision 2026-11-08): on a 4g visit the first data arrives at about 330 ms,
+	// Warm navigation: on a 4g visit the first data arrives at about 330 ms,
 	// which is when the runtime boots, so the harness's first navigation measures about 100 ms of
 	// runtime start-up (3 to 4 ms over the +100 ms floor every night). A ratchet; it only goes down.
 	if (
@@ -127,6 +139,9 @@ export function cpuAllowanceMs(
 		(metric === 'P5' || metric === 'P4-course' || metric === 'P4-lesson')
 	) {
 		return WARM_NAVIGATION_BOOT_ALLOWANCE_MS
+	}
+	if (temperature === 'warm' && (metric === 'P2' || metric === 'P3')) {
+		return cpu <= 1 ? WARM_FIRST_DATA_ALLOWANCE_MS.normal : WARM_FIRST_DATA_ALLOWANCE_MS.throttled
 	}
 	if (cpu <= 1) return 0
 	if (metric === 'P8') return temperature === 'cold' ? 450 : 200
@@ -144,7 +159,7 @@ export const P9_ALLOWANCE_KIB = 32
 
 /**
  * K1 ratchet (section 2.2): offline-ready on the 20k-1 fixture, in milliseconds, at 1x CPU.
- * Decision of 2026-11-06 (Obed): the original 8 s and 10 s targets are not reachable with staged
+ * The original 8 s and 10 s targets are not reachable with staged
  * replication (staging the stream is ~7 s of JavaScript, the merge ~3 s, and the plain-REST
  * baseline has no offline-ready at all), so K1 is a ratchet at the measured nightly level plus
  * margin. It only goes down, in a commit that says why. `K1_CPU_FACTOR` scales it for throttled CPUs.
@@ -163,7 +178,7 @@ export function k1TargetMs(profile: string, cpu: number): number {
 
 /**
  * K3 ratchet: critical-path JavaScript Kora may add over the baseline in the parity app, in
- * gzip bytes. Measured 22,057 (21.5 KiB gzip; 18,963 brotli) at the head of the S4a PR, 1 KB of margin above;
+ * gzip bytes. Measured 22,057 (21.5 KiB gzip; 18,963 brotli) when render-before-ready landed, 1 KB of margin above;
  * a no-growth ratchet at the floor the first screen needs, and it only goes down. (The parity
  * app's schema imports the lite entry `korajs`, as the templates do; importing `@korajs/core`
  * would put the full fold and DDL code on the critical path and read 48 KB.)

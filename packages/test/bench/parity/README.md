@@ -52,7 +52,7 @@ KORA_PARITY_REPORT=cpu1.json,cpu4.json pnpm --filter @korajs/test bench:parity
 | `KORA_PARITY_TEMPS` | `cold,warm` | `cold`, `warm`, and `warm-stale` (separate cell, below) |
 | `KORA_PARITY_RUNS` | `7` | Runs per cell; the two apps alternate which goes first |
 | `KORA_PARITY_SIZES` | `20k-1` | Fixture: `small`, `20k-1`, `20k-5` (`relations: true`) |
-| `KORA_PARITY_CPU` | `1,4` | CPU slowdown rates (CDP `Emulation.setCPUThrottlingRate`); both are gated (decision D1, 2026-10-30) |
+| `KORA_PARITY_CPU` | `1,4` | CPU slowdown rates (CDP `Emulation.setCPUThrottlingRate`); both are gated |
 | `KORA_PARITY_APPS` | `baseline,kora` | Run one app only (the table then has no cells) |
 | `KORA_PARITY_THROTTLE` | `proxy` | `proxy`: one shared shaped link; `cdp`: per-page CDP throttling (see "Network") |
 | `KORA_PARITY_JSON` | `node_modules/.cache/parity-bench/parity-<time>.json` | Raw runs, written after every run |

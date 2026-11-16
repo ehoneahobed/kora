@@ -29,7 +29,7 @@ describe('parity contract (first-visit-parity.md, section 2.4)', () => {
 		expect(verdict.pass).toBe(false)
 	})
 
-	test('warm Kora gets the same margin as cold (the 2026-11-06 decision)', () => {
+	test('warm Kora gets the same margin as cold', () => {
 		// A worker-backed store pays a query round trip the baseline's in-memory cache does not;
 		// 100 ms is the line below which a user cannot tell.
 		expect(evaluateCell('P5', 'warm', [2, 2, 2], [60, 60, 60]).pass).toBe(true)
@@ -65,7 +65,7 @@ describe('parity contract (first-visit-parity.md, section 2.4)', () => {
 	})
 })
 
-describe('K1 ratchet (the 2026-11-06 decision)', () => {
+describe('K1 ratchet', () => {
 	test('allows the measured level at 1x and twice that at a throttled CPU', () => {
 		expect(k1TargetMs('broadband', 1)).toBe(17_000)
 		expect(k1TargetMs('broadband', 4)).toBe(34_000)
@@ -86,6 +86,15 @@ describe('K1 ratchet (the 2026-11-06 decision)', () => {
 		expect(evaluateCell('P2', 'cold', [500, 500, 500], [650, 650, 650], 4).pass).toBe(true)
 		expect(evaluateCell('P2', 'cold', [500, 500, 500], [651, 651, 651], 4).pass).toBe(false)
 		expect(evaluateCell('P2', 'cold', [500, 500, 500], [651, 651, 651], 1).pass).toBe(false)
+	})
+
+	test('warm first data waits for the local store: a ratchet at 1x and throttled', () => {
+		expect(cpuAllowanceMs('P2', 'warm', 1)).toBe(175)
+		expect(cpuAllowanceMs('P3', 'warm', 4)).toBe(350)
+		expect(cpuAllowanceMs('P2', 'cold', 1)).toBe(0)
+		// Limit: baseline + 100 + 175 at 1x.
+		expect(evaluateCell('P2', 'warm', [136, 136, 136], [411, 411, 411]).pass).toBe(true)
+		expect(evaluateCell('P2', 'warm', [136, 136, 136], [412, 412, 412]).pass).toBe(false)
 		expect(evaluateCell('P6', 'cold', [100, 100, 100], [201, 201, 201], 4).pass).toBe(false)
 		expect(k2LimitMs(1)).toBe(50)
 		expect(k2LimitMs(4)).toBe(150)
