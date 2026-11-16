@@ -262,9 +262,13 @@ export function createApp<const S extends SchemaInput>(
 					.catch(() => {})
 			}
 			if (config.sync?.unassignedWrites === 'assign-to-first-user') {
-				void import('./pre-ready-recovery').then((m) => {
-					if (!closed) stopJournalPolicy = m.assignJournalOnConnect(emitter, queue)
-				})
+				void import('./pre-ready-recovery')
+					.then((m) => {
+						if (!closed) stopJournalPolicy = m.assignJournalOnConnect(emitter, queue)
+					})
+					.catch((error: unknown) => {
+						console.error('[kora] Could not load the unassigned-writes policy:', error)
+					})
 			}
 			// A user who signs out or is replaced takes the failed writes kept for them along, and
 			// entries still waiting for their owner learn it. The first answer is the baseline.
@@ -824,23 +828,33 @@ export function createApp<const S extends SchemaInput>(
 			// Loaded once the runtime settled (it opens only after the first answer): the signal
 			// has nothing to judge before that, and its bytes must not count against first data (P9).
 			const wire = (): void =>
-				void import('./first-data-signal').then((m) => {
-					if (closed) return
-					stopFirstData = m.wireFirstDataSignal({
-						claimed: true,
-						ready: runtimeOpen,
-						syncs: sync !== null,
-						status: () => sync?.status ?? OFFLINE_SYNC_STATUS,
-						subscribeStatus: (listener) => sync?.subscribeStatus(listener) ?? (() => {}),
+				void import('./first-data-signal')
+					.then((m) => {
+						if (closed) return
+						stopFirstData = m.wireFirstDataSignal({
+							claimed: true,
+							ready: runtimeOpen,
+							syncs: sync !== null,
+							status: () => sync?.status ?? OFFLINE_SYNC_STATUS,
+							subscribeStatus: (listener) => sync?.subscribeStatus(listener) ?? (() => {}),
+						})
 					})
-				})
+					.catch((error: unknown) => {
+						console.error('[kora] Could not load the first-data signal:', error)
+					})
 			void runtimeOpen.then(wire, wire)
 		}
 	}
 
 	if (!inert && !localComplete) {
 		void runtimeOpen.then(
-			() => void import('./scope-watch').then((m) => m.watchScopeHeld(sync, markLocalComplete)),
+			() =>
+				void import('./scope-watch')
+					.then((m) => m.watchScopeHeld(sync, markLocalComplete))
+					.catch((error: unknown) => {
+						// Completeness is not reported rather than reported without the scope check.
+						console.error('[kora] Could not load the scope watch:', error)
+					}),
 			// The store did not open: nothing more is coming, so nothing waits for completeness.
 			markLocalComplete,
 		)
