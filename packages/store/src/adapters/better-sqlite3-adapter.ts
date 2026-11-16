@@ -17,6 +17,9 @@ import {
 import type { MigrationPlan, StorageAdapter, Transaction, TransactionOptions } from '../types'
 import { Mutex } from './mutex'
 
+/** Prepared statements kept per adapter (distinct SQL texts, LRU). */
+const STATEMENT_CACHE_SIZE = 256
+
 /**
  * Storage adapter backed by better-sqlite3 for Node.js environments.
  * Used for testing and server-side usage.
@@ -28,9 +31,6 @@ import { Mutex } from './mutex'
  * const adapter = new BetterSqlite3Adapter(':memory:')
  * ```
  */
-/** Prepared statements kept per adapter (distinct SQL texts, LRU). */
-const STATEMENT_CACHE_SIZE = 256
-
 export class BetterSqlite3Adapter implements StorageAdapter {
 	private db: Database.Database | null = null
 	private readonly statements = new Map<string, Database.Statement>()
@@ -206,7 +206,9 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 				await fn(tx)
 				db.exec('COMMIT')
 			} catch (error) {
-				db.exec('ROLLBACK')
+				// Some failures (RAISE(ROLLBACK), SQLITE_FULL, ...) already ended the transaction
+				// inside SQLite; a second ROLLBACK would throw and hide the original error.
+				if (db.inTransaction) db.exec('ROLLBACK')
 				throw error
 			}
 		} finally {
@@ -226,7 +228,7 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 				}
 				db.exec('COMMIT')
 			} catch (error) {
-				db.exec('ROLLBACK')
+				if (db.inTransaction) db.exec('ROLLBACK')
 				throw new AdapterError(
 					`Migration from v${from} to v${to} failed: ${(error as Error).message}`,
 					{

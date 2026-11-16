@@ -1,4 +1,4 @@
-import { hashBlob } from '@korajs/core'
+import { KoraError, hashBlob } from '@korajs/core'
 import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-addressed-blob-store'
 
 /** Default chunk size for out-of-band blob transfer (256 KiB). */
@@ -45,7 +45,13 @@ export async function chunkBlob(
 	metadata: BlobManifestMetadata = {},
 ): Promise<{ manifest: BlobManifest; chunks: Map<string, Uint8Array> }> {
 	if (chunkSize <= 0) {
-		throw new Error(`chunkBlob requires a positive chunkSize, got ${chunkSize}`)
+		throw new KoraError(
+			`chunkBlob requires a positive chunkSize, got ${chunkSize}`,
+			'INVALID_CHUNK_SIZE',
+			{
+				chunkSize,
+			},
+		)
 	}
 
 	const chunkHashes: string[] = []
@@ -90,7 +96,7 @@ export async function chunkBlob(
  * @param chunkStore - A store holding the chunk bytes keyed by chunk hash
  * @returns The full reassembled blob bytes
  * @throws {BlobIntegrityError} If the reassembled bytes do not match blobHash
- * @throws {Error} If a chunk named in the manifest is missing from the store
+ * @throws {KoraError} `BLOB_CHUNK_MISSING` if a chunk named in the manifest is missing from the store
  */
 export async function reassembleBlob(
 	manifest: BlobManifest,
@@ -102,7 +108,11 @@ export async function reassembleBlob(
 	for (const hash of manifest.chunkHashes) {
 		const chunk = await chunkStore.get(hash)
 		if (chunk === null) {
-			throw new Error(`Cannot reassemble blob ${manifest.blobHash}: missing chunk ${hash}`)
+			throw new KoraError(
+				`Cannot reassemble blob ${manifest.blobHash}: missing chunk ${hash}`,
+				'BLOB_CHUNK_MISSING',
+				{ blobHash: manifest.blobHash, chunkHash: hash },
+			)
 		}
 		parts.push(chunk)
 		total += chunk.byteLength

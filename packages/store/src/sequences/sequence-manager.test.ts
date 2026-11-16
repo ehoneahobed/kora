@@ -195,6 +195,19 @@ describe('SequenceManager', () => {
 			expect(next).toBe('order-0051')
 		})
 
+		test('is atomic: a next() issued during a reset never interleaves with it', async () => {
+			await mgr.next('order')
+			await mgr.next('order')
+
+			// Not awaited in between: the next() is queued while the reset runs.
+			const reset = mgr.reset('order', { to: 50 })
+			const next = mgr.next('order')
+
+			await expect(reset).resolves.toBeUndefined()
+			expect(await next).toBe('order-0051')
+			expect(await mgr.current('order')).toBe(51)
+		})
+
 		test('respects scope', async () => {
 			await mgr.next('receipt', { scope: 'A' })
 			await mgr.next('receipt', { scope: 'A' })

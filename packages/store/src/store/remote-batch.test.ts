@@ -1,4 +1,4 @@
-import type { Operation } from '@korajs/core'
+import { type Operation, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
@@ -356,5 +356,72 @@ describe('Store.applyRemoteBatch', () => {
 		await legacy.open()
 		expect(await legacy.applyRemoteBatch(async () => 'never')).toBeNull()
 		await legacy.close()
+	})
+})
+
+describe('Store.applyRemoteBatch commit probe', () => {
+	const relational = defineSchema({
+		version: 1,
+		collections: {
+			projects: { fields: { name: t.string() } },
+			tasks: { fields: { title: t.string(), projectId: t.string() } },
+		},
+		relations: {
+			taskProject: {
+				from: 'tasks',
+				to: 'projects',
+				type: 'many-to-one',
+				field: 'projectId',
+				onDelete: 'cascade',
+			},
+		},
+	})
+	const op = (
+		collection: string,
+		recordId: string,
+		seq: number,
+		data: Record<string, unknown>,
+	): Operation => ({
+		id: `insert-${collection}-${recordId}`,
+		nodeId: 'author',
+		type: 'insert',
+		collection,
+		recordId,
+		data,
+		previousData: null,
+		timestamp: { wallTime: 1_000 + seq, logical: 0, nodeId: 'author' },
+		sequenceNumber: seq,
+		causalDeps: [],
+		schemaVersion: 1,
+	})
+
+	test('a step that was rolled back is never the proof that a batch with a lost COMMIT answer landed', async () => {
+		const adapter = new PoisonableAdapter(':memory:')
+		const emitter = new SimpleEventEmitter()
+		const store = new Store({ schema: relational, adapter, nodeId: 'device', emitter })
+		await store.open()
+		const applied: string[] = []
+		emitter.on('operation:applied', (event) => applied.push(event.operation.id))
+
+		adapter.ending = 'committed-then-rejected'
+		const outcome = await store.applyRemoteBatch(async (batch) => {
+			await batch.applyRemoteOperation(op('projects', 'p1', 1, { name: 'P' }))
+			// A task whose project is unknown runs as a strict step and fails on its foreign
+			// key after its fold ran: the step is undone and the caller quarantines it.
+			const orphan = await batch
+				.applyRemoteOperation(op('tasks', 't1', 2, { title: 'T', projectId: 'missing' }))
+				.then(
+					() => null,
+					(error: unknown) => error,
+				)
+			return orphan
+		})
+		adapter.ending = 'ok'
+
+		// The batch landed (the project is in the log): it resolves and publishes the project.
+		expect(outcome?.value).toBeInstanceOf(Error)
+		expect(applied).toEqual(['insert-projects-p1'])
+		expect(await store.collection('projects').findById('p1')).not.toBeNull()
+		await store.close()
 	})
 })

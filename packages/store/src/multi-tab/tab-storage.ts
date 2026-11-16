@@ -176,8 +176,6 @@ export interface TabStorageSession {
 	channelName: string
 	/** Leader only: release the navigator lock when closing the database. */
 	releaseLock?: () => Promise<void>
-	/** Leader only: stop the broadcast RPC relay or heartbeat. */
-	stopRelay?: () => void
 	/**
 	 * Follower only: cancels the queued lock request (or, once promoted, releases
 	 * the lock this tab won). Present so callers can tear the session down.
@@ -219,7 +217,7 @@ export async function acquireTabStorageSession(
 		return { role: 'leader', channelName }
 	}
 
-	return new Promise<TabStorageSession>((resolve) => {
+	return new Promise<TabStorageSession>((resolve, reject) => {
 		let releaseHeld: (() => void) | undefined
 
 		const request = navigator.locks.request(
@@ -249,6 +247,10 @@ export async function acquireTabStorageSession(
 				})
 			},
 		)
+		// The request can reject before its callback runs (a detached document's
+		// SecurityError, for instance): fail the open instead of leaving it pending forever.
+		// After the callback resolved the session this is a no-op.
+		request.catch(reject)
 	})
 }
 
@@ -352,7 +354,11 @@ function serveChannel(
 ): WorkerRpcRelay {
 	const epoch = createClientId()
 	const dedup = createRequestDeduper()
+	// Requests still running when the relay stops settle afterwards: posting their answer
+	// (or a heartbeat from a long statement) on the closed channel would throw.
+	let stopped = false
 	const beat = (): void => {
+		if (stopped) return
 		const message: HeartbeatMessage = {
 			type: LEADER_HEARTBEAT,
 			epoch,
@@ -362,6 +368,7 @@ function serveChannel(
 		channel.postMessage(message)
 	}
 	const respond = (requestId: string, response: WorkerResponse): void => {
+		if (stopped) return
 		const msg: RpcResponseMessage = { type: RPC_RESPONSE, requestId, response, epoch }
 		channel.postMessage(msg)
 	}
@@ -431,6 +438,7 @@ function serveChannel(
 	return {
 		beat,
 		stop: () => {
+			stopped = true
 			if (interval !== undefined) clearInterval(interval)
 			channel.removeEventListener('message', onMessage)
 			channel.close()
@@ -506,12 +514,16 @@ export function serveSnapshotBarriers(channelName: string, run: () => Promise<vo
 	const channel = new BroadcastChannel(channelName)
 	const epoch = createClientId()
 	const running = new Set<string>()
+	// A barrier still running when serving stops settles afterwards: never post on the
+	// closed channel (it throws); the follower falls back on its own.
+	let stopped = false
 	const onMessage = (event: MessageEvent<ChannelMessage>): void => {
 		const data = event.data
 		if (data?.type !== SNAPSHOT_BARRIER_REQUEST || running.has(data.requestId)) return
 		running.add(data.requestId)
 		const respond = (response: WorkerResponse): void => {
 			running.delete(data.requestId)
+			if (stopped) return
 			const msg: RpcResponseMessage = {
 				type: RPC_RESPONSE,
 				requestId: data.requestId,
@@ -534,6 +546,7 @@ export function serveSnapshotBarriers(channelName: string, run: () => Promise<vo
 	}
 	channel.addEventListener('message', onMessage)
 	return () => {
+		stopped = true
 		channel.removeEventListener('message', onMessage)
 		channel.close()
 	}

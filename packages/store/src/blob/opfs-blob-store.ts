@@ -1,4 +1,10 @@
-import { type BlobRef, type BlobRefMetadata, createBlobRef, hashBlob } from '@korajs/core'
+import {
+	type BlobRef,
+	type BlobRefMetadata,
+	KoraError,
+	createBlobRef,
+	hashBlob,
+} from '@korajs/core'
 import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-addressed-blob-store'
 
 /**
@@ -121,8 +127,9 @@ interface StorageManagerLike {
 function getStorageManager(): StorageManagerLike {
 	const nav = (globalThis as unknown as { navigator?: { storage?: StorageManagerLike } }).navigator
 	if (!nav?.storage || typeof nav.storage.getDirectory !== 'function') {
-		throw new Error(
+		throw new KoraError(
 			'OPFS is unavailable in this environment. The OPFS blob store requires a browser with Origin Private File System support; use MemoryBlobStore or a server-side store elsewhere.',
+			'OPFS_UNAVAILABLE',
 		)
 	}
 	return nav.storage
@@ -142,7 +149,7 @@ function isNotFoundError(error: unknown): boolean {
  * storage: that is `app.storage.persistence`, kept off the startup path.
  *
  * @param rootDirName - The OPFS subdirectory to store blobs under (default `kora-blobs`)
- * @throws {Error} If OPFS is unavailable (e.g. called outside a browser)
+ * @throws {KoraError} `OPFS_UNAVAILABLE` if OPFS is unavailable (e.g. called outside a browser)
  */
 export async function createOpfsBlobDirectory(
 	rootDirName = 'kora-blobs',
@@ -264,7 +271,7 @@ export async function createOpfsBlobDirectory(
  * Create a persistent {@link OpfsBlobStore} backed by real browser OPFS.
  *
  * @param rootDirName - The OPFS subdirectory to store blobs under (default `kora-blobs`)
- * @throws {Error} If OPFS is unavailable (e.g. called outside a browser)
+ * @throws {KoraError} `OPFS_UNAVAILABLE` if OPFS is unavailable (e.g. called outside a browser)
  */
 export async function createOpfsBlobStore(rootDirName = 'kora-blobs'): Promise<OpfsBlobStore> {
 	return new OpfsBlobStore(await createOpfsBlobDirectory(rootDirName))

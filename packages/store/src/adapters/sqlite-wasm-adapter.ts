@@ -851,7 +851,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		const session = this.tabSession
 		this.tabSession = null
 		this.stopServing()
-		session?.stopRelay?.()
 		this.bridge?.terminate()
 		this.bridge = null
 		this.ownWorker = null
@@ -1386,7 +1385,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		const session = this.tabSession
 		this.tabSession = null
 		this.stopServing()
-		session?.stopRelay?.()
 		// Worker (pool holder) first, then the leader lock (NEW-STORE-10). After the drain no
 		// write of this tab is in flight; a follower span cut here fails retriably (#59).
 		this.bridge?.terminate()

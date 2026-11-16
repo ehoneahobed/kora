@@ -125,7 +125,7 @@ export interface WorkerSendOptions {
 
 /**
  * Abstraction over the communication channel with the SQLite WASM worker.
- * In browsers, this is backed by a real Web Worker via MessagePort.
+ * In browsers, this is backed by a dedicated Web Worker (`Worker.postMessage`).
  * In Node.js tests, this is backed by better-sqlite3 via MockWorkerBridge.
  */
 export interface WorkerBridge {

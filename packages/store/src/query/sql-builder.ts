@@ -1,4 +1,4 @@
-import type { CollectionDefinition, FieldDescriptor } from '@korajs/core'
+import type { FieldDescriptor } from '@korajs/core'
 import { quoteIdent } from '@korajs/core'
 import { QueryError } from '../errors'
 import { lwwVersionWhereClause } from '../lww/row-version'
