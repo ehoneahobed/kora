@@ -1565,6 +1565,26 @@ describe('ClientSession', () => {
 			expect(onClose).toHaveBeenCalledWith('sess-1')
 		})
 
+		test('an acknowledgment whose delivery sequence is not a count is ignored', async () => {
+			const store = new MemoryServerStore('server-1')
+			await store.applyRemoteOperation(createTestOp({ id: 'op-1', nodeId: 'node-a' }))
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			const session = new ClientSession({ sessionId: 'sess-1', transport: server, store })
+			session.start()
+			sendHandshake(client, { lastDeliverySequence: 0 })
+			await vi.waitFor(() => expect(messages.some((m) => m.type === 'operation-batch')).toBe(true))
+			client.send({
+				type: 'acknowledgment',
+				messageId: 'ack-1',
+				acknowledgedMessageId: 'none',
+				lastSequenceNumber: 0,
+				deliverySequence: 'abc',
+			} as unknown as SyncMessage)
+			await new Promise((resolve) => setImmediate(resolve))
+			expect(session.getConfirmedDeliveryPosition()).toBe(0)
+		})
+
 		test('a disconnect while the handshake authenticates leaves the session closed', async () => {
 			const store = new MemoryServerStore('server-1')
 			const onReady = vi.fn()

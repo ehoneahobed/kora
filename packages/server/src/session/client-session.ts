@@ -2263,19 +2263,23 @@ export class ClientSession {
 			case 'operation-batch':
 				await this.handleOperationBatch(message)
 				break
-			case 'acknowledgment':
+			case 'acknowledgment': {
 				this.pendingRelays.delete(message.acknowledgedMessageId)
 				// A retraction held behind an acknowledged relay may go out now.
 				if (!this.isClosed()) this.releaseHeldRelays()
 				if (typeof message.nodeToken === 'string') {
 					await this.confirmNodeClaim(message.nodeToken)
 				}
-				if (message.deliverySequence !== undefined) {
+				const ackedDelivery = deliveryWatermarkField(message.deliverySequence)
+				if (ackedDelivery !== null) {
 					// Advance the confirmed watermark (a retransmission rewinds to it). It never
-					// passes the send cursor: a client cannot acknowledge what was not sent.
-					this.noteDeliveryAcked(message.deliverySequence)
+					// passes the send cursor: a client cannot acknowledge what was not sent. A
+					// value that is not a count is ignored (a string would make it NaN and
+					// clear every unacknowledged batch).
+					this.noteDeliveryAcked(ackedDelivery)
 				}
 				break
+			}
 			case 'error':
 			case 'heartbeat':
 				// A client liveness probe needs no answer: receiving it is the point.
