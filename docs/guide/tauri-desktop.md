@@ -537,7 +537,7 @@ The built binaries are in `src-tauri/target/release/bundle/`.
 
 The first `pnpm dev` compiles the Rust backend, which takes 2-5 minutes. Subsequent builds only recompile changed code and are much faster.
 
-### `tauri-plugin-kora` not found
+### `tauri-plugin-kora-sqlite` not found
 
 Make sure you've run `pnpm install`: the Tauri plugin is referenced from `node_modules/@korajs/tauri/plugin` in `Cargo.toml`.
 
