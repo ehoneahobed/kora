@@ -76,7 +76,6 @@
   },
   "dependencies": {
     "@korajs/core": "workspace:*",
-    "@korajs/merge": "workspace:*",
     "protobufjs": "^8.0.1"
   },
   "devDependencies": {
