@@ -83,6 +83,14 @@ export class TauriStoreNotOpenError extends Error {
 	}
 }
 
+/**
+ * The message of a failed IPC call. Tauri's `invoke` rejects with the Rust error
+ * serialized as a plain string, not an `Error`, so `.message` alone would read `undefined`.
+ */
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error)
+}
+
 // Mutex for serializing transactions over async IPC
 class AsyncMutex {
 	private queue: Array<() => void> = []
@@ -130,7 +138,7 @@ const PLUGIN_PREFIX = 'plugin:kora-sqlite|'
 /**
  * Storage adapter backed by native SQLite via a Tauri plugin.
  *
- * Uses Tauri IPC to communicate with the `tauri-plugin-kora` Rust plugin,
+ * Uses Tauri IPC to communicate with the `tauri-plugin-kora-sqlite` Rust plugin,
  * which provides native SQLite access with WAL mode, foreign keys, and
  * proper connection management — zero WASM overhead.
  *
@@ -161,7 +169,6 @@ export class TauriSqliteAdapter implements StorageAdapter {
 	private invoker: InvokeFn | null
 	private readonly dbPath: string
 	private readonly txMutex = new AsyncMutex()
-	private inTransaction = false
 
 	constructor(options?: TauriSqliteOptions) {
 		this.dbPath = options?.path ?? 'kora.db'
@@ -213,7 +220,7 @@ export class TauriSqliteAdapter implements StorageAdapter {
 				params: params ?? [],
 			})
 		} catch (error) {
-			throw new TauriAdapterError(`Execute failed: ${(error as Error).message}`, {
+			throw new TauriAdapterError(`Execute failed: ${errorMessage(error)}`, {
 				sql,
 				params,
 			})
@@ -232,7 +239,7 @@ export class TauriSqliteAdapter implements StorageAdapter {
 				params: params ?? [],
 			})
 		} catch (error) {
-			throw new TauriAdapterError(`Query failed: ${(error as Error).message}`, {
+			throw new TauriAdapterError(`Query failed: ${errorMessage(error)}`, {
 				sql,
 				params,
 			})
@@ -249,7 +256,6 @@ export class TauriSqliteAdapter implements StorageAdapter {
 		this.ensureOpen()
 		const release = await this.txMutex.acquire()
 		try {
-			this.inTransaction = true
 			await this.invoke('execute', { path: this.dbPath, sql: 'BEGIN', params: [] })
 			try {
 				const tx: Transaction = {
@@ -261,10 +267,10 @@ export class TauriSqliteAdapter implements StorageAdapter {
 								params: params ?? [],
 							})
 						} catch (error) {
-							throw new TauriAdapterError(
-								`Transaction execute failed: ${(error as Error).message}`,
-								{ sql, params },
-							)
+							throw new TauriAdapterError(`Transaction execute failed: ${errorMessage(error)}`, {
+								sql,
+								params,
+							})
 						}
 					},
 					query: async <T>(sql: string, params?: unknown[]): Promise<T[]> => {
@@ -275,7 +281,7 @@ export class TauriSqliteAdapter implements StorageAdapter {
 								params: params ?? [],
 							})
 						} catch (error) {
-							throw new TauriAdapterError(`Transaction query failed: ${(error as Error).message}`, {
+							throw new TauriAdapterError(`Transaction query failed: ${errorMessage(error)}`, {
 								sql,
 								params,
 							})
@@ -293,7 +299,6 @@ export class TauriSqliteAdapter implements StorageAdapter {
 				throw error
 			}
 		} finally {
-			this.inTransaction = false
 			release()
 		}
 	}
@@ -310,7 +315,7 @@ export class TauriSqliteAdapter implements StorageAdapter {
 			})
 		} catch (error) {
 			throw new TauriAdapterError(
-				`Migration from v${from} to v${to} failed: ${(error as Error).message}`,
+				`Migration from v${from} to v${to} failed: ${errorMessage(error)}`,
 				{ from, to },
 			)
 		}

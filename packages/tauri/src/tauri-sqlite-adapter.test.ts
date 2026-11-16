@@ -21,7 +21,7 @@ const minimalSchema = defineSchema({
 })
 
 /**
- * Creates a mock invoke function that simulates the tauri-plugin-kora Rust plugin
+ * Creates a mock invoke function that simulates the tauri-plugin-kora-sqlite Rust plugin
  * using better-sqlite3 in-memory. This tests the adapter's logic without Tauri.
  */
 function createMockInvoke(): InvokeFn {
@@ -427,6 +427,22 @@ describe('TauriSqliteAdapter IPC marshaling', () => {
 		expect(err.message).toContain('native boom')
 		expect(err.code).toBe('TAURI_ADAPTER_ERROR')
 		expect(err.context).toMatchObject({ sql: 'UPDATE todos SET title = ?', params: ['x'] })
+	})
+
+	test('keeps the native message when invoke rejects with a string, as Tauri does', async () => {
+		const failing: InvokeFn = async <T>(cmd: string): Promise<T> => {
+			if (cmd.endsWith('open')) return undefined as T
+			throw 'SQLite error: native boom'
+		}
+		const adapter = new TauriSqliteAdapter({ invoke: failing })
+		await adapter.open(minimalSchema)
+
+		await expect(adapter.execute('UPDATE todos SET title = ?', ['x'])).rejects.toThrow(
+			'Execute failed: SQLite error: native boom',
+		)
+		await expect(adapter.query('SELECT * FROM todos')).rejects.toThrow(
+			'Query failed: SQLite error: native boom',
+		)
 	})
 
 	test('migrate marshals only the statement list (path + statements), not transforms', async () => {
