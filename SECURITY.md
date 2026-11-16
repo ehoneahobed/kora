@@ -8,7 +8,7 @@ Security fixes are applied to the latest published minor version of each `@koraj
 
 Please do not report security vulnerabilities through public GitHub issues, discussions, or social media.
 
-Instead, use GitHub's private vulnerability reporting on this repository (Security tab, "Report a vulnerability"), or email **bozomagroup@gmail.com** with the subject line `KORA SECURITY`. Include a description of the issue, steps to reproduce, the affected package and version, and any suggested remediation if you have one.
+Instead, use GitHub's private vulnerability reporting on this repository (Security tab, "Report a vulnerability"), or email **contact@bozomalabs.com** with the subject line `KORA SECURITY`. Include a description of the issue, steps to reproduce, the affected package and version, and any suggested remediation if you have one.
 
 You will receive an acknowledgment within 72 hours. Expect a status update within 14 days. If the report is accepted, a fix will be developed privately, released as a patch version, and credited to you in the release notes unless you prefer to remain anonymous.
 

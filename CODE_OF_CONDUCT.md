@@ -12,7 +12,7 @@ Examples of unacceptable behavior include the use of sexualized language or imag
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the maintainer at **bozomagroup@gmail.com**. All complaints will be reviewed and investigated promptly and fairly. The maintainer is obligated to respect the privacy and security of the reporter of any incident.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the maintainer at **contact@bozomalabs.com**. All complaints will be reviewed and investigated promptly and fairly. The maintainer is obligated to respect the privacy and security of the reporter of any incident.
 
 Maintainers who do not follow or enforce the Code of Conduct in good faith may face temporary or permanent repercussions as determined by the project leadership.
 
