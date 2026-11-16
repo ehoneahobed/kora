@@ -306,7 +306,10 @@ export class InMemoryUserStore implements UserStore {
 	 * @returns The stored user record including credentials, or null if not found
 	 */
 	async findByEmail(email: string): Promise<StoredUser | null> {
-		return this.usersByEmail.get(email.toLowerCase()) ?? null
+		const user = this.usersByEmail.get(email.toLowerCase())
+		// A copy, as the SQL stores return: a caller editing the record before `update()`
+		// must not change the stored one (and leave the email index pointing at it).
+		return user ? { ...user } : null
 	}
 
 	/**
@@ -316,7 +319,8 @@ export class InMemoryUserStore implements UserStore {
 	 * @returns The stored user record including credentials, or null if not found
 	 */
 	async findById(id: string): Promise<StoredUser | null> {
-		return this.usersById.get(id) ?? null
+		const user = this.usersById.get(id)
+		return user ? { ...user } : null
 	}
 
 	/**
@@ -421,10 +425,11 @@ export class InMemoryUserStore implements UserStore {
 	}
 
 	/**
-	 * Set a user's email verification status.
+	 * Mark a user's email verified, only while the account still has that address.
 	 *
 	 * @param userId - The user whose email to verify
-	 * @param verified - Whether the email is verified
+	 * @param email - The address the verification was sent to (compared without case)
+	 * @returns Whether the user was marked verified
 	 */
 	async markEmailVerifiedIfEmail(userId: string, email: string): Promise<boolean> {
 		const user = this.usersById.get(userId)
@@ -433,6 +438,12 @@ export class InMemoryUserStore implements UserStore {
 		return true
 	}
 
+	/**
+	 * Set a user's email verification status.
+	 *
+	 * @param userId - The user whose email to verify
+	 * @param verified - Whether the email is verified
+	 */
 	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
 		const user = this.usersById.get(userId)
 		if (!user) return
@@ -478,7 +489,7 @@ export class InMemoryUserStore implements UserStore {
 	 * List all users. For admin/development use.
 	 */
 	async listAll(): Promise<StoredUser[]> {
-		return [...this.usersById.values()]
+		return [...this.usersById.values()].map((user) => ({ ...user }))
 	}
 
 	/**
@@ -489,17 +500,18 @@ export class InMemoryUserStore implements UserStore {
 		if (!existing) return
 		const user: StoredUser = {
 			...profile,
+			email: profile.email.toLowerCase(),
 			passwordHash: existing.passwordHash,
 			salt: existing.salt,
 		}
-
-		// If email changed, update the email index
-		if (existing.email !== user.email) {
-			this.usersByEmail.delete(existing.email)
-			this.usersByEmail.set(user.email, user)
-		} else {
-			this.usersByEmail.set(user.email, user)
+		// The address is unique, as the SQL stores' unique index enforces.
+		const holder = this.usersByEmail.get(user.email)
+		if (holder !== undefined && holder.id !== user.id) {
+			throw new DuplicateEmailError()
 		}
+
+		this.usersByEmail.delete(existing.email)
+		this.usersByEmail.set(user.email, user)
 		this.usersById.set(user.id, user)
 	}
 

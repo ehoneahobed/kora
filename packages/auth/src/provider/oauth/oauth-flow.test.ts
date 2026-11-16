@@ -377,6 +377,40 @@ describe('user info normalization', () => {
 		expect(userInfo.name).toBe('Alice Smith')
 	})
 
+	test('a provider sending email_verified as the string "false" does not verify the address', async () => {
+		for (const [claim, expected] of [
+			['false', false],
+			['true', true],
+			[1, false],
+		] as const) {
+			const stateStore = new InMemoryOAuthStateStore()
+			const mockFn = vi.fn()
+			const mgr = new OAuthManager({
+				providers: [
+					{
+						providerId: 'cognito',
+						clientId: 'c',
+						clientSecret: 's',
+						authorizationUrl: 'https://idp.example/authorize',
+						tokenUrl: 'https://idp.example/token',
+						userInfoUrl: 'https://idp.example/userinfo',
+						scopes: ['openid', 'email'],
+						redirectUri: 'r',
+					},
+				],
+				stateStore,
+				fetch: mockFn as unknown as typeof fetch,
+			})
+			const { state } = await mgr.getAuthorizationUrl('cognito')
+			mockFn.mockResolvedValueOnce(mockTokenResponse).mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ sub: 'u-1', email: 'alice@example.com', email_verified: claim }),
+			})
+			const { userInfo } = await mgr.handleCallback('cognito', 'code', state)
+			expect(userInfo.emailVerified).toBe(expected)
+		}
+	})
+
 	test('normalizes Microsoft user info', async () => {
 		const stateStore = new InMemoryOAuthStateStore()
 		const mockFn = vi.fn()

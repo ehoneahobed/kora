@@ -648,7 +648,14 @@ export class TokenManager {
 	 */
 	async revokeFamily(family: string, expiresAt: number): Promise<void> {
 		if (this.revocationStore) {
-			await this.revocationStore.revoke(familyKey(family), expiresAt)
+			// The caller only knows the expiry of the tokens it holds, but the family may
+			// already have a later member (a rotation the caller did not see). No member
+			// can be minted once the family is revoked, so every member expires by now plus
+			// one refresh lifetime: keep the revocation at least that long, or a store
+			// cleanup would purge it while a successor is still alive.
+			const latestMemberExpiry =
+				Math.floor(Date.now() / 1000) + Math.floor(this.refreshTokenLifetime / 1000)
+			await this.revocationStore.revoke(familyKey(family), Math.max(expiresAt, latestMemberExpiry))
 		}
 	}
 

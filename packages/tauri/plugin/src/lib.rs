@@ -1,4 +1,4 @@
-//! # tauri-plugin-kora
+//! # tauri-plugin-kora-sqlite
 //!
 //! Tauri plugin providing native SQLite storage for Kora.js applications.
 //!

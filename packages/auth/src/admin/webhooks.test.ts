@@ -7,6 +7,28 @@ import {
 } from './webhooks'
 import type { WebhookPayload } from './webhooks'
 
+/**
+ * Dispatch with a fake setTimeout, so the retry backoff runs at once instead of sleeping.
+ * Signing resolves outside the timer queue, so each backoff is scheduled only after real
+ * I/O: yield to the event loop (setImmediate stays real) and fire timers until it settles.
+ */
+async function dispatchSkippingBackoff(manager: WebhookManager): Promise<void> {
+	vi.useFakeTimers({ toFake: ['setTimeout'] })
+	try {
+		let settled = false
+		const run = manager.dispatch('user.created', { userId: 'u1' }).finally(() => {
+			settled = true
+		})
+		while (!settled) {
+			await new Promise<void>((resolve) => setImmediate(resolve))
+			vi.runOnlyPendingTimers()
+		}
+		await run
+	} finally {
+		vi.useRealTimers()
+	}
+}
+
 describe('WebhookManager', () => {
 	let manager: WebhookManager
 	let store: InMemoryWebhookStore
@@ -156,14 +178,14 @@ describe('WebhookManager', () => {
 				.mockResolvedValueOnce({ ok: false, status: 500 })
 
 			const ep = await manager.register({ url: 'https://a.com', events: ['user.created'] })
-			await manager.dispatch('user.created', { userId: 'u1' })
+			await dispatchSkippingBackoff(manager)
 
 			const deliveries = await manager.getDeliveries(ep.id)
 			expect(deliveries).toHaveLength(1)
 			expect(deliveries[0]?.success).toBe(false)
 			expect(deliveries[0]?.attempts).toBe(3)
 			expect(deliveries[0]?.error).toContain('500')
-		}, 40000)
+		})
 
 		test('retries on network error', async () => {
 			mockFetch
@@ -171,13 +193,13 @@ describe('WebhookManager', () => {
 				.mockResolvedValueOnce({ ok: true, status: 200 })
 
 			const ep = await manager.register({ url: 'https://a.com', events: ['user.created'] })
-			await manager.dispatch('user.created', { userId: 'u1' })
+			await dispatchSkippingBackoff(manager)
 
 			const deliveries = await manager.getDeliveries(ep.id)
 			expect(deliveries).toHaveLength(1)
 			expect(deliveries[0]?.success).toBe(true)
 			expect(deliveries[0]?.attempts).toBe(2)
-		}, 10000)
+		})
 
 		test('includes signature header', async () => {
 			await manager.register({ url: 'https://a.com', events: ['user.created'] })

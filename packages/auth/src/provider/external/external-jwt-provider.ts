@@ -1,5 +1,5 @@
 import { KoraError, type ScopeMap, claimScopes } from '@korajs/core'
-import { decodeJwt, isExpired, verifyJwt } from '../../tokens/jwt'
+import { isExpired, verifyJwt } from '../../tokens/jwt'
 import type { AuthTokens } from '../../types'
 import type { AuthProviderAdapter, SignInParams, SignUpParams } from '../adapter'
 import type { AuthUser } from '../built-in/user-store'

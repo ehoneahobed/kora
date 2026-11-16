@@ -9,7 +9,6 @@ import type {
 } from './org-types'
 import {
 	CannotRemoveOwnerError,
-	InsufficientRoleError,
 	InvitationExpiredError,
 	InvitationNotFoundError,
 	MemberAlreadyExistsError,

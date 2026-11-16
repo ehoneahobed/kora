@@ -25,8 +25,8 @@ export interface AdminApiConfig {
 	isAdmin?: (adminId: string) => boolean | Promise<boolean>
 	/**
 	 * Revoke every credential of a user (defaults to the user store's token
-	 * revocation store). Called by `revokeUserSessions`, `suspend`-style flows
-	 * and `deleteUser`, so JWTs and refresh tokens die with the session rows.
+	 * revocation store). Called by `revokeUserSessions` and `deleteUser`, so
+	 * JWTs and refresh tokens die with the session rows.
 	 * Pass `authServer.revokeAllForUser` to also end live sync sessions.
 	 */
 	revokeAllForUser?: (userId: string) => Promise<void>
@@ -112,8 +112,8 @@ export class AdminUnauthorizedError extends AdminApiError {
  * // List users
  * const { data, total } = await admin.listUsers({ limit: 20 })
  *
- * // Suspend a user (revokes all sessions)
- * await admin.suspendUser('admin-user-id', 'target-user-id', 'Policy violation')
+ * // End every session of a user (sessions, JWTs and refresh tokens)
+ * await admin.revokeUserSessions('admin-user-id', 'target-user-id')
  * ```
  */
 export class AdminApi {
@@ -169,8 +169,6 @@ export class AdminApi {
 		const limit = query.limit ?? 50
 		const offset = query.offset ?? 0
 
-		// Get all users (InMemoryUserStore doesn't have a list method, so we use findByEmail with patterns)
-		// For now, we expose a listing helper
 		const allUsers = await this.userStore.listAll()
 
 		let filtered = allUsers

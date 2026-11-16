@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useRef } from 'react'
+import { type ReactElement, type ReactNode, useEffect, useMemo, useRef } from 'react'
 import { type OrgSession, createOrgSession } from '../bindings/create-org-session'
 import type { OrgClient } from '../client/org-client'
 import { OrgContext, type OrgContextValue } from './org-hooks'
@@ -11,7 +11,7 @@ export interface OrgProviderProps {
 /**
  * Provides organization context for {@link useOrg}, {@link useOrgMembers}, and {@link usePermission}.
  */
-export function OrgProvider({ client, children }: OrgProviderProps) {
+export function OrgProvider({ client, children }: OrgProviderProps): ReactElement {
 	const sessionRef = useRef<OrgSession | null>(null)
 
 	if (sessionRef.current === null || sessionRef.current.client !== client) {
