@@ -6,7 +6,7 @@ import {
 	holdOfflineKeep,
 	toOfflinePinSpec,
 } from '@korajs/core/bindings'
-import { onScopeDispose, readonly, shallowRef, watch } from 'vue'
+import { type Ref, onScopeDispose, readonly, shallowRef, watch } from 'vue'
 import { useKoraContext } from '../context'
 
 /**
@@ -26,7 +26,7 @@ import { useKoraContext } from '../context'
 export function useOfflineKeep(
 	query: OfflineKeepQuery | (() => OfflineKeepQuery),
 	options?: OfflineKeepOptions,
-) {
+): { held: Readonly<Ref<boolean>>; error: Readonly<Ref<Error | null>> } {
 	const { app } = useKoraContext()
 	const offline = app?.offline
 	const held = shallowRef(false)

@@ -10,9 +10,11 @@ interface MockAwareness {
 
 const state: {
 	syncEngine: { getAwarenessManager: () => MockAwareness } | null
+	app: { ready: Promise<void> } | null
 	awareness: MockAwareness
 } = {
 	syncEngine: null,
+	app: null,
 	awareness: { setLocalState: vi.fn() },
 }
 
@@ -20,7 +22,15 @@ let capturedCallback: ((states: AwarenessState[]) => void) | null = null
 const unsubscribeSpy = vi.fn()
 
 vi.mock('../context', () => ({
-	getKoraContext: () => ({ syncEngine: state.syncEngine }),
+	// Live getters, like the provider's context: the engine arrives when the store opens.
+	getKoraContext: () => ({
+		get syncEngine() {
+			return state.syncEngine
+		},
+		get app() {
+			return state.app
+		},
+	}),
 }))
 
 vi.mock('@korajs/sync', () => ({
@@ -35,6 +45,7 @@ vi.mock('@korajs/sync', () => ({
 
 afterEach(() => {
 	state.syncEngine = null
+	state.app = null
 	state.awareness = { setLocalState: vi.fn() }
 	capturedCallback = null
 	unsubscribeSpy.mockClear()
@@ -88,6 +99,29 @@ describe('createCollaboratorsStore', () => {
 
 		const seen: AwarenessState[][] = []
 		const stop = store.subscribe((states) => seen.push(states))
+
+		const remote = [{ user: { name: 'Bob', color: '#00f' } }] as unknown as AwarenessState[]
+		capturedCallback?.(remote)
+		expect(get(store)).toEqual(remote)
+
+		stop()
+		expect(unsubscribeSpy).toHaveBeenCalled()
+	})
+
+	it('follows the sync engine that arrives when the store opens', async () => {
+		let open = (): void => {}
+		state.app = {
+			ready: new Promise<void>((resolve) => {
+				open = resolve
+			}),
+		}
+		const store = createCollaboratorsStore()
+		const stop = store.subscribe(() => {})
+		expect(capturedCallback).toBeNull()
+
+		state.syncEngine = { getAwarenessManager: () => state.awareness }
+		open()
+		await state.app.ready
 
 		const remote = [{ user: { name: 'Bob', color: '#00f' } }] as unknown as AwarenessState[]
 		capturedCallback?.(remote)

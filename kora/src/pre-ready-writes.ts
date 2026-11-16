@@ -372,7 +372,11 @@ export class PreReadyWriteQueue {
 			// and so no key to record.
 			return this.run(this.store, { collection, kind, args, options, ...ids, writtenAt }, observer)
 		}
-		void import('./pre-ready-journal').then((m) => m.watchPageHide(this))
+		void import('./pre-ready-journal')
+			.then((m) => m.watchPageHide(this))
+			.catch((error: unknown) => {
+				console.error('[kora] Could not load the page-hide flush for early writes:', error)
+			})
 		return new Promise<unknown>((resolve, reject) => {
 			const item: Pending = {
 				collection,
@@ -567,9 +571,11 @@ export class PreReadyWriteQueue {
 		})
 		if (!this.warnedReasons.has(reason)) {
 			this.warnedReasons.add(reason)
-			void import('./pre-ready-recovery').then(({ warnJournal }) =>
-				warnJournal('memory-only', item.collection, reason),
-			)
+			void import('./pre-ready-recovery')
+				.then(({ warnJournal }) => warnJournal('memory-only', item.collection, reason))
+				.catch((error: unknown) => {
+					console.error('[kora] Could not load the journal warning:', error)
+				})
 		}
 	}
 

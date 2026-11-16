@@ -1,3 +1,4 @@
+import { KoraError } from '@korajs/core/lite'
 import { useKoraContext } from '../context/kora-context'
 import type { KoraAppLike } from '../types'
 
@@ -25,9 +26,10 @@ import type { KoraAppLike } from '../types'
 export function useApp<T extends KoraAppLike = KoraAppLike>(): T {
 	const { app } = useKoraContext()
 	if (!app) {
-		throw new Error(
+		throw new KoraError(
 			'useApp() requires KoraProvider to be initialized with an "app" prop. ' +
 				'Pass your createApp() result to <KoraProvider app={app}>.',
+			'KORA_NOT_PROVIDED',
 		)
 	}
 	return app as T

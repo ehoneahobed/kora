@@ -1,4 +1,6 @@
+import { isPendingStore } from '@korajs/core/bindings'
 import { asRichTextSyncEngine, createRichTextController } from '@korajs/store'
+import type { CollectionAccessor } from '@korajs/store'
 import type { AwarenessUser } from '@korajs/sync'
 import { onDestroy } from 'svelte'
 import { type Readable, get, readable } from 'svelte/store'
@@ -22,10 +24,13 @@ export function createRichTextBinding(
 	fieldName: string,
 	options?: UseRichTextOptions,
 ): UseRichTextResult & { subscribe: Readable<UseRichTextResult>['subscribe'] } {
-	const { store, syncEngine } = getKoraContext()
+	const { app, store, syncEngine } = getKoraContext()
 
 	const controller = createRichTextController({
-		collection: store.collection(collectionName),
+		collection:
+			isPendingStore(store) && app
+				? collectionWhenReady(app, store.collection(collectionName), collectionName)
+				: store.collection(collectionName),
 		collectionName,
 		recordId,
 		fieldName,
@@ -102,5 +107,24 @@ function buildResult(controller: ReturnType<typeof createRichTextController>): U
 		hasUnsavedChanges: snapshot.hasUnsavedChanges,
 		retrySave: () => controller.retrySave(),
 		getUnsavedState: () => controller.getUnsavedState(),
+	}
+}
+
+/**
+ * The accessor to give the controller while the store is still opening (the provider renders
+ * before it): the early accessor refuses `findById`, so this one waits for `app.ready` and
+ * reads the open store, as `KoraRichText` and the React and Vue bindings do.
+ */
+function collectionWhenReady(
+	app: { ready: Promise<void>; getStore(): { collection(name: string): CollectionAccessor } },
+	early: CollectionAccessor,
+	name: string,
+): CollectionAccessor {
+	return {
+		...early,
+		async findById(id: string) {
+			await app.ready
+			return app.getStore().collection(name).findById(id)
+		},
 	}
 }

@@ -1,5 +1,5 @@
 import { OFFLINE_STATUS_UNKNOWN, type OfflineStatus } from '@korajs/core/bindings'
-import { onScopeDispose, readonly, shallowRef } from 'vue'
+import { type DeepReadonly, type Ref, onScopeDispose, readonly, shallowRef } from 'vue'
 import { useKoraContext } from '../context'
 
 /**
@@ -7,7 +7,7 @@ import { useKoraContext } from '../context'
  * data it was told to keep. A readonly ref of `app.offline.status()`; it updates only when
  * the status changes and never touches the network.
  */
-export function useOfflineReady() {
+export function useOfflineReady(): Readonly<Ref<DeepReadonly<OfflineStatus>>> {
 	const { app } = useKoraContext()
 	const offline = app?.offline
 	const status = shallowRef<OfflineStatus>(offline?.status() ?? OFFLINE_STATUS_UNKNOWN)

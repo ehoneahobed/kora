@@ -1,11 +1,13 @@
+import { KoraError } from '@korajs/core/lite'
 import { getKoraContext } from '../context'
 import type { KoraAppLike } from '../types'
 
 export function getApp<T extends KoraAppLike = KoraAppLike>(): T {
 	const { app } = getKoraContext()
 	if (!app) {
-		throw new Error(
+		throw new KoraError(
 			'getApp() requires <KoraProvider app={kora}> or <KoraStoreProvider store={store}> with a createApp() instance.',
+			'KORA_NOT_PROVIDED',
 		)
 	}
 	return app as T

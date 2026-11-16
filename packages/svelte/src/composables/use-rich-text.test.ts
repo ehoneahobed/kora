@@ -3,8 +3,10 @@ import { cleanup, render, waitFor } from '@testing-library/svelte'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as Y from 'yjs'
+import EarlyRichTextBindingFlow from '../../tests/fixtures/EarlyRichTextBindingFlow.svelte'
 import RichTextBindingFlow from '../../tests/fixtures/RichTextBindingFlow.svelte'
 import RichTextControlsFlow from '../../tests/fixtures/RichTextControlsFlow.svelte'
+import type { KoraAppLike } from '../types'
 
 function encodeText(value: string): Uint8Array {
 	const doc = new Y.Doc()
@@ -124,5 +126,46 @@ describe('createRichTextBinding', () => {
 		})
 
 		expect(() => unmount()).not.toThrow()
+	})
+})
+
+describe('createRichTextBinding before the store opens', () => {
+	it('loads the record once app.ready resolves (the early accessor refuses findById)', async () => {
+		const helloBody = encodeText('Hello')
+		const early = {
+			findById: vi.fn(async () => {
+				throw new Error('findById is not available before app.ready')
+			}),
+			update: vi.fn(),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([])),
+		} as unknown as CollectionAccessor
+		const opened = {
+			findById: vi.fn(async () => ({ id: 'rec-1', body: helloBody })),
+			update: vi.fn(),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: helloBody }])),
+		} as unknown as CollectionAccessor
+		let open = (): void => {}
+		const ready = new Promise<void>((resolve) => {
+			open = resolve
+		})
+		const app = {
+			ready,
+			getStore: () => createMockStore({ notes: opened }),
+			getSyncEngine: () => null,
+			collections: { notes: early },
+		} as unknown as KoraAppLike
+
+		const { getByTestId } = render(EarlyRichTextBindingFlow, { props: { app } })
+		expect(getByTestId('value').textContent).toBe('loading')
+
+		open()
+		await waitFor(() => {
+			expect(getByTestId('value').textContent).toBe('Hello')
+		})
+		expect(early.findById).not.toHaveBeenCalled()
 	})
 })

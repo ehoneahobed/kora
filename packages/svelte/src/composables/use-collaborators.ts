@@ -7,16 +7,28 @@ import { getKoraContext } from '../context'
  * Readable store of remote collaborators' awareness states.
  */
 export function createCollaboratorsStore(): Readable<AwarenessState[]> {
-	const { syncEngine } = getKoraContext()
+	const context = getKoraContext()
 
 	return readable<AwarenessState[]>([], (set) => {
-		if (!syncEngine) {
-			set([])
-			return () => {}
+		let stop = (): void => {}
+		let cancelled = false
+		const attach = (): void => {
+			// Read here, not above: the engine arrives when the store opens.
+			const syncEngine = context.syncEngine
+			if (cancelled || !syncEngine) return
+			stop = subscribeRemoteAwarenessStates(syncEngine.getAwarenessManager(), set)
 		}
-
-		const awareness = syncEngine.getAwarenessManager()
-		return subscribeRemoteAwarenessStates(awareness, set)
+		set([])
+		if (context.syncEngine) {
+			attach()
+		} else if (context.app) {
+			// The provider renders before the store opens: follow the engine when it exists.
+			context.app.ready.then(attach, () => {})
+		}
+		return () => {
+			cancelled = true
+			stop()
+		}
 	})
 }
 

@@ -81,10 +81,12 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
   let showDone = $state(false)
 </script>
 
-<KoraQuery query={app.todos.where({ completed: showDone })} let:data>
-  {#each data as todo}
-    <p>{todo.title}</p>
-  {/each}
+<KoraQuery query={app.todos.where({ completed: showDone })}>
+  {#snippet children(data)}
+    {#each data as todo}
+      <p>{todo.title}</p>
+    {/each}
+  {/snippet}
 </KoraQuery>
 ```
 
@@ -92,7 +94,7 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
 
 | Export | Purpose |
 |--------|---------|
-| `KoraProvider.svelte` | Root provider (waits for `app.ready`, sets context) |
+| `KoraProvider.svelte` | Root provider: sets context and renders at once (`waitForStorage` holds the children until `app.ready`) |
 | `KoraStoreProvider.svelte` | Store-only provider (advanced / tests) |
 | `createQueryStore(query)` | Svelte readable store of results |
 | `createMutation(fn)` | Mutation controller |

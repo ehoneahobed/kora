@@ -14,6 +14,10 @@ const { store }: Props = $props()
 	<KoraRichText collectionName="notes" recordId="rec-1" fieldName="body">
 		{#snippet children(result)}
 			<span data-testid="value">{result.ready ? result.text.toString() : 'loading'}</span>
+			<span data-testid="unsaved">{String(result.hasUnsavedChanges)}</span>
+			<span data-testid="save-api"
+				>{typeof result.retrySave}/{typeof result.getUnsavedState}</span
+			>
 		{/snippet}
 	</KoraRichText>
 </TestKoraProvider>
