@@ -63,7 +63,7 @@ If you change a collection's shape, increment `version` and add a `migrations` e
 ## Commands
 
 - `npm run dev` starts everything: Vite dev server (port 5173), local sync server (port 3001), and the schema watcher.
-- `npm run build` type-checks and builds for production.
+- `npm run build` builds for production; `npm run check` type-checks (svelte-check).
 - `npx kora doctor` diagnoses a broken setup.
 - DevTools overlay: press Ctrl+Shift+K (Cmd+Shift+K on macOS) in the running app to inspect operations, merges, and sync status.
 

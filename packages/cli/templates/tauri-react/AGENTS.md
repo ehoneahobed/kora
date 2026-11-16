@@ -62,14 +62,14 @@ If you change a collection's shape, increment `version` and add a `migrations` e
 
 ## Commands
 
-- `npm run dev` starts everything: Vite dev server (port 5173), local sync server (port 3001), and the schema watcher.
-- `npm run build` type-checks and builds for production.
+- `npm run dev` starts everything: the local sync server (port 3001) and the Tauri desktop shell, which runs the Vite dev server (port 5173).
+- `npm run build` builds the desktop app for release (`tauri build`).
 - `npx kora doctor` diagnoses a broken setup.
 - DevTools overlay: press Ctrl+Shift+K (Cmd+Shift+K on macOS) in the running app to inspect operations, merges, and sync status.
 
 ## Sync and auth
 
-Sync is configured in `src/main.*` via `createApp({ sync: { url, authClient } })`. In dev, the sync URL is derived from the page host and proxied by Vite; in production set `VITE_SYNC_URL`. Auth (if present in this template) uses `@korajs/auth`; the client is created in `src/auth.ts`. Local writes work without sign-in; sync requires the server to accept the connection.
+Sync is configured in `src/AppShell.tsx` via `createApp({ sync: { url, authClient } })`. The sync URL comes from the first-launch setup screen (stored by `src/sync-config.ts`), or from `VITE_SYNC_URL` set at build time, which skips that screen. Auth (if present in this template) uses `@korajs/auth`; the client is created in `src/auth.ts`. Local writes work without sign-in; sync requires the server to accept the connection.
 
 ## React bindings
 
@@ -88,4 +88,4 @@ Rules: always render `mutation.error` somewhere. The app must work under React S
 
 ## Tauri specifics
 
-This app runs inside Tauri with native SQLite storage through the bundled plugin. Web-only APIs (OPFS) are not the storage path here; do not add browser-storage assumptions. Use `npm run tauri dev` for the desktop shell and consult https://korajs.dev/guide/tauri-desktop.md before changing storage or plugin configuration.
+This app runs inside Tauri with native SQLite storage through the bundled plugin. Web-only APIs (OPFS) are not the storage path here; do not add browser-storage assumptions. Use `npm run dev` for the sync server and desktop shell together (`npm run dev:app` for the desktop shell alone) and consult https://korajs.dev/guide/tauri-desktop.md before changing storage or plugin configuration.
