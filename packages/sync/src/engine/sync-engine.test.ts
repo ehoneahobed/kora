@@ -1,7 +1,7 @@
 import type { Operation, VersionVector } from '@korajs/core'
 import type { KoraEvent, KoraEventEmitter, KoraEventListener, KoraEventType } from '@korajs/core'
-import { APPLY_FAILURE_CODES, SyncError } from '@korajs/core'
-import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { APPLY_FAILURE_CODES } from '@korajs/core'
+import { describe, expect, test, vi } from 'vitest'
 import { encodeDeltaCursor } from '../delta/delta-cursor'
 import type {
 	AcknowledgmentMessage,

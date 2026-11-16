@@ -1,5 +1,4 @@
 import type {
-	ApplyFailureReason,
 	ApplyResult,
 	OfflineCompletion,
 	Operation,

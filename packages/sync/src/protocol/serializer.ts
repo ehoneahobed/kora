@@ -6,11 +6,6 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import type {
-	AcknowledgmentMessage,
-	ErrorMessage,
-	HandshakeMessage,
-	HandshakeResponseMessage,
-	OperationBatchMessage,
 	SerializedOperation,
 	SyncMessage,
 	WireFormat,

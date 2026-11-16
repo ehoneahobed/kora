@@ -18,11 +18,6 @@ import type { EncryptedOperationEnvelope, HLCTimestamp, Operation } from '@koraj
 import protobuf from 'protobufjs/minimal.js'
 import { isEncryptionKeyMessageType } from '../encryption/key-messages'
 import type {
-	AcknowledgmentMessage,
-	ErrorMessage,
-	HandshakeMessage,
-	HandshakeResponseMessage,
-	OperationBatchMessage,
 	SerializedOperation,
 	SyncMessage,
 	WireFormat,
@@ -35,8 +30,6 @@ import {
 	normalizeEnvelope,
 	normalizeFieldVersions,
 	toBytes,
-	versionVectorToWire,
-	wireToVersionVector,
 } from './serializer'
 
 type Reader = protobuf.Reader

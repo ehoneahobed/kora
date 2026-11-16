@@ -9,7 +9,6 @@ import type {
 	OfflineUnitKey,
 	Operation,
 	OperationTransform,
-	SyncDiagnosticsSnapshot,
 	VersionVector,
 } from '@korajs/core'
 import {
@@ -34,7 +33,6 @@ import {
 	createDeltaCursorFromBatch,
 	decodeDeltaCursor,
 	encodeDeltaCursor,
-	sliceOperationsAfterCursor,
 } from '../delta/delta-cursor'
 import { SyncMetricsCollector } from '../diagnostics/metrics-collector'
 import type { MetricsCollectorConfig } from '../diagnostics/metrics-collector'
@@ -3357,8 +3355,9 @@ export class SyncEngine {
 	}
 
 	/**
-	 * The oldest batch taken from the queue and not yet resolved (diagnostics and
-	 * tests); null when nothing is in flight.
+	 * The oldest batch taken from the queue and not yet resolved; null when nothing is in
+	 * flight. Unused by the engine itself: tests read it through a cast
+	 * (`kora/tests/repro/SYNC-10.test.ts`).
 	 */
 	private get currentBatch(): OutboundBatch | null {
 		const first = this.inFlightUploads.values().next()
