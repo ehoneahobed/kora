@@ -42,6 +42,21 @@ describe('bundled template manifests', () => {
 		},
 	)
 
+	test.each(templates)('%s: ships a .env.example (kora doctor reads it)', (template) => {
+		expect(existsSync(join(templatesDir, template, '.env.example'))).toBe(true)
+	})
+
+	test.each(templates)(
+		'%s: the .env.example sync URL points at the server sync path',
+		(template) => {
+			const env = readFileSync(join(templatesDir, template, '.env.example'), 'utf-8')
+			// server.ts and createProductionServer accept WebSocket upgrades only at /kora-sync.
+			for (const [, url] of env.matchAll(/VITE_SYNC_URL=(\S+)/g)) {
+				expect(new URL(url as string).pathname).toBe('/kora-sync')
+			}
+		},
+	)
+
 	test.each(templates)('%s: @lucide/svelte is pinned to a published range', (template) => {
 		const range = manifest(template).dependencies?.['@lucide/svelte']
 		// @lucide/svelte's first stable release is 0.479.0; ^0.468.0 matches nothing.
