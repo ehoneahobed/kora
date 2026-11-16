@@ -226,7 +226,7 @@ function Main() {
 }
 ```
 
-The `AuthProvider` calls `authClient.initialize()` on mount, which restores any existing session from stored tokens. If the access token has expired, it refreshes using the stored refresh token. Returning users are signed in without any action, also offline: network errors, timeouts, 5xx responses, rate limits and captive portals never sign anyone out or destroy tokens. While the auth server cannot be reached the session is `authenticated-offline` (the user's identity is known, `token` is `null`), the user's own local database opens, and only sync waits for a fresh token.
+The `AuthProvider` calls `authClient.initialize()` on mount, which restores any existing session from stored tokens. If the access token has expired, it refreshes using the stored refresh token. Returning users are signed in without any action, also offline: network errors, timeouts, 5xx responses, rate limits and captive portals never sign anyone out or destroy tokens. While the auth server cannot be reached the user stays `authenticated` with session status `offline` (the user's identity is known, `token` is `null`), the user's own local database opens, and only sync waits for a fresh token.
 
 A user with MFA enabled gets `MfaRequiredError` from `signIn`; complete it with
 `authClient.verifyMfa(error.mfaToken, { code })` (or `{ recoveryCode }`).
@@ -1204,10 +1204,14 @@ Kora ships with five built-in roles, ordered by decreasing privilege:
 ### Server Setup
 
 ```typescript
-import { OrgRoutes, InMemoryOrgStore } from '@korajs/auth/server'
+import { OrgRoutes, InMemoryOrgStore, createSqliteUserStore } from '@korajs/auth/server'
 
+const userStore = await createSqliteUserStore({ filename: './auth.db' })
 const orgStore = new InMemoryOrgStore()
-const orgRoutes = new OrgRoutes({ orgStore })
+// Invitations are listed and accepted only for the caller's own verified email: without
+// `userLookup` (a UserStore satisfies it), pass the verified identity to
+// `acceptInvitation` / `listMyInvitations` yourself.
+const orgRoutes = new OrgRoutes({ orgStore, userLookup: userStore })
 ```
 
 ### Creating Organizations
@@ -1586,8 +1590,10 @@ app.post('/auth/passkey/login/verify', async (req, res) => {
     // Update the stored sign count to detect cloned authenticators
     await updateSignCount(req.body.credentialId, result.newSignCount)
 
-    // Issue auth tokens
-    const tokens = tokenManager.issueTokens(storedCredential.userId, 'passkey')
+    // Issue auth tokens for the requesting device, recording the passkey as the method
+    const tokens = tokenManager.issueTokens(storedCredential.userId, req.body.deviceId, undefined, {
+      amr: ['hwk'],
+    })
     res.json({ data: { tokens } })
   } else {
     res.status(401).json({ error: 'Passkey verification failed.' })
