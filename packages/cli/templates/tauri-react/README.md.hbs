@@ -103,7 +103,7 @@ Built apps check the update address when they start. When a newer signed version
 
 4. Add `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to your GitHub repo secrets. The release workflow signs the update files with them (`createUpdaterArtifacts` is turned on only there, so local builds work without the key).
 
-5. Push a version tag to trigger a release:
+5. Push a version tag to trigger a release. The tag is the version: the workflow writes it into `package.json`, `tauri.conf.json` and `Cargo.toml` before building, so each release needs a new, higher tag (a manual run asks for the tag):
    ```bash
    git tag v1.0.0 && git push origin v1.0.0
    ```
