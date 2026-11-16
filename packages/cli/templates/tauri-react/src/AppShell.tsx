@@ -4,6 +4,7 @@ import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { App } from './App'
 import { AuthBoundary, retryImport } from './AuthBoundary'
 import { SetupScreen } from './SetupScreen'
+import { UpdateBanner } from './UpdateBanner'
 import schema from './schema'
 import {
 	clearSyncUrl,
@@ -13,7 +14,6 @@ import {
 	markSetupComplete,
 	setSyncUrl,
 } from './sync-config'
-import { UpdateBanner } from './UpdateBanner'
 
 // The sign-in client is not on the first paint's path: the list renders from the local database.
 const AuthBridge = lazy(() => retryImport(() => import('./AuthBridge')))

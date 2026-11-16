@@ -49,6 +49,7 @@ export function describeUpdateError(error: unknown): string {
 	if (/pubkey|endpoints|not configured/i.test(text)) return 'Updates are not set up for this build.'
 	if (/network|connect|dns|timed? ?out|offline|request/i.test(text))
 		return 'Could not reach the update server.'
-	if (/signature/i.test(text)) return 'An update was found but its signature did not match, so it was not installed.'
+	if (/signature/i.test(text))
+		return 'An update was found but its signature did not match, so it was not installed.'
 	return `Could not check for updates (${text}).`
 }

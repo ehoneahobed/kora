@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { checkForUpdate, type UpdateCheck } from './updater'
+import { type UpdateCheck, checkForUpdate } from './updater'
 
 type Available = Extract<UpdateCheck, { state: 'available' }>
 
@@ -32,7 +32,9 @@ export function UpdateBanner() {
 		setStatus('Downloading...')
 		try {
 			await update.install((fraction) => setStatus(`Downloading... ${Math.round(fraction * 100)}%`))
-			setStatus(`Version ${update.version} is installed. Close the app and open it again to use it.`)
+			setStatus(
+				`Version ${update.version} is installed. Close the app and open it again to use it.`,
+			)
 		} catch (error) {
 			setStatus(error instanceof Error ? error.message : 'The update could not be installed.')
 			setBusy(false)
@@ -59,7 +61,12 @@ export function UpdateBanner() {
 					<button type="button" onClick={() => setUpdate(null)} style={{ cursor: 'pointer' }}>
 						Later
 					</button>
-					<button type="button" onClick={() => void install()} disabled={busy} style={{ cursor: 'pointer' }}>
+					<button
+						type="button"
+						onClick={() => void install()}
+						disabled={busy}
+						style={{ cursor: 'pointer' }}
+					>
 						Install
 					</button>
 				</>
