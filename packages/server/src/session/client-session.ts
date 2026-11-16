@@ -1149,6 +1149,10 @@ export class ClientSession {
 			// Transport errors during active session cause close
 			if (this.state !== 'closed') {
 				this.handleTransportClose()
+				// A frame that fails to decode leaves the connection open: close it, or the
+				// socket outlives its session (no longer counted by maxConnections, and its
+				// handshake deadline cleared) for as long as the peer answers pings.
+				if (this.transport.isConnected()) this.transport.close(1002, 'invalid message')
 			}
 		})
 	}

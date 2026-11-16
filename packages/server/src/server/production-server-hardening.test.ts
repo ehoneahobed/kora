@@ -2,6 +2,7 @@ import { request } from 'node:http'
 import { connect } from 'node:net'
 import { defineSchema, t } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
+import { WebSocket } from 'ws'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createSqliteServerStore } from '../store/sqlite-server-store'
 import { type ProductionServer, createProductionServer } from './production-server'
@@ -142,6 +143,17 @@ describe('production server robustness', () => {
 			socket.on('error', () => resolve())
 		})
 		expect((await fetch(`${base}/health`)).status).toBe(200)
+	})
+
+	test('a frame that fails to decode closes the socket', async () => {
+		const base = await start()
+		const ws = new WebSocket(`${base.replace('http', 'ws')}/kora-sync`)
+		const code = await new Promise<number>((resolve, reject) => {
+			ws.on('open', () => ws.send('{'))
+			ws.on('close', (closeCode) => resolve(closeCode))
+			ws.on('error', reject)
+		})
+		expect(code).toBe(1002)
 	})
 
 	test('stop() ends open dashboard feeds', async () => {
