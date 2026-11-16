@@ -21,7 +21,10 @@ export interface ReconnectionConfig {
 	 * being retried at the initial interval forever. Defaults to 10000.
 	 */
 	stableAfterMs?: number
-	/** Injectable time source for deterministic testing. */
+	/**
+	 * @deprecated Never read: the backoff waits on `setTimeout`, so deterministic tests use
+	 * fake timers (and `randomSource` for the jitter).
+	 */
 	timeSource?: TimeSource
 	/** Injectable random source for deterministic jitter. Returns value in [0, 1). */
 	randomSource?: () => number

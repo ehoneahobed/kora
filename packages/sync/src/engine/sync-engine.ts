@@ -9,7 +9,6 @@ import type {
 	OfflineUnitKey,
 	Operation,
 	OperationTransform,
-	SyncDiagnosticsSnapshot,
 	VersionVector,
 } from '@korajs/core'
 import {
@@ -34,7 +33,6 @@ import {
 	createDeltaCursorFromBatch,
 	decodeDeltaCursor,
 	encodeDeltaCursor,
-	sliceOperationsAfterCursor,
 } from '../delta/delta-cursor'
 import { SyncMetricsCollector } from '../diagnostics/metrics-collector'
 import type { MetricsCollectorConfig } from '../diagnostics/metrics-collector'
@@ -2211,7 +2209,9 @@ export class SyncEngine {
 	/** Atomically replace the manifest used by static query-subset mode. */
 	setQuerySubsets(subsets: SyncQuerySubset[]): void {
 		if ((this.config.querySubsets?.mode ?? 'reactive') !== 'static')
-			throw new Error('setQuerySubsets() requires sync.querySubsets.mode = "static"')
+			throw new SyncError('setQuerySubsets() requires sync.querySubsets.mode = "static"', {
+				mode: this.config.querySubsets?.mode ?? 'reactive',
+			})
 		const previousSignature = this.deliverySignature()
 		const previousEffective = this.getActiveQuerySubsets()
 		this.staticQuerySubsets = dedupeQuerySubsets(subsets)
@@ -3355,8 +3355,9 @@ export class SyncEngine {
 	}
 
 	/**
-	 * The oldest batch taken from the queue and not yet resolved (diagnostics and
-	 * tests); null when nothing is in flight.
+	 * The oldest batch taken from the queue and not yet resolved; null when nothing is in
+	 * flight. Unused by the engine itself: tests read it through a cast
+	 * (`kora/tests/repro/SYNC-10.test.ts`).
 	 */
 	private get currentBatch(): OutboundBatch | null {
 		const first = this.inFlightUploads.values().next()
@@ -4237,7 +4238,9 @@ export class SyncEngine {
 			if (moved()) return stale()
 			try {
 				if (!this.store.applyCollectionNarrowing) {
-					throw new Error('The configured sync store does not support access narrowing')
+					throw new SyncError('The configured sync store does not support access narrowing', {
+						collection,
+					})
 				}
 				const hidden = await this.store.applyCollectionNarrowing(
 					collection,
@@ -5739,7 +5742,7 @@ export class SyncEngine {
 	): Promise<void> {
 		if (applyToStore) {
 			if (!this.store.applyScopeRetraction) {
-				throw new Error('The configured sync store does not support scope retractions')
+				throw new SyncError('The configured sync store does not support scope retractions')
 			}
 			// The hide waits for the database (an unbounded wait while a transaction is open): the
 			// store asks, inside its own transaction and before it writes, whether the delivery

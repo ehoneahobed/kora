@@ -29,7 +29,6 @@ import {
 } from './keyring-crypto'
 
 const ITERATIONS = 1000
-const OWNER = 'u:alice'
 
 function clone<T>(value: T): T {
 	return JSON.parse(JSON.stringify(value)) as T

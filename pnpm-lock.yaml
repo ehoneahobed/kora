@@ -659,9 +659,6 @@ importers:
       '@korajs/core':
         specifier: workspace:*
         version: link:../core
-      '@korajs/merge':
-        specifier: workspace:*
-        version: link:../merge
       protobufjs:
         specifier: ^8.0.1
         version: 8.0.1

@@ -8,7 +8,6 @@ import type {
 	SyncMessage,
 } from '../../src/protocol/messages'
 import { JsonMessageSerializer } from '../../src/protocol/serializer'
-import { versionVectorToWire } from '../../src/protocol/serializer'
 import { createMemoryTransportPair } from '../../src/transport/memory-transport'
 import {
 	createMockEmitter,

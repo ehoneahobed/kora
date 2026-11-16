@@ -55,6 +55,12 @@ export class HttpLongPollingTransport implements SyncTransport {
 
 	private connected = false
 	private polling = false
+	/**
+	 * Bumped whenever the poll loop must end (disconnect, session ended). A loop resuming
+	 * from an await checks it, so a loop of a finished session never polls beside the next
+	 * session's loop or reports a close for it.
+	 */
+	private pollGeneration = 0
 	private url: string | null = null
 	private authToken: string | undefined
 	private pollAbort: AbortController | null = null
@@ -126,6 +132,7 @@ export class HttpLongPollingTransport implements SyncTransport {
 
 		this.connected = false
 		this.polling = false
+		this.pollGeneration++
 		this.pollAbort?.abort()
 		this.pollAbort = null
 		this.url = null
@@ -234,7 +241,7 @@ export class HttpLongPollingTransport implements SyncTransport {
 	private startPolling(): void {
 		if (this.polling || !this.connected) return
 		this.polling = true
-		void this.runPollLoop()
+		void this.runPollLoop(this.pollGeneration)
 	}
 
 	/** The server-side session is gone: stop and report a close so the engine reconnects. */
@@ -242,20 +249,30 @@ export class HttpLongPollingTransport implements SyncTransport {
 		if (!this.connected) return
 		this.connected = false
 		this.polling = false
+		this.pollGeneration++
 		this.pollAbort?.abort()
 		this.pollAbort = null
 		this.sessionId = null
 		this.closeHandler?.(`http sync session ended (${String(status)})`)
 	}
 
-	private async runPollLoop(): Promise<void> {
-		while (this.polling && this.connected && this.url) {
+	/**
+	 * Long-poll until the loop's generation ends. It reports no close of its own: an
+	 * intentional disconnect fires no close handler, and a session the server ended was
+	 * already reported by {@link endSession}.
+	 */
+	private async runPollLoop(generation: number): Promise<void> {
+		const current = (): boolean => generation === this.pollGeneration
+		while (current() && this.polling && this.connected && this.url) {
 			try {
 				const response = await this.fetchImpl(this.url, {
 					method: 'GET',
 					headers: this.makeHeaders(),
 					signal: this.pollAbort?.signal,
 				})
+
+				// A response that arrives for a finished session must not end the next one.
+				if (!current()) break
 
 				if (SESSION_ENDED_STATUSES.has(response.status)) {
 					this.endSession(response.status)
@@ -278,10 +295,11 @@ export class HttpLongPollingTransport implements SyncTransport {
 					continue
 				}
 
+				if (!current()) break
 				const message = this.serializer.decode(payload)
 				this.messageHandler?.(message)
 			} catch (error) {
-				if (!this.connected || !this.polling) {
+				if (!current() || !this.connected || !this.polling) {
 					break
 				}
 
@@ -292,10 +310,6 @@ export class HttpLongPollingTransport implements SyncTransport {
 				this.errorHandler?.(error instanceof Error ? error : new Error(String(error)))
 				await sleep(this.retryDelayMs)
 			}
-		}
-
-		if (!this.connected) {
-			this.closeHandler?.('http long-polling disconnected')
 		}
 	}
 

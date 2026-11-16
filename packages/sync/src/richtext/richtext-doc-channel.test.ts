@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from 'vitest'
+import { describe, expect, test } from 'vitest'
 import type { YjsDocUpdateMessage } from '../protocol/messages'
 import { decodeYjsUpdate, encodeYjsUpdate } from './doc-channel-wire'
 import { RichtextDocChannel } from './richtext-doc-channel'

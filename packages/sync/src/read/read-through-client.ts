@@ -356,7 +356,7 @@ function interpret(response: ReadFetchResponse, text: string): Attempt {
 		if (!isReadResponse(parsed)) return invalid('The read answer has an unexpected shape.')
 		return { kind: 'ok', response: expandResponse(parsed) }
 	}
-	const body = parseErrorBody(text)
+	const body = parseErrorBody(text, status)
 	const message = body?.error.message ?? `The read endpoint answered ${status}.`
 	if (status === 404) {
 		return {
@@ -430,7 +430,8 @@ function isReadResponse(value: unknown): value is ReadResponse {
 	)
 }
 
-function parseErrorBody(text: string): ReadErrorBody | null {
+/** The error body, if any; a body that does not say whether it is retriable defers to the status. */
+function parseErrorBody(text: string, status: number): ReadErrorBody | null {
 	try {
 		const parsed: unknown = JSON.parse(text)
 		if (typeof parsed !== 'object' || parsed === null) return null
@@ -442,7 +443,8 @@ function parseErrorBody(text: string): ReadErrorBody | null {
 			error: {
 				code: fields.code,
 				message: fields.message,
-				retriable: fields.retriable === true,
+				retriable:
+					typeof fields.retriable === 'boolean' ? fields.retriable : RETRIABLE_STATUSES.has(status),
 				...(typeof fields.retryAfterMs === 'number' ? { retryAfterMs: fields.retryAfterMs } : {}),
 			},
 		}

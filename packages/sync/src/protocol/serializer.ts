@@ -5,16 +5,7 @@ import type {
 	Operation,
 	VersionVector,
 } from '@korajs/core'
-import type {
-	AcknowledgmentMessage,
-	ErrorMessage,
-	HandshakeMessage,
-	HandshakeResponseMessage,
-	OperationBatchMessage,
-	SerializedOperation,
-	SyncMessage,
-	WireFormat,
-} from './messages'
+import type { SerializedOperation, SyncMessage, WireFormat } from './messages'
 import { isSyncMessage } from './messages'
 
 export type EncodedMessage = string | Uint8Array

@@ -1,4 +1,4 @@
-import type { Operation, VersionVector } from '@korajs/core'
+import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { createMockSyncStore, createTestOperations } from '../../tests/fixtures/test-helpers'
 import { SyncEngine } from '../engine/sync-engine'

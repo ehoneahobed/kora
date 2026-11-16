@@ -17,16 +17,7 @@ import type { EncryptedOperationEnvelope, HLCTimestamp, Operation } from '@koraj
 // (bundlers tolerate it, which is why this only breaks in plain Node).
 import protobuf from 'protobufjs/minimal.js'
 import { isEncryptionKeyMessageType } from '../encryption/key-messages'
-import type {
-	AcknowledgmentMessage,
-	ErrorMessage,
-	HandshakeMessage,
-	HandshakeResponseMessage,
-	OperationBatchMessage,
-	SerializedOperation,
-	SyncMessage,
-	WireFormat,
-} from './messages'
+import type { SerializedOperation, SyncMessage, WireFormat } from './messages'
 import { isSyncMessage } from './messages'
 import {
 	type EncodedMessage,
@@ -35,8 +26,6 @@ import {
 	normalizeEnvelope,
 	normalizeFieldVersions,
 	toBytes,
-	versionVectorToWire,
-	wireToVersionVector,
 } from './serializer'
 
 type Reader = protobuf.Reader
