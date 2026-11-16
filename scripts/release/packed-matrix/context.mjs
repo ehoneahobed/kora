@@ -31,7 +31,7 @@ const THIRD_PARTY = { postgres: '^3.4.0', ws: '^8.18.0' }
 
 /** @returns {{ dir: string, manifest: Record<string, any> }[]} every publishable package */
 export function listPublishable() {
-	const dirs = ['kora', 'create-kora-app']
+	const dirs = ['kora']
 	for (const entry of readdirSync(join(ROOT, 'packages'))) dirs.push(join('packages', entry))
 	return dirs
 		.map((dir) => ({ dir, path: join(ROOT, dir, 'package.json') }))

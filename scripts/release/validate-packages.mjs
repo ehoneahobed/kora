@@ -21,7 +21,7 @@ import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '../..')
-const packageDirs = ['kora', 'create-kora-app']
+const packageDirs = ['kora']
 for (const entry of readdirSync(join(root, 'packages'))) {
 	packageDirs.push(join('packages', entry))
 }
