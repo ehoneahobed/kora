@@ -1,5 +1,4 @@
 import type { OrgStore } from '../org/org-store'
-import type { OrgRole } from '../org/org-types'
 import type { RbacEngine } from './rbac-engine'
 import type {
 	CollectionScopeResolver,

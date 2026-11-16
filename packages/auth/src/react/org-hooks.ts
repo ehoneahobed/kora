@@ -12,7 +12,6 @@ import {
 	type OrgSnapshot,
 	checkOrgPermission,
 	createOrgMembersActions,
-	createOrgSession,
 	loadOrgMembers,
 } from '../bindings/create-org-session'
 import type {

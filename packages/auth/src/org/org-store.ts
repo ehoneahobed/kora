@@ -93,7 +93,6 @@ export interface OrgStore {
 	/** Consume an invitation (mark as accepted). Returns the invitation details. */
 	consumeInvitation(token: string): Promise<OrgInvitation>
 
-	/** Revoke a pending invitation. */
 	/**
 	 * Revoke a pending invitation of `orgId`. Must throw InvitationNotFoundError
 	 * when the invitation belongs to another org (AUTH-4).

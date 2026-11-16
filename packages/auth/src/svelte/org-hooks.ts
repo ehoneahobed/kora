@@ -52,7 +52,7 @@ function createOrgSnapshotStore(): Readable<{
 }
 
 export function useOrg(): UseOrgResult {
-	const { client, session } = getOrgContext()
+	const { client } = getOrgContext()
 	const snapshotStore = createOrgSnapshotStore()
 	const error = writable<string | null>(null)
 

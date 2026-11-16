@@ -193,7 +193,7 @@ const RETRY_DELAYS_MS = [1000, 5000, 30000] // 1s, 5s, 30s
  *   events: ['user.created', 'user.signin'],
  * })
  *
- * // Dispatch an event (usually called internally by auth system)
+ * // Dispatch an event (the app calls this; the auth server does not dispatch on its own)
  * await webhooks.dispatch('user.created', { userId: 'user-123', email: 'alice@example.com' })
  * ```
  */

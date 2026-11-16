@@ -6,7 +6,6 @@ import {
 	type TokenManagerConfig,
 	type TokenRevocationStore,
 } from '../../tokens/token-manager'
-import type { AuthTokens } from '../../types'
 import {
 	DuplicateLinkedIdentityError,
 	InMemoryLinkedIdentityStore,
@@ -23,7 +22,6 @@ import { AuthActivity, type AuthActivitySnapshot, countedSend } from './auth-act
 import {
 	type AuthRevocationEvent,
 	type AuthRouteResponse,
-	type AuthRoutesConfig,
 	BuiltInAuthRoutes,
 	type ChallengeStore,
 	type MfaVerifier,
@@ -539,7 +537,6 @@ async function handleOAuthRequest(params: {
 		oauth,
 		routes,
 		userStore,
-		tokenManager,
 		relativePath,
 		method,
 		body,

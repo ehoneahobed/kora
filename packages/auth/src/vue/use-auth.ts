@@ -1,4 +1,4 @@
-import { computed, onScopeDispose, reactive } from 'vue'
+import { type ComputedRef, computed, onScopeDispose, reactive } from 'vue'
 import type {
 	AuthUser,
 	LinkedOAuthAccount,
@@ -122,7 +122,7 @@ export function useAuth(): UseAuthResult {
 	}
 }
 
-export function useCurrentUser() {
+export function useCurrentUser(): ComputedRef<AuthUser | null> {
 	const { session } = useAuthContext()
 	const state = reactive({ user: session.getSnapshot().user })
 
