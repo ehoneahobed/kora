@@ -12,7 +12,7 @@ useSynchronousDigest()
 /**
  * Instant-UI S6a: `store.transaction` (what `app.transaction` and `app.mutation` call)
  * predicted as one entry group, end to end on a real Store with commits held at a gate by
- * the test. Design: docs/design/instant-ui-updates.md, "S6a design". No timers.
+ * the test. Design: docs/design/instant-ui-updates.md 5.9. No timers.
  */
 const schema = defineSchema({
 	version: 1,

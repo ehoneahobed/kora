@@ -1,6 +1,6 @@
 /**
  * First-visit parity S3: a large initial delivery stream is applied into a scratch replica
- * and merged into the live database once (docs/design/first-visit-parity.md 5.7).
+ * and merged into the live database once (docs/design/first-visit-parity.md 6).
  *
  * A "direct" device (`bulkReplication: false`) applies the same batches the ordinary way and
  * is the reference: the staged device must end in exactly its state (rows, fold states, op

@@ -7,7 +7,7 @@ import { Store } from '../store/store'
 import { expectTimingGate } from './timing-gate'
 
 /**
- * Node gates for instant-UI stage S3 (docs/design/instant-ui-updates.md 13, S3):
+ * Node gates for patched queries (docs/design/instant-ui-updates.md 11):
  *
  * - write to subscriber callback under 2 ms while the write's commit is still pending;
  * - one write patched into 1,000 subscriptions of 100 rows each (all on the written

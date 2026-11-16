@@ -22,7 +22,7 @@ import {
 
 /**
  * Wire types of the read-through endpoint, `POST <syncPath>/read` (first-visit parity S2,
- * `docs/design/first-visit-parity.md` section 5.4.1). They are owned by `@korajs/sync`, which
+ * `docs/design/first-visit-parity.md` section 4). They are owned by `@korajs/sync`, which
  * the device-side read client shares them with; the server re-exports them.
  */
 export { READ_PROTOCOL_VERSION }

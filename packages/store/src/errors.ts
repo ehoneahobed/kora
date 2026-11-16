@@ -444,7 +444,7 @@ export class VersionGateClosedError extends KoraError {
  * Raised (in test builds only, `NODE_ENV=test`) when the instant-updates overlay predicted
  * something the database then disagreed with. Production builds report the same fact as
  * the `store:overlay-diverged` event and keep going; a test build fails loudly so a
- * prediction bug is found by the app's own tests (docs/design/instant-ui-updates.md 16.9).
+ * prediction bug is found by the app's own tests (docs/design/instant-ui-updates.md 6 and 12).
  */
 export class OverlayDivergedError extends KoraError {
 	constructor(

@@ -31,12 +31,12 @@ export {
  *   dispatching `kora:update-waiting` meanwhile, so a reload never loses a write on screen. On a first
  *   visit it registers the worker only after the app's first data, and the install reuses
  *   the HTTP cache, so the precache never competes with the app or downloads it twice
- *   (first-visit parity, docs/design/first-visit-parity.md section 5.8).
+ *   (first-visit parity, docs/design/first-visit-parity.md section 7).
  *
  * In `vite dev` it injects a script that unregisters any Kora service worker left on the
  * dev origin, so a stale shell can never shadow the dev server.
  *
- * Built in-house instead of `vite-plugin-pwa` (CLAUDE.md: justify every dependency): the
+ * Built in-house instead of `vite-plugin-pwa` (AGENTS.md: justify every dependency): the
  * whole worker is under 150 lines, needs no Workbox runtime, and its caching rules are the
  * ones a Kora app specifically needs (never cache the sync endpoint or auth routes; never
  * serve an unhashed file such as `assets/sqlite3.wasm` cache-first).

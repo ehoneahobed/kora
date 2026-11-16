@@ -462,7 +462,7 @@ describe('predictLocalUpdate', () => {
 			options: {},
 		})
 		expect(predicted).toMatchObject({ values: { tags: committed } })
-		// Recorded as found: the visible copy survives the removal (see the S6b result in
+		// Recorded as found: the visible copy survives the removal (see section 5.10 of
 		// docs/design/instant-ui-updates.md).
 		expect(committed).toEqual(['y'])
 	})

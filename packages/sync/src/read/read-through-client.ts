@@ -13,7 +13,7 @@ import {
 } from './read-types'
 
 /**
- * The read-through client (first-visit parity S4b, `docs/design/first-visit-parity.md` 5.2):
+ * The read-through client (`docs/design/first-visit-parity.md` 5):
  * asks the server for the answer to a query before this device has replicated anything.
  *
  * It has no store, engine or transport dependency, so it lives in the lite entry and can run

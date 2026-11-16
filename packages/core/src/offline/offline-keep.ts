@@ -10,7 +10,7 @@
 import { hashBlob } from '../blob/blob-ref'
 import { KoraError } from '../errors/errors'
 
-/** The most pins one database keeps (decision 5: pins travel in the handshake). */
+/** The most pins one database keeps (pins travel in the handshake, so their number is bounded). */
 export const OFFLINE_PIN_LIMIT = 64
 
 /** Why a keep request was refused. */

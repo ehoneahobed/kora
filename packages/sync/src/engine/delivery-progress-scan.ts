@@ -1,6 +1,6 @@
 /**
  * A syntax-tree scan of the sync engine's source for who writes the delivery position
- * (docs/design/first-visit-parity.md, S3 review round 6). Test support only: it is not exported
+ * (docs/design/first-visit-parity.md 6, "One writer for the delivery position"). Test support only: it is not exported
  * from the package and nothing at runtime imports it.
  *
  * Four review rounds found the same bug class four times: a write of the position after an

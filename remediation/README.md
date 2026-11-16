@@ -1,7 +1,7 @@
 # Remediation programme
 
 This folder tracks the fix programme for the 106 verified defects found in the October 2026
-review of Kora 1.0.0-beta.12 (first review plus the LMS team intake). One of them, SEC-9, is
+review of Kora 1.0.0-beta.12 (a security and correctness review plus field reports from production apps). One of them, SEC-9, is
 tracked as two parts, so the tracker has 107 entries. Nothing here is aspirational: every entry
 is backed by a reproduction test that fails today and must pass when the fix lands, and CI
 enforces it.
@@ -11,7 +11,7 @@ enforces it.
 | `tracker.json` | One entry per problem: severity, workstream, phase, status, PR, and the tests that prove it. **The source of truth.** |
 | `baseline.json` | Every repro result at the start (commit recorded inside). Decides which tests are repro tests (failing) and which are guards (passing). |
 | `STATUS.md` | Generated progress report. Never edit by hand. |
-| `evidence/` | The plan (`kora-fix-plan.md`) and the red-team and compatibility reports the tracker cites. |
+| `evidence/` | Compatibility results for upgrades from beta.12. |
 
 The checker lives at `scripts/remediation/check.mjs`; CI runs it in `.github/workflows/remediation.yml`.
 
@@ -34,10 +34,10 @@ The checker lives at `scripts/remediation/check.mjs`; CI runs it in `.github/wor
 ## Workflow for every fix
 
 1. **Pick** the problem(s) from `STATUS.md`, in phase order. Set `status: "in_progress"`.
-2. **Read the evidence** in `evidence/` (search for the ID) and the design in `evidence/kora-fix-plan.md`.
+2. **Read the entry** in `tracker.json` (title, notes, acceptance) and its repro tests.
 3. **Run the failing tests** to see them fail. Use `node scripts/remediation/check.mjs --only packages/<pkg>`, or `KORA_REPRO=1 npx vitest run tests/repro/<ID>.test.ts` in the package.
 4. **Fix by root cause**, following the workstream design. Keep the package's normal test suite green (`pnpm --filter <pkg> test`).
-5. **Invert** any existing unit test that encoded the bug (listed in plan §4 W0 task 2), in the same PR.
+5. **Invert** any existing unit test that encoded the bug, in the same PR.
 6. **Add** unit tests next to the code you changed. Repro tests prove the defect is gone; unit tests prove the new code's contract.
 7. **Set** `status: "fixed"` and `pr: "#123"` in `tracker.json`, then run `node scripts/remediation/check.mjs --all` and commit the regenerated `STATUS.md`.
 8. **Open a PR** whose description lists the problem IDs, the repro tests that turned green, and any breaking change with its migration note.

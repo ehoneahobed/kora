@@ -87,7 +87,7 @@ describe('per-field LWW register', () => {
 		expect(result.values.title).toBe('late')
 	})
 
-	// CLAUDE.md: merge must be DETERMINISTIC and ORDER-INDEPENDENT. Folding the
+	// AGENTS.md: merge must be DETERMINISTIC and ORDER-INDEPENDENT. Folding the
 	// same writes in any order must yield identical materialized state — this is
 	// the exact guarantee the concurrent-multifield sync bug violated.
 	propTest.prop([fc.array(writeArb, { minLength: 1, maxLength: 12 })])(

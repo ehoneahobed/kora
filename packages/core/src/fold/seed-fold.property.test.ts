@@ -8,7 +8,7 @@ import { createSnapshotState } from './snapshot'
 
 /*
  * First-visit parity, S4b: the fold-level half of the convergence gate
- * (docs/design/first-visit-parity.md 5.6.2, 5.6.3 and 10.1).
+ * (docs/design/first-visit-parity.md 5.2 and 12).
  *
  * A seed is a row snapshot of a record as the server held it at some frontier. While a device
  * is seeded, a local write is folded on top of that snapshot. The design claims the result is

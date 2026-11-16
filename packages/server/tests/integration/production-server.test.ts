@@ -129,7 +129,7 @@ describe('createProductionServer operational auth', () => {
 		}
 	})
 
-	// Regression: KoraForms hit a bug where a malformed request body reached
+	// Regression: a production server hit a bug where a malformed request body reached
 	// @korajs/auth's handleSignUp/handleSignIn as `undefined` fields, which
 	// threw a TypeError inside a custom httpRoute handler. Because
 	// http.createServer's request listener isn't awaited by Node, a handler
@@ -179,7 +179,7 @@ describe('createProductionServer operational auth', () => {
 		}
 	})
 
-	// Regression: the actual root cause of the KoraForms report. A raw
+	// Regression: the actual root cause of that report. A raw
 	// http.IncomingMessage starts paused; without an explicit resume() after
 	// attaching 'data'/'end' listeners, the body reads back empty on some
 	// Node versions/environments, so httpRoutes handlers (and @korajs/auth's

@@ -93,7 +93,7 @@ export type BulkReplicationMergeResult =
 
 /**
  * A scratch replica a large first sync is applied into before it is merged
- * (`docs/design/first-visit-parity.md` 5.7). The engine applies delivery batches into
+ * (`docs/design/first-visit-parity.md` 6). The engine applies delivery batches into
  * `store` / `syncState` exactly as it would into the live database, then calls
  * {@link BulkReplication.merge} once with the final progress. Nothing about it is durable:
  * a crash or reload loses it and replication restarts from the live watermark.

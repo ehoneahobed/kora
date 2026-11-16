@@ -11,7 +11,7 @@ import {
 import type { Transaction } from '../types'
 
 /**
- * Seeds (first-visit parity S4b, `docs/design/first-visit-parity.md` 5.6): records a read-through
+ * Seeds (`docs/design/first-visit-parity.md` 5.2): records a read-through
  * answer showed, kept so the device can answer the same queries from its own database before
  * replication has delivered them.
  *

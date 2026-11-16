@@ -172,7 +172,7 @@ describe('handleSignUp', () => {
 		}
 	})
 
-	// Regression: KoraForms hit a production server bug where a POST body was
+	// Regression: a production server hit a bug where a POST body was
 	// silently read as empty, so handlers received `{}` instead of the real
 	// payload. Every body field, typed as required `string` at compile time,
 	// arrived as `undefined` at runtime — and this handler crashed the process

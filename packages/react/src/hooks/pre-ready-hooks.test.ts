@@ -80,7 +80,7 @@ describe('hooks before the store opens (S4a)', () => {
 describe('every exported hook renders before the store opens', () => {
 	// With first-visit read-through the tree renders before `app.ready`, when `getStore()` throws.
 	// A hook that asks the app for the store while rendering takes the page down (the spaces
-	// hooks did, found by koraforms' e2e). This mounts all of them at once against such an app;
+	// hooks did, found by a production app's e2e suite). This mounts all of them at once against such an app;
 	// add a new hook to the list when one is exported.
 	it('mounts all of them without throwing', () => {
 		const descriptor = { collection: 'todos', where: {}, orderBy: [] }

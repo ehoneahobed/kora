@@ -284,7 +284,7 @@ describe('OPFS (one database file, leader worker)', () => {
 		await old.store.close()
 	})
 
-	test('retired while the worker bridge loads (after mayLead): no worker of the old build starts (Codex re-audit)', async () => {
+	test('retired while the worker bridge loads (after mayLead): no worker of the old build starts', async () => {
 		const dbName = `vg-opfs-${dbCounter}`
 		const old = opfsTab('A', 'old', dbName)
 		const realMayLead = old.gate.mayLead.bind(old.gate)
@@ -306,7 +306,7 @@ describe('OPFS (one database file, leader worker)', () => {
 		expect(locks.isHeld(`kora-leader-${dbName}`)).toBe(false)
 	})
 
-	test('retired during a promotion, after mayLead: the follower starts no worker (Codex re-audit)', async () => {
+	test('retired during a promotion, after mayLead: the follower starts no worker', async () => {
 		const dbName = `vg-opfs-${dbCounter}`
 		const leader = opfsTab('A', 'leader', dbName)
 		await leader.store.open()
@@ -750,7 +750,7 @@ describe('IndexedDB fallback (snapshots)', () => {
 		await a2.store.close()
 	})
 
-	test('resume whose discovery fails (lock query rejects): no tab lock held without a worker; it retries and reopens (Codex re-audit)', async () => {
+	test('resume whose discovery fails (lock query rejects): no tab lock held without a worker; it retries and reopens', async () => {
 		const dbName = `vg-idb-${dbCounter}`
 		const one = idbTab('A', 'one', dbName)
 		await one.store.open()

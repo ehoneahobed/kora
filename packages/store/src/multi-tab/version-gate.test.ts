@@ -643,7 +643,7 @@ function controllableLocks(inner: MockLockManager): {
 	}
 }
 
-describe('state rechecks after every await (Codex re-audit)', () => {
+describe('state rechecks after every await', () => {
 	test('a hello arriving during the legacy-leader probe: open rejects as superseded and never becomes open', async () => {
 		const control = controllableLocks(locks)
 		const old = gate('A', 'old', {

@@ -241,7 +241,7 @@ describe('useFormDraft (Svelte): show password', () => {
 	})
 })
 
-describe('useFormDraft (Svelte): users, clearing, values (Codex re-audit)', () => {
+describe('useFormDraft (Svelte): users, clearing, values', () => {
 	const KEY_U = 'kora-draft:notes-db:user-form'
 	type U = { title: string; body: string }
 	const make = (userId: unknown, kora = app()) => {

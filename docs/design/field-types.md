@@ -1,101 +1,114 @@
-# Design: Structured, Secret, and Binary Field Types
+# Design: structured, secret and binary field types
 
-Status: state-of-the-art target (no phasing; each type is built to its complete form)
+Scope: `t.object()`, `t.json()`, `t.secret()` and `t.blob()`. Builders live in
+`packages/core/src/schema/types.ts`; merge behaviour in `packages/core/src/fold/`. User-facing
+reference: `docs/guide/schema-design.md` (value domains, storage per backend) and
+`docs/guide/conflict-resolution.md` (merge behaviour).
 
-> Design record. The field types shipped; their merge semantics were superseded in 1.0.0-beta.13 by the per-field CRDT fold in `@korajs/core` (arrays are element multisets merged per occurrence, objects merge per top-level key with nested values replaced whole, resolvers fold once per write in HLC order). Section 1 describes the pre-fold pairwise engine of the time. Current behaviour: `docs/guide/conflict-resolution.md` and `docs/guide/schema-design.md`.
-Scope: `@korajs/core` field system, with changes across `@korajs/merge`, `@korajs/store`, `@korajs/sync`, `@korajs/devtools`
-Bar: these three field types are a differentiating moat. The structured-data CRDT and the content-addressed blob channel are the parts a large engineering org evaluating offline-first frameworks would judge us on. They are built complete, correct, and property-tested, not stubbed.
+## Problem
 
----
+The scalar kinds (string, number, boolean, enum, timestamp), arrays and rich text cover most
+fields, but three common needs fall outside them:
 
-## 1. Where the field system stands today (grounding)
+- **Structured values** such as a settings object or a form definition. Treated as one opaque
+  last-write-wins value, two devices editing different keys offline lose one edit on reconnect,
+  which is exactly what an offline-first framework exists to prevent.
+- **Secrets** such as tokens and password hashes. They must never appear in plaintext in the
+  operation log, merge traces, events, DevTools or logs.
+- **Files.** The operation log is append-only and re-synced to every new device, so bytes stored
+  in it are a permanent payload that also exceeds the operation size limit (256 KiB of operation
+  JSON).
 
-- `FieldKind` (core `types.ts`): `string | number | boolean | timestamp | richtext | enum | array`.
-- Merge dispatch (`merge/engine/field-merger.ts`, `autoMerge`): scalar kinds resolve by LWW, `array` by add-wins set, `richtext` by Yjs CRDT. `autoMerge` receives `baseValue`, `localValue`, `remoteValue`, and both operations' HLC timestamps, so a 3-way convergent merge has everything it needs.
-- Storage maps kinds to SQL columns: string→TEXT, number→REAL, boolean→INTEGER, enum→TEXT (membership enforced by validation, no CHECK), timestamp→INTEGER, array→TEXT (JSON), richtext→BLOB (Yjs state).
-- Binary already crosses the whole system: `richtext` values are `Uint8Array`, tagged as canonical JSON in `op.data`, and travel over the protobuf wire as bytes. "A field kind whose value is binary" is a solved plumbing pattern.
-- Crypto already exists in `@korajs/auth` (`generateEncryptionKey`, `encryptData`, `decryptData`, key derivation, an `operation-encryptor` for end-to-end operation encryption). `@korajs/core` cannot depend on `@korajs/auth`, so field-level crypto primitives move into core.
+## `object` and `json`: per-key merge
 
----
+- `t.object({ ...fields })` declares a shape whose keys follow their own builders.
+  `t.json<T>()` holds any JSON value; `T` is compile-time only.
+- Both fold as a **key map** (`object-key-lww` in the fold plan): each top-level key is its own
+  last-write-wins register, ordered by HLC stamp. A write stamps only the keys it changed
+  relative to its `previousData`, so concurrent edits to different keys both survive. A key
+  present in `previousData` and absent from the new value is a stamped removal, and the later
+  of a removal and a write to that key wins.
+- Nested values are replaced whole: two concurrent edits inside the same top-level key resolve by
+  last-write-wins on that key. Recursion was left out on purpose: a per-key fold over top-level
+  keys is commutative, associative and idempotent with a small, inspectable state, and apps that
+  need finer granularity can split the value into more top-level keys or separate fields.
+- Writing a non-object value (for example `null`, or a scalar into a `json` field) records the
+  value's shape with its stamp and clears every key stamped before it.
+- Storage: JSON text (SQLite) or JSONB (Postgres); wire: JSON. Values must have a canonical JSON
+  form (no `Map`, `Set`, class instances, cycles, `NaN`, or an own `__proto__` key; at most 64
+  levels deep); `undefined` inside an object value is dropped, as `JSON.stringify` does.
+- In a scope entry, deleted keys keep their stamps under a salted digest with the value removed,
+  so a late write cannot resurrect them on a reader that never saw the value
+  (`docs/design/server-fold-authority.md`).
 
-## 2. Structured data: `object` and `json` as a convergent CRDT
+## `secret`: protected at rest, redacted everywhere
 
-### The bar
-Not opaque LWW. Two devices editing different keys of the same settings object offline must both survive on reconnect. That is the whole reason to use an offline-first framework, and getting it wrong on structured data is disqualifying.
+- `t.secret()` takes a string. Two modes:
+  - `.encrypted()` (the default): reversible AES-256-GCM, for tokens and API keys that must be
+    read back (`revealSecret`).
+  - `.hashed()`: one-way PBKDF2-SHA-256 with a random salt, for passwords
+    (`verifySecretValue`).
+- **Transformed before the operation exists.** `transformSecretFieldsForWrite` replaces each
+  secret value with its at-rest form before the operation is created, so plaintext never enters
+  the operation log, the local store or the sync stream. The primitives use only WebCrypto, so
+  they live in `@korajs/core` (which may not depend on `@korajs/auth`).
+- **Key.** Encrypted secrets use the app's `sync.encryption.key` (a string, or a provider called
+  on demand), whether or not wire encryption is enabled. Writing or revealing an encrypted
+  secret with no key throws `MissingSecretKeyError`; there is no plaintext fallback.
+- **Merge.** Last-write-wins on the at-rest value; the fold never sees plaintext.
+- **Redaction.** For a secret field the fold writes `[secret]` in place of every value in its
+  merge trace (inputs, base, output) and redacts the field in the operation the trace carries,
+  so DevTools and `merge:*` events never show it. Form drafts never store a `t.secret()` field
+  (`docs/design/version-gate.md`).
 
-### Design: recursive 3-way LWW-map with add-wins key presence
-- `t.object({ ...nested field schema })`: a structured value. Each key merges by its declared nested kind (scalars LWW, nested arrays add-wins, nested objects recurse, nested richtext via Yjs).
-- `t.json<T>()`: dynamic-key structured value with the same convergent semantics, resolved structurally (a value that is a plain object recurses as a map, an array merges add-wins, anything else is a scalar leaf under LWW).
+## `blob`: content-addressed, out of band
 
-Merge algorithm, per key, given local, remote, and base:
-- Classify each side's action against base: wrote (added or changed), removed (present in base, absent now), or unchanged.
-- unchanged + unchanged → base value.
-- wrote + unchanged (either side) → the written value.
-- removed + unchanged → absent.
-- wrote + wrote → recurse if both are maps; add-wins if both arrays; otherwise LWW by the two operations' HLC timestamps (the existing total order, `nodeId` breaking ties).
-- wrote + removed → **add-wins**: the write survives. Chosen deliberately: it never silently drops a concurrent edit, matching the array strategy and the "never lose data" principle.
-- removed + removed → absent.
+- A `t.blob()` field holds a **reference**, `BlobRef`: the SHA-256 content hash of the bytes,
+  the size, optional MIME type and filename, and `manifestHash` when the blob was stored for
+  transfer. The reference is a small last-write-wins value in the log; the bytes never are.
+  A list of attachments is a `t.array()` of references and merges like any array.
+- **Store.** Bytes live in a content-addressed store, deduplicated by hash: OPFS in the browser
+  (`opfs-blob-store.ts`), the filesystem or an object store (S3, Azure) on the server
+  (`@korajs/store/blob-fs`, `@korajs/store/blob-object`).
+- **Transfer.** `app.blobs.put(bytes, metadata)` splits the blob into 256 KiB content-addressed
+  chunks, stores them, and stores a **manifest** (the ordered chunk hashes) as its own
+  content-addressed object; the returned reference carries `manifestHash`. A peer that receives
+  the reference calls `app.blobs.pull(ref)`: it fetches the manifest, then only the chunks it does
+  not already hold, over the sync connection's blob-chunk messages, and verifies every chunk and
+  the reassembled blob by re-hashing. Identical chunks across blobs are stored and sent once.
+  Without a connection local reads still work and `pull` reports that none is available.
+- **Garbage collection.** `collectBlobGarbage` keeps every blob reachable from a live reference
+  (the blob, its manifest and its chunks) and deletes the rest, sparing unreferenced blobs written
+  within a grace period (default 24 hours): a device uploads bytes before the record that points
+  at them, and that record can arrive much later.
 
-This is an Observed-Remove-flavored LWW map. It is commutative (swapping local/remote also swaps the HLCs, and HLC compare is a symmetric total order), idempotent (`merge(a,a,a) = a`), and deterministic (fixed inputs, fixed output). These are proven with fast-check property tests alongside the existing merge proofs, per the testing rules.
+## Key choices
 
-### Storage, wire, validation
-Storage: TEXT (JSON), like `array`. Wire: JSON, no new encoding. Validation: `t.object` validates against its nested schema at write time; `t.json<T>()` carries compile-time `T` and an optional runtime validator. DevTools: object merges emit a `MergeTrace` per resolved sub-path so a conflict inside a nested object is still inspectable.
+- **Per-top-level-key, not recursive, map merge**: covers the concurrent-edit case that matters
+  (different keys) with a fold that is easy to prove and to redact.
+- **Secrets transformed at write time** rather than encrypted in transit only: the operation log
+  is durable and replicated, so it must never hold plaintext.
+- **Blobs as references plus a chunk channel** rather than inline bytes: the log stays small,
+  transfer is deduplicated and resumable at chunk granularity, and a peer never re-downloads
+  content it has.
 
-### Migration
-A `string`-to-`object`/`json` transform so an app already storing `JSON.stringify`'d blobs in a string field adopts the CRDT without a manual data rewrite.
+## Known limits
 
----
+- Concurrent edits inside one top-level key of an object or json value resolve by
+  last-write-wins on that key.
+- A hashed secret cannot be read back, by design; an encrypted secret is readable by anyone who
+  holds the app's encryption key.
+- Blob bytes are fetched on demand; a device that never called `pull` for a reference does not
+  have the file offline.
+- There is no inline fast path for tiny blobs: every blob goes through the store and the chunk
+  channel.
 
-## 3. `secret`: field-level encryption plus mandatory redaction
+## Tests
 
-### The bar
-A serious framework encrypts secret fields end to end and never leaks them into logs, traces, or DevTools. "It does not sync" is not the state of the art; controlled, encrypted sync is.
-
-### Design
-Three properties, all delivered:
-
-1. **Redaction (security-critical).** A `secret` field's value is redacted everywhere the merge engine or event stream exposes values: `MergeTrace.inputA/inputB/base/output`, the `merge:*` and `operation:*` `KoraEvent`s, and the DevTools operation log. Redaction happens where the trace is constructed in `field-merger.ts`, keyed off `kind === 'secret'`, so no path leaks. This lands early (during the CRDT trace work) because it closes an active plaintext leak.
-2. **At rest, two sub-kinds.** `t.secret().hashed()` for one-way values (passwords: verify, never read back) and `t.secret().encrypted()` for reversible values (tokens: read back to use). Encryption is AES-GCM via WebCrypto primitives lifted into `@korajs/core` so a `secret` field is self-contained; `@korajs/auth` composes higher-level key management on top.
-3. **Encrypted sync.** Secret values sync as ciphertext, riding the operation-encryptor path. Merge is LWW on ciphertext, never on plaintext, and never emits plaintext to a trace.
-
-### Key management
-Keys come from a key provider (the same shape `createApp`'s `sync.encryption.key` / `keyProvider` already uses), not hardcoded. A field with no key configured and `.encrypted()` is a schema-validation error at app init, not a silent plaintext write.
-
----
-
-## 4. `blob` / `attachment`: content-addressed, out-of-band sync
-
-### The bar
-Files must not live in the operation log. The log is append-only and only compacted by an explicit process, so a base64 blob is a permanent, re-synced payload that blows past operation-size limits. The state of the art is content addressing plus out-of-band, deduplicated, resumable transfer, which is also what makes large media viable offline.
-
-### Design
-- The operation carries a **reference only**: a SHA-256 content hash (the system already hashes for op ids) plus metadata (size, mime type, filename). The reference is a small, LWW value in the log.
-- Bytes live in a **content-addressed blob store**, deduplicated by hash (the same file attached twice stores once), with backends per environment (OPFS client-side, filesystem or S3 server-side).
-- Transfer is a **dedicated, resumable, chunked channel**, decoupled from the operation stream, content-addressed so a peer never re-requests bytes it already has. Integrity is verified by re-hashing on receipt.
-- A small inline fast-path (reusing the richtext binary plumbing) handles tiny blobs below a threshold so avatars and signatures skip the coordination cost.
-
-### Merge, lifecycle
-Merge: LWW on the reference hash; a list of attachments is an `array` of references and merges add-wins (two devices attaching different files both survive). Lifecycle: reference-counted garbage collection so a blob is retained while any live record references its hash and reclaimed when none do, coordinated with log compaction.
-
----
-
-## 5. What every new kind touches
-
-- `@korajs/core`: `FieldKind` union, a `t.*` builder + `FieldBuilder` subclass, `FieldDescriptor` (nested schema for `object`, sub-kind for `secret`, metadata shape for `blob`), schema validation, type inference.
-- `@korajs/merge`: `autoMerge` dispatch, the recursive object strategy, and secret redaction in the trace.
-- `@korajs/store`: SQL mapping, materialization, binary tagging (blob inline path), and the content-addressed blob store.
-- `@korajs/sync`: wire encoding, and the out-of-band blob transfer channel.
-- `@korajs/devtools`: `MergeTrace` rendering and honoring secret redaction.
-- Migration transforms for each: `string`→`object`/`json`, `string`→`secret`, `string`(base64)→`blob`.
-
----
-
-## 6. Build sequence (each delivered complete)
-
-Sequenced by where the differentiation is and by dependency, not by "minimum viable first":
-
-1. **`object` / `json` convergent CRDT.** The biggest differentiator and exactly what KoraForms' form definitions and settings need. Establishes the recursive-merge machinery. Delivered with full property-based proofs.
-2. **`blob` content-addressed store + out-of-band channel.** The second moat; the real infrastructure project. Includes the inline fast-path.
-3. **`secret` field-level encryption.** Redaction lands during step 1's trace work (it is an active leak); the hashed/encrypted-at-rest and encrypted-sync completion follows as its own self-contained unit.
-
-Each step is a complete, property-tested, shippable subsystem before the next begins, so correctness is never deferred behind a stub.
+- Fold properties (commutativity, idempotency, order independence) for every field kind,
+  including key maps: `packages/core/src/fold/fold.property.test.ts`, `fold.test.ts`,
+  `fold-canonical-values.test.ts`, `fold-prototype-keys.test.ts`.
+- Secrets: `packages/core/src/secret/secret-crypto.test.ts`, `secret-transform.test.ts`.
+- Blobs: `packages/core/src/blob/blob-ref.test.ts` and `packages/store/src/blob/*.test.ts`
+  (store backends, chunk transport, manifest transfer, garbage collection, durability),
+  `packages/sync/src/blob/blob-chunk-channel.test.ts`.

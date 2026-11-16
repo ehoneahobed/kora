@@ -189,7 +189,7 @@ describe('IndexedDbAdapter', () => {
 			'writeSnapshot',
 		)
 
-		// Deterministic (CLAUDE.md anti-pattern 9, NEW-TEST-1): the debounce runs on a
+		// Deterministic (AGENTS.md anti-pattern 9, NEW-TEST-1): the debounce runs on a
 		// fake clock, so a slow machine cannot fire it between two executes. Only the
 		// timer functions are faked; fake-indexeddb keeps its own scheduling.
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })

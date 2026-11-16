@@ -6,7 +6,7 @@ import type { AtomicOp, Operation, SchemaDefinition } from '../types'
 
 // Performance gates run via `pnpm --filter @korajs/core test:benchmarks`, not `pnpm test`.
 const REGRESSION_FACTOR = 1.1
-/** CLAUDE.md: merge 1,000 concurrent operations in under 500 ms. */
+/** AGENTS.md: merge 1,000 concurrent operations in under 500 ms. */
 const MERGE_1K_LIMIT_MS = 500 * REGRESSION_FACTOR
 
 const schema = defineSchema({

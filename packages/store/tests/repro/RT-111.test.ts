@@ -1,5 +1,5 @@
 /**
- * RT-111 repro (Codex review of PR #4, core constraint-relaxation.ts): the one-time
+ * RT-111 repro (review of PR #4, core constraint-relaxation.ts): the one-time
  * SQLite value-domain relaxation (RT-101), which every client store runs at open, treated
  * ANY `CHECK (` in a collection table's DDL as a beta.12 enum check and rebuilt the table
  * without checks. A constraint added as a storage safety net (`CHECK (price >= 0)`) was

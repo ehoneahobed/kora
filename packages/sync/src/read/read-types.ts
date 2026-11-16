@@ -2,7 +2,7 @@ import type { HLCTimestamp } from '@korajs/core'
 
 /**
  * Wire types of the read-through endpoint, `POST <syncPath>/read` (first-visit parity S2,
- * `docs/design/first-visit-parity.md` section 5.4.1). They live in @korajs/sync so the read client
+ * `docs/design/first-visit-parity.md` section 4). They live in @korajs/sync so the read client
  * (S4b) and the server share one definition; the server keeps the request parser.
  */
 

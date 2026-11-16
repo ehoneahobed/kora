@@ -19,7 +19,7 @@ export interface TimingGateOptions {
 }
 
 /**
- * Enforce an absolute timing gate (CLAUDE.md target x 1.1) and report the measurement
+ * Enforce an absolute timing gate (AGENTS.md target x 1.1) and report the measurement
  * (as a GitHub annotation on CI, so run-to-run variance is visible without the logs).
  *
  * @param label - The gate, as named in docs/benchmarks/baseline.md

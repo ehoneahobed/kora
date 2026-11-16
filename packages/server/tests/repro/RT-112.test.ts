@@ -1,5 +1,5 @@
 /**
- * RT-112 repro (Codex review of PR #4, server/static-files.ts): the static file handler
+ * RT-112 repro (review of PR #4, server/static-files.ts): the static file handler
  * contained request paths lexically (`resolve(join(root, path))` under `root`), but then
  * `stat` and `createReadStream` follow symbolic links. A link inside `staticDir` that
  * points outside it (a file link, a directory link, or a directory whose `index.html`

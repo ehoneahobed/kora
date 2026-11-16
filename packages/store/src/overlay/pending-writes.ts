@@ -52,7 +52,7 @@ export interface PendingEntry {
 	/**
 	 * The transaction this entry belongs to (stage S6a), or null for a single write. Members
 	 * of a group share their fate: they are registered, committed, marked unknown and rolled
-	 * back together, and a subscription applies all of them or none (design, "S6a design").
+	 * back together, and a subscription applies all of them or none (design 5.9).
 	 */
 	readonly groupId: string | null
 	readonly state: EntryState
@@ -720,7 +720,7 @@ export class PendingWrites {
 
 	/**
 	 * A transaction committed: every member of the group retires with ONE epoch value, so a
-	 * SQL read either contains the whole group or none of it (design "S6a design", step 5).
+	 * SQL read either contains the whole group or none of it (design 5.9).
 	 * Members are retired in registration order (the order the transaction wrote them), so
 	 * the committed-row cache ends with each record's last write. One
 	 * `store:write-settled committed` carries every operation id of the group.

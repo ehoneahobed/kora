@@ -12,8 +12,9 @@ one database:
   route enter, an in-memory per-session cache, no service worker, non-optimistic writes.
 
 Every time is measured from **navigation start** (`performance.timeOrigin`), never from
-`connect()`. It is **report-only**: it prints PASS or FAIL per cell but never fails the process on
-a FAIL (stage S6 adds the gate). It is not part of `pnpm test` or any CI workflow.
+`connect()`. It prints PASS or FAIL per cell. Locally it only reports; the nightly workflow
+(`.github/workflows/parity-nightly.yml`) fails when a cell or a Kora target fails the contract. It
+is not part of `pnpm test`.
 
 ## Run it
 
@@ -192,7 +193,7 @@ link shaping, and reports, for the head build and (with `--base`) for a base che
 ```sh
 # Build the packages in both checkouts first (pnpm --filter "korajs..." --filter @korajs/cli build).
 # Quiet machine: nothing else running, the same one for both builds.
-node bench/parity/trace.mjs --base ../../.claude/worktrees/p1-main --runs 5 --profile slow-4g
+node bench/parity/trace.mjs --base ../path/to/main-checkout --runs 5 --profile slow-4g
 ```
 
 Options: `--base <checkout>` (or `KORA_TRACE_BASE`; a worktree of origin/main), `--runs N`

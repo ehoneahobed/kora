@@ -287,7 +287,7 @@ const server = createProductionServer({
     })
     if (!form) return null // never describe a draft
     return {
-      title: `${form.title} | KoraForms`,
+      title: `${form.title} | My Forms`,
       description: metaExcerpt(String(form.description)), // about 160 characters, cut at a word
       url: `https://forms.example${path}`,
     }

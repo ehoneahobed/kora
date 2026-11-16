@@ -57,7 +57,7 @@ describe('W7 convergence gate', () => {
 		expect(rejected).toBeGreaterThan(40)
 	})
 
-	// Per-kind gates (CLAUDE.md: property tests for commutativity, associativity and
+	// Per-kind gates (AGENTS.md: property tests for commutativity, associativity and
 	// idempotency per kind), driven by fast-check with a fixed seed.
 	const KIND_GROUPS: Array<[string, GateField[]]> = [
 		[

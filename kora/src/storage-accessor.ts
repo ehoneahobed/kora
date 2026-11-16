@@ -245,7 +245,7 @@ export function wireStoragePersistence(
 /**
  * `app.storage.writes` with the instant-updates extras. INTERNAL until the feature is on
  * by default (design 16.6): `app.storage.writes` is typed {@link StorageWritesApi}; this
- * is what the object really is, for tests, DevTools and the koraforms/koradocs canaries.
+ * is what the object really is, for tests, DevTools and canary deployments.
  */
 export interface InternalStorageWritesApi extends StorageWritesApi {
 	/**

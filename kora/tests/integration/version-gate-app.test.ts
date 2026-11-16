@@ -294,7 +294,7 @@ describe('a superseded app', () => {
 		}
 	}
 
-	test('an auth reconnect in flight when the tab retires never starts a session (Codex re-audit)', async () => {
+	test('an auth reconnect in flight when the tab retires never starts a session', async () => {
 		const tab = heldAuthApp('auth-inflight')
 		await tab.app.ready
 		const engine = tab.app.getSyncEngine()
@@ -316,7 +316,7 @@ describe('a superseded app', () => {
 		newer.close()
 	})
 
-	test('a connect() that passed its check before retirement never opens a session (Codex re-audit)', async () => {
+	test('a connect() that passed its check before retirement never opens a session', async () => {
 		const tab = heldAuthApp('connect-inflight')
 		await tab.app.ready
 		const engine = tab.app.getSyncEngine()
@@ -340,7 +340,7 @@ describe('a superseded app', () => {
 		newer.close()
 	})
 
-	test('every sync API that changes persisted sync state refuses after supersession (Codex re-audit)', async () => {
+	test('every sync API that changes persisted sync state refuses after supersession', async () => {
 		const old = tab('A', 'old-sync-apis', { sync: true })
 		await old.app.ready
 		const fresh = tab('B', 'new-sync-apis', { sync: true })
@@ -470,7 +470,7 @@ describe('initialization', () => {
 		expect(locks.heldNames()).toEqual([])
 	})
 
-	test('initialization failing while the tab retires with unsaved writes keeps the gate until they are saved (Codex re-audit)', async () => {
+	test('initialization failing while the tab retires with unsaved writes keeps the gate until they are saved', async () => {
 		const dbName = join(dir, 'failing-unsaved.db')
 		const gate = gateFor('A', 'failing-unsaved', dbName)
 		let saving = false
@@ -899,7 +899,7 @@ describe('reloadIntoNewestBuild (offline shell)', () => {
 		}
 	}
 
-	test("no newer worker ready (offline or a failed update) and still controlled by the page's own worker: no reload (Codex re-audit)", async () => {
+	test("no newer worker ready (offline or a failed update) and still controlled by the page's own worker: no reload", async () => {
 		const reload = vi.fn()
 		const ownWorker = { scriptURL: '/sw.js' }
 		const { container } = serviceWorkerContainer({
@@ -922,7 +922,7 @@ describe('reloadIntoNewestBuild (offline shell)', () => {
 		expect(reload).toHaveBeenCalledOnce()
 	})
 
-	test('a waiting worker that does not take control in time: no reload under the old worker (Codex re-audit)', async () => {
+	test('a waiting worker that does not take control in time: no reload under the old worker', async () => {
 		const reload = vi.fn()
 		const ownWorker = { scriptURL: '/sw.js' }
 		const postMessage = vi.fn()

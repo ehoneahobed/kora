@@ -7,7 +7,7 @@ import type { KoraProviderProps } from '../../src/types'
 
 /**
  * The CLI's react-basic template, rendered for real (its `useTodos` module mocked): the
- * new-task form's submit (Codex review of #72).
+ * new-task form's submit (review of #72).
  */
 
 const inserted: string[] = []

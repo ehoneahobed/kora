@@ -76,7 +76,7 @@ describe('apply order determinism', () => {
 		}
 		// This test asserts determinism, not speed: 100 fresh stores take well over the
 		// 5 s default on a loaded machine, so it carries no tight wall-clock budget
-		// (NEW-TEST-1, CLAUDE.md anti-pattern 9). Speed is gated by the benchmarks.
+		// (NEW-TEST-1, AGENTS.md anti-pattern 9). Speed is gated by the benchmarks.
 	}, 300_000)
 })
 

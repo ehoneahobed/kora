@@ -14,7 +14,7 @@ pnpm build
 pnpm test
 ```
 
-The repo is a pnpm + Turborepo monorepo. Packages live in `packages/`, the meta-package in `kora/`, end-to-end tests in `e2e/`, and the docs site in `docs/`. Build order follows the dependency graph in `CLAUDE.md`; `pnpm build` handles it for you.
+The repo is a pnpm + Turborepo monorepo. Packages live in `packages/`, the meta-package in `kora/`, end-to-end tests in `e2e/`, and the docs site in `docs/`. Build order follows the dependency graph in `AGENTS.md`; `pnpm build` handles it for you.
 
 Useful commands while working:
 

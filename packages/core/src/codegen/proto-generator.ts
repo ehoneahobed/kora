@@ -175,7 +175,7 @@ function generateCollectionMessage(
 
 /**
  * The KoraOperation message — the wire format for individual operations.
- * Field assignments match the sync protocol specification from CLAUDE.md.
+ * Field assignments match the sync protocol specification from AGENTS.md.
  */
 const KORA_OPERATION_MESSAGE = `message KoraOperation {
 \tstring id = 1;

@@ -96,7 +96,7 @@ describe('checkDuplicateSchemas', () => {
 		return temp.path
 	}
 
-	it('warns with both paths for a koraforms-like client and server schema', async () => {
+	it('warns with both paths for a client and server schema in separate files', async () => {
 		const root = await project({
 			'src/schema.ts': CLIENT_SCHEMA,
 			'server/schema.ts': CLIENT_SCHEMA.replace('version: 3', 'version: 2'),

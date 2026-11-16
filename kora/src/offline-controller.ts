@@ -163,7 +163,7 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 		if (source !== 'binding' || !binding) return initialAuth()
 		const sync = await binding.resolveSyncState?.()
 		if (sync?.state === 'loading') return { state: 'loading', offlineUntil: null }
-		// A client that may connect anonymously has no session to restore (koraforms respondents).
+		// A client that may connect anonymously has no session to restore (for example, the respondents of a public form).
 		if (sync?.state === 'anonymous') return { state: 'n/a', offlineUntil: null }
 		if (!binding.resolveOfflineRestore) return { state: 'unknown', offlineUntil: null }
 		return fromRestore(await binding.resolveOfflineRestore())
