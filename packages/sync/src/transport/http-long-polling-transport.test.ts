@@ -194,6 +194,106 @@ describe('HttpLongPollingTransport', () => {
 		expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'handshake-response' }))
 	})
 
+	describe('poll loop lifetime', () => {
+		/**
+		 * A fetch whose GETs stay pending until aborted or answered by hand, so the test
+		 * controls exactly when each long poll returns (no timers).
+		 */
+		function controlledFetch(postResponses: Array<() => Response>) {
+			const polls: Array<{ resolve: (r: Response) => void; signal: AbortSignal | undefined }> = []
+			const posts = [...postResponses]
+			const fetchImpl = vi.fn<typeof fetch>((_url, init) => {
+				if (init?.method === 'POST') {
+					const next = posts.shift()
+					return Promise.resolve(next ? next() : new Response(null, { status: 202 }))
+				}
+				return new Promise<Response>((resolve, reject) => {
+					const signal = init?.signal ?? undefined
+					signal?.addEventListener('abort', () => {
+						reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+					})
+					polls.push({ resolve, signal })
+				})
+			})
+			return { fetchImpl, polls }
+		}
+
+		async function flush(): Promise<void> {
+			for (let i = 0; i < 20; i++) await Promise.resolve()
+		}
+
+		test('an intentional disconnect during a long poll fires no close handler', async () => {
+			const { fetchImpl, polls } = controlledFetch([() => sessionOpened()])
+			const transport = new HttpLongPollingTransport({ fetchImpl, preferWebSocket: false })
+			const onClose = vi.fn()
+			transport.onClose(onClose)
+			await transport.connect('http://localhost:3000/sync')
+			transport.send(handshake)
+			await flush()
+			expect(polls).toHaveLength(1)
+
+			await transport.disconnect()
+			await flush()
+			expect(onClose).not.toHaveBeenCalled()
+		})
+
+		test('a session ended by a POST reports one close, not a second from the aborted poll', async () => {
+			const { fetchImpl, polls } = controlledFetch([
+				() => sessionOpened(),
+				() => new Response(null, { status: 401 }),
+			])
+			const transport = new HttpLongPollingTransport({ fetchImpl, preferWebSocket: false })
+			const onClose = vi.fn()
+			transport.onClose(onClose)
+			await transport.connect('http://localhost:3000/sync')
+			transport.send(handshake)
+			await flush()
+			expect(polls).toHaveLength(1)
+
+			transport.send(handshake)
+			await flush()
+			expect(onClose).toHaveBeenCalledOnce()
+		})
+
+		test('a poll loop waiting out a retry delay across a reconnect does not run beside the new one', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			try {
+				const { fetchImpl, polls } = controlledFetch([
+					() => sessionOpened('first-session'),
+					() => sessionOpened('second-session'),
+				])
+				const transport = new HttpLongPollingTransport({
+					fetchImpl,
+					retryDelayMs: 1000,
+					preferWebSocket: false,
+				})
+				await transport.connect('http://localhost:3000/sync')
+				transport.send(handshake)
+				await flush()
+				expect(polls).toHaveLength(1)
+
+				// The first loop's poll comes back empty: it waits out the retry delay.
+				polls[0]?.resolve(new Response(null, { status: 204 }))
+				await flush()
+
+				await transport.disconnect()
+				await transport.connect('http://localhost:3000/sync')
+				transport.send(handshake)
+				await flush()
+				expect(polls).toHaveLength(2)
+
+				// The first loop wakes up: it belongs to a session that is gone.
+				await vi.advanceTimersByTimeAsync(1000)
+				await flush()
+				const live = polls.filter((poll) => !poll.signal?.aborted)
+				expect(live).toHaveLength(1)
+				await transport.disconnect()
+			} finally {
+				vi.useRealTimers()
+			}
+		})
+	})
+
 	test('upgrades to websocket transport when available', async () => {
 		const connect = vi.fn(async () => {})
 		const disconnect = vi.fn(async () => {})
