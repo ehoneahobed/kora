@@ -25,7 +25,7 @@
       "require": { "types": "./dist/react.d.cts", "default": "./dist/react.cjs" }
     }
   },
-  "files": ["dist", "src", "!src/**/*.test.ts"],
+  "files": ["dist", "src", "!src/**/*.test.ts", "!src/**/*.test.tsx"],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
