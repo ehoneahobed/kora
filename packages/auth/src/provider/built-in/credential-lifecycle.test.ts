@@ -77,6 +77,29 @@ describe('device ownership (AUTH-5)', () => {
 		expect(res.status).toBe(409)
 		expect(res.body).toMatchObject({ code: 'DEVICE_OWNERSHIP_CONFLICT' })
 	})
+
+	it('two browsers of one user without a device identity get two devices, never a shared one (#82)', async () => {
+		const auth = createKoraAuthServer({ jwtSecret: SECRET })
+		const { userId, tokens } = await signUp(auth, 'learner@example.com')
+		const signIn = async (): Promise<string | undefined> => {
+			const res = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signin',
+				body: { email: 'learner@example.com', password: 'password-123' },
+			})
+			expect(res.status).toBe(200)
+			const data = (res.body as { data: { tokens: Tokens } }).data
+			return decodeJwt(data.tokens.accessToken)?.dev as string | undefined
+		}
+		const devices = [decodeJwt(tokens.accessToken)?.dev, await signIn(), await signIn()]
+		// Each sign-in is its own sync node: a shared node would make the devices skip each
+		// other's writes (they look like their own) and collide on sequence numbers.
+		expect(new Set(devices).size).toBe(3)
+		for (const device of devices) {
+			expect(device).toMatch(/^dev-/)
+			expect(device).not.toBe(`device-${userId}`)
+		}
+	})
 })
 
 describe('authenticateAccess is the single access check (AUTH-2, AUTH-8)', () => {
