@@ -42,6 +42,14 @@ describe('bundled template manifests', () => {
 		},
 	)
 
+	test.each(templates.filter((t) => t !== 'tauri-react'))(
+		'%s: the build copies the sqlite OPFS async proxy into dist/assets',
+		(template) => {
+			const config = readFileSync(join(templatesDir, template, 'vite.config.ts'), 'utf-8')
+			expect(config).toContain("'sqlite3-opfs-async-proxy.js'")
+		},
+	)
+
 	test.each(templates)('%s: ships a .env.example (kora doctor reads it)', (template) => {
 		expect(existsSync(join(templatesDir, template, '.env.example'))).toBe(true)
 	})
