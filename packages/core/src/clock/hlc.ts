@@ -1,4 +1,4 @@
-import { ClockDriftError, InvalidTimestampError, RemoteClockDriftError } from '../errors/errors'
+import { InvalidTimestampError, RemoteClockDriftError } from '../errors/errors'
 import type { HLCTimestamp, TimeSource } from '../types'
 
 /** Default time source using the system clock */
@@ -270,11 +270,17 @@ export class HybridLogicalClock {
 
 	/**
 	 * Deserialize an HLC timestamp from its serialized string form.
+	 *
+	 * @throws {InvalidTimestampError} If the string has fewer than three `:`-separated parts.
 	 */
 	static deserialize(s: string): HLCTimestamp {
 		const parts = s.split(':')
 		if (parts.length < 3) {
-			throw new Error(`Invalid HLC timestamp string: "${s}"`)
+			throw new InvalidTimestampError(
+				`Invalid HLC timestamp string: "${s}". Expected the "wallTime:logical:nodeId" form produced by HybridLogicalClock.serialize.`,
+				Number.NaN,
+				Number.NaN,
+			)
 		}
 		return {
 			wallTime: Number.parseInt(parts[0] ?? '0', 10),
