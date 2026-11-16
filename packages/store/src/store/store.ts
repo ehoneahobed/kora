@@ -1983,6 +1983,7 @@ export class Store implements OperationLog {
 						await loadParents(operations)
 					},
 					applyRemoteOperation: async (op, options) => {
+						const probeBefore = probe
 						try {
 							return await applyStep(op, options)
 						} catch (error) {
@@ -1990,6 +1991,9 @@ export class Store implements OperationLog {
 							// record is read from the transaction from now on.
 							prefetch.markDirty(op.collection, op.recordId)
 							prefetch.noteAppended(op)
+							// Nor may it prove the commit landed: a strict step sets the probe before
+							// its flush, which can still fail and roll the step back.
+							probe = probeBefore
 							throw error
 						}
 					},
@@ -2076,8 +2080,6 @@ export class Store implements OperationLog {
 		this.emitter.emit({ type: 'merge:completed', trace: first })
 	}
 
-	/** The record fold, once the database's rows are fold materializations. */
-	/** The delivery position of a remote operation being applied, if known. */
 	/**
 	 * A remote operation applied for a delivery whose position moved while it waited for the
 	 * database writes nothing: asked first thing inside the write transaction (the wait for
@@ -2088,6 +2090,7 @@ export class Store implements OperationLog {
 		if (isCurrent !== undefined && !isCurrent()) throw new StaleStoreWrite()
 	}
 
+	/** The delivery position of a remote operation being applied, if known. */
 	private deliveryPositionOf(
 		op: Operation,
 		options: ApplyRemoteOptions | undefined,
@@ -2111,6 +2114,7 @@ export class Store implements OperationLog {
 		return index
 	}
 
+	/** The record fold, once the database's rows are fold materializations. */
 	private activeFold(): RecordFolder | undefined {
 		return this.foldActive && this.folder ? this.folder : undefined
 	}
@@ -3972,17 +3976,6 @@ export class Store implements OperationLog {
 	}
 
 	/**
-	 * Re-stamp never-acknowledged local operations after a fast device clock was
-	 * corrected, so sync can resume immediately. Safe because unacknowledged
-	 * operations are private to this device (like unpushed git commits);
-	 * acknowledged/shared operations are immutable and never touched.
-	 *
-	 * After the rewrite the store's HLC is advanced past the highest new
-	 * timestamp so subsequent local writes keep sorting after the rebased ops.
-	 * No data-change notifications are emitted: materialized values are
-	 * unchanged, only version stamps move.
-	 */
-	/**
 	 * Move this device to a fresh node id, re-authoring its never-acknowledged
 	 * operations under it (RT-21). Used when the sync server refuses the current node
 	 * id (`NODE_ID_CLAIMED`): the device keeps every local write and uploads it under
@@ -4653,6 +4646,17 @@ export class Store implements OperationLog {
 		return isNodeLockHeld(nodeLockName(this.dbName, nodeId))
 	}
 
+	/**
+	 * Re-stamp never-acknowledged local operations after a fast device clock was
+	 * corrected, so sync can resume immediately. Safe because unacknowledged
+	 * operations are private to this device (like unpushed git commits);
+	 * acknowledged/shared operations are immutable and never touched.
+	 *
+	 * After the rewrite the store's HLC is advanced past the highest new
+	 * timestamp so subsequent local writes keep sorting after the rebased ops.
+	 * No data-change notifications are emitted: materialized values are
+	 * unchanged, only version stamps move.
+	 */
 	async rebaseUnsyncedOperations(
 		unsyncedOpIds: string[],
 		correctedNowMs: number,
