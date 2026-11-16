@@ -1,4 +1,3 @@
-import type { TokenManager } from '../tokens/token-manager'
 import type { AuthTokens } from '../types'
 import { type AuthRoutesConfig, BuiltInAuthRoutes } from './built-in/auth-routes'
 import type { AuthDevice, AuthUser, UserStore } from './built-in/user-store'
@@ -46,7 +45,7 @@ export interface SignInParams {
  * // Use the built-in provider
  * const provider: AuthProviderAdapter = new BuiltInProvider({
  *   userStore: new InMemoryUserStore(),
- *   tokenManager: new TokenManager({ secret: 'my-secret' }),
+ *   tokenManager: new TokenManager({ secret: TokenManager.generateSecret() }),
  * })
  *
  * const { user, tokens } = await provider.signUp({
@@ -87,7 +86,7 @@ export interface AuthProviderAdapter {
 	 * Validate an access token and extract identity claims.
 	 *
 	 * @param token - The JWT access token
-	 * @returns User ID and device ID if valid, or null if invalid/expired
+	 * @returns User ID and device ID if valid, or null if invalid, expired or revoked
 	 */
 	validateAccessToken(token: string): Promise<{ userId: string; deviceId: string } | null>
 
@@ -144,9 +143,7 @@ export class AuthProviderError extends Error {
  *
  * @example
  * ```typescript
- * import { BuiltInProvider } from '@korajs/auth'
- * import { InMemoryUserStore } from '@korajs/auth'
- * import { TokenManager } from '@korajs/auth'
+ * import { BuiltInProvider, InMemoryUserStore, TokenManager } from '@korajs/auth/server'
  *
  * const provider = new BuiltInProvider({
  *   userStore: new InMemoryUserStore(),
@@ -162,12 +159,10 @@ export class AuthProviderError extends Error {
  */
 export class BuiltInProvider implements AuthProviderAdapter {
 	private readonly routes: BuiltInAuthRoutes
-	private readonly tokenManager: TokenManager
 	private readonly userStore: UserStore
 
 	constructor(config: AuthRoutesConfig) {
 		this.routes = new BuiltInAuthRoutes(config)
-		this.tokenManager = config.tokenManager
 		this.userStore = config.userStore
 	}
 
@@ -205,11 +200,14 @@ export class BuiltInProvider implements AuthProviderAdapter {
 
 	/** @inheritdoc */
 	async validateAccessToken(token: string): Promise<{ userId: string; deviceId: string } | null> {
-		const payload = this.tokenManager.validateToken(token)
-		if (payload === null || payload.type !== 'access') {
+		// The same check every HTTP route uses: signature, expiry, the token's own and its
+		// family's revocation, device and user cut-offs, and that user and device still stand.
+		// Signature and expiry alone would keep accepting a signed-out or revoked token.
+		const access = await this.routes.authenticateAccess(token)
+		if (access === null) {
 			return null
 		}
-		return { userId: payload.sub, deviceId: payload.dev }
+		return { userId: access.payload.sub, deviceId: access.payload.dev }
 	}
 
 	/** @inheritdoc */
