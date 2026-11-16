@@ -145,9 +145,9 @@ export function useOrgMembers(orgId: string): UseOrgMembersResult {
 		}
 	}
 
-	$effect(() => {
-		void refresh(orgId)
-	})
+	// A plain module, not a component: runes such as `$effect` are not compiled here and
+	// would throw at runtime. `orgId` is a fixed string, so one load is all an effect did.
+	void refresh(orgId)
 
 	const actions = createOrgMembersActions(client, orgId, (message) => {
 		error.set(message)
