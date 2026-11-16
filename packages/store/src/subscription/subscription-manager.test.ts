@@ -39,6 +39,22 @@ describe('SubscriptionManager', () => {
 		expect(manager.size).toBe(0)
 	})
 
+	test('clear() runs each subscription cleanup once, and a later unsubscribe does not repeat it', () => {
+		const cleanup = vi.fn()
+		const withCleanup = new SubscriptionManager({ onQuerySubscribed: () => cleanup })
+		const unsub = withCleanup.register(
+			{ collection: 'todos', where: {}, orderBy: [] },
+			() => {},
+			async () => [],
+		)
+
+		withCleanup.clear()
+		expect(cleanup).toHaveBeenCalledTimes(1)
+
+		unsub()
+		expect(cleanup).toHaveBeenCalledTimes(1)
+	})
+
 	test('notify + flush calls callback with new results', async () => {
 		const results: CollectionRecord[][] = []
 		const mockData: CollectionRecord[] = [

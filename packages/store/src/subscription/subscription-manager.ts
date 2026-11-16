@@ -198,6 +198,8 @@ export interface SubscriptionStats {
  */
 export class SubscriptionManager {
 	private subscriptions = new Map<string, Subscription>()
+	/** Cleanups returned by `onQuerySubscribed`, by subscription id (run on unsubscribe or clear). */
+	private readonly externalCleanups = new Map<string, () => void>()
 	private pendingCollections = new Set<string>()
 	private flushScheduled = false
 	/** Internal S0 phase timer: when the oldest unflushed change was recorded (null when none or timers off). */
@@ -332,13 +334,16 @@ export class SubscriptionManager {
 		this.bloomDirty = true
 
 		const externalCleanup = this.onQuerySubscribed?.(subscription.descriptor)
+		if (externalCleanup) this.externalCleanups.set(id, externalCleanup)
 		this.registry()
 
 		return () => {
 			if (!this.subscriptions.delete(id)) return
 			this.bloomDirty = true
 			if (this.subscriptions.size === 0) this.detachRegistry()
-			externalCleanup?.()
+			const cleanup = this.externalCleanups.get(id)
+			this.externalCleanups.delete(id)
+			cleanup?.()
 		}
 	}
 
@@ -553,6 +558,18 @@ export class SubscriptionManager {
 	 */
 	clear(): void {
 		this.subscriptions.clear()
+		// The unsubscribe functions become no-ops once the map is empty: run the external
+		// cleanups (sync query-subset registrations) here, or they would never run.
+		const cleanups = [...this.externalCleanups.values()]
+		this.externalCleanups.clear()
+		for (const cleanup of cleanups) {
+			try {
+				cleanup()
+			} catch (error) {
+				// One failing cleanup must not stop the others or the store's close.
+				console.warn('[kora] A query subscription cleanup failed during clear():', error)
+			}
+		}
 		this.pendingCollections.clear()
 		this.flushScheduled = false
 		this.overlayPending.clear()
