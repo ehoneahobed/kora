@@ -46,11 +46,6 @@ export function buildIdTag(id: string): BuildIdHtmlTag {
 	return { tag: 'meta', attrs: { name: BUILD_META_NAME, content: id }, injectTo: 'head-prepend' }
 }
 
-/** The tag to inject: the dev id in `vite dev`, the placeholder in a build. */
-export function buildIdTagFor(command: 'build' | 'serve', devId: string): BuildIdHtmlTag {
-	return buildIdTag(command === 'serve' ? devId : BUILD_ID_PLACEHOLDER)
-}
-
 /** The dev-server build id: one per plugin instance (one per dev-server start). */
 export function devBuildId(): string {
 	return `dev-${Date.now().toString(36)}`

@@ -10,9 +10,6 @@ export const PRODUCTION_SERVER_AUTH_ID = 'production-server-auth'
 /** The probe gives up on one request after this long. */
 export const PROBE_TIMEOUT_MS = 5_000
 
-/** Sync protocol the app's client speaks, by Kora release (see docs/guide/sync-protocol.md). */
-export const CURRENT_SYNC_PROTOCOL = 2
-
 /** The seams of the probe: the network, the timeout and the project's files. */
 export interface ProbeDeps {
 	fetch: typeof fetch

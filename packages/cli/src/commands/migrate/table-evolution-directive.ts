@@ -76,17 +76,6 @@ export function formatEvolveTableDirective(target: EvolveTableTarget): string {
 	return `${EVOLVE_TABLE_DIRECTIVE} ${JSON.stringify(target)}`
 }
 
-/** Whether a directive changes nothing. */
-export function isEmptyEvolveTarget(target: EvolveTableTarget): boolean {
-	return (
-		Object.keys(target.add).length === 0 &&
-		target.drop.length === 0 &&
-		Object.keys(target.change).length === 0 &&
-		target.addIndexes.length === 0 &&
-		target.removeIndexes.length === 0
-	)
-}
-
 /**
  * The directive's target when `statement` is an evolve-table directive, otherwise null.
  *
