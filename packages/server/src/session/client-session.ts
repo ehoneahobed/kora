@@ -1050,8 +1050,6 @@ export class ClientSession {
 	/** Operations accepted with an unverified legacy (beta.12) id (RT-71). */
 	private forgedDuplicates = 0
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
-	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
-	private invalidOperationIds = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
 	private readonly blobAccess: BlobAccessIndex | null
@@ -4224,7 +4222,6 @@ export class ClientSession {
 			// after decryption), and a version-1 id never covered every field.
 			const integrity = await this.checkUploadIntegrity(op)
 			if (integrity !== null) {
-				if (integrity.code === INVALID_OPERATION_ID) this.invalidOperationIds += 1
 				await this.refuseTerminally(op, integrity.code, integrity.message)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber

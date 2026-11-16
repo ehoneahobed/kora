@@ -445,9 +445,10 @@ export function accessReadGrant(
 
 /**
  * Decide a change to one field of a stored record that does not travel as an operation
- * (a collaborative rich-text update): the collection's `update` rule on the stored row,
- * and the field's own `update` rule when it has one. Collections without rules are not
- * judged here.
+ * (a collaborative rich-text update) on the stored row: the field's own `update` rule
+ * when it has one, otherwise the collection's `update` rule (as for an operation, a
+ * field rule replaces the collection rule for that field). Collections without rules
+ * are not judged here.
  */
 export function authorizeAccessFieldUpdate(
 	access: AccessDefinition,

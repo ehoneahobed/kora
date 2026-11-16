@@ -277,11 +277,6 @@ export function createAccessApi(
 		return exists(read, parsed.collection, parsed.id)
 	}
 	/**
-	 * Every live row holding `userId`'s membership of `group`. Usually one, under the
-	 * derived id; rows written before `server.access` existed (a pre-populated memberships
-	 * collection) may use other ids, and authorization reads them all.
-	 */
-	/**
 	 * Every live row holding `userId`'s membership of `group`, read inside a transaction
 	 * (no write commits meanwhile, so paging cannot skip a row). Usually one, under the
 	 * derived id; rows written before `server.access` existed (a pre-populated

@@ -1751,11 +1751,7 @@ export class MemoryServerStore implements ServerStore {
 		return true
 	}
 
-	/**
-	 * The record as currently stored, including a soft-deleted one (whose last field
-	 * values are kept), or null when it was never written. Without a materialized
-	 * table, the last known values are replayed from the operation log.
-	 */
+	/** {@inheritDoc ServerStore.getLiveGroups} */
 	async getLiveGroups(groups: readonly string[], since?: number): Promise<ReadonlySet<string>> {
 		return this.liveGroupsOf(groups, since)
 	}

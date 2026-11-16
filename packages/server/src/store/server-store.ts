@@ -491,8 +491,8 @@ export interface ApplyRemoteOptions {
 	 *
 	 * The store calls it inside its apply critical section (the SQLite write
 	 * transaction, the in-memory store's synchronous apply, or a Postgres
-	 * transaction holding the per-record advisory lock shared with conditional
-	 * applies) with the record as stored at that moment, including a soft-deleted
+	 * transaction holding the delivery-counter row lock every append, conditional
+	 * applies included, takes until commit) with the record as stored at that moment, including a soft-deleted
 	 * one, or null when none exists. The record is the one this store's fold plan
 	 * defines: a row materialized under another plan (an instance still on the old plan
 	 * during a rolling deploy) is judged as this plan folds it. Returning a refusal aborts the apply and the

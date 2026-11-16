@@ -29,8 +29,8 @@ import {
  * - Brotli or gzip for compressible types: a pre-compressed `file.br` / `file.gz` sibling
  *   when the build emitted one and it decompresses to the file's current bytes, otherwise
  *   compressed once per content hash and cached in memory.
- * - A 404 for a missing file. The SPA fallback (`index.html`) answers navigations only
- *   (`Accept: text/html` or `Sec-Fetch-Mode: navigate`) and never a path under
+ * - A 404 for a missing file. The SPA fallback (`index.html`) answers page requests
+ *   only (see {@link StaticFileHandlerOptions.spaFallback}) and never a path under
  *   `/assets/`, so a stale tab asking for an old hashed chunk gets a 404, not HTML
  *   parsed as JavaScript.
  * - Correct media types, including `.webmanifest`, `.wasm` and `.mjs`.
@@ -175,12 +175,6 @@ export type StaticFileHandler = (
 	pathname: string,
 ) => Promise<void>
 
-/**
- * Create the static file handler for a build directory (`dist/`).
- *
- * @param staticDir - Directory holding the built app
- * @returns A handler answering GET and HEAD for files under `staticDir`
- */
 /** Options for {@link createStaticFileHandler}. */
 export interface StaticFileHandlerOptions {
 	/**
@@ -205,6 +199,13 @@ export interface StaticFileHandlerOptions {
 	transformShell?: (req: IncomingMessage, pathname: string, html: string) => Promise<string | null>
 }
 
+/**
+ * Create the static file handler for a build directory (`dist/`).
+ *
+ * @param staticDir - Directory holding the built app
+ * @param options - SPA fallback and app-shell rewriting
+ * @returns A handler answering GET and HEAD for files under `staticDir`
+ */
 export function createStaticFileHandler(
 	staticDir: string,
 	options: StaticFileHandlerOptions = {},

@@ -657,9 +657,9 @@ export class PostgresServerStore implements ServerStore {
 		return this.nodeId
 	}
 
-	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
 	/** Capability grants are checked inside the write's transaction (`liveGroupsOf`). */
 	readonly reportsLiveGroups = true
+	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
 	private readonly accessIndex = new AccessIndexReadiness(
 		(keys) => this.renewMarkerLeases(keys),
 		ACCESS_INDEX_MARKER_LEASE_MS / 3,
@@ -3954,11 +3954,6 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
-	 * The record as currently stored, including a soft-deleted one (whose last field
-	 * values are kept), or null when it was never written. Without a materialized
-	 * table, the last known values are replayed from the operation log.
-	 */
-	/**
 	 * When the record's fold state was folded with another plan (an instance still on the
 	 * old plan during a rolling deploy), the row on disk is that plan's: this is the
 	 * record as this instance's plan folds it, which is what `mergeIntoRecord` folds the
@@ -5782,11 +5777,6 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
-	 * Reserve the next delivery sequence inside an open append transaction. The
-	 * `UPDATE ... RETURNING` locks the counter row until this transaction commits,
-	 * serializing assignment into commit order (see the counter table comment).
-	 */
-	/**
 	 * Take the delivery-counter row lock without advancing it: every append waits for
 	 * this transaction, so work done under it (an index rebuild) sees no interleaved write.
 	 */
@@ -5796,6 +5786,11 @@ export class PostgresServerStore implements ServerStore {
 		await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
 	}
 
+	/**
+	 * Reserve the next delivery sequence inside an open append transaction. The
+	 * `UPDATE ... RETURNING` locks the counter row until this transaction commits,
+	 * serializing assignment into commit order (see the counter table comment).
+	 */
 	private async nextDeliverySeq(tx: {
 		execute: (query: SQL) => Promise<unknown>
 	}): Promise<number> {
