@@ -1,6 +1,6 @@
 name: canary
 
-# Snapshot builds of unreleased work on main, for dogfooding in our own apps between
+# Snapshot builds of unreleased work on main, for testing in production apps between
 # releases. Published as 0.0.0-canary-<datetime> under the `canary` dist-tag only:
 # such versions never satisfy a `^1.0.0-...` range and never touch `latest` or `beta`.
 # Install with `pnpm add korajs@canary @korajs/server@canary ...` (all packages from
