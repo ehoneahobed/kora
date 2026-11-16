@@ -31,6 +31,7 @@ packages/
   svelte/                   # @korajs/svelte - Svelte stores
   tauri/                    # @korajs/tauri - Tauri desktop integration
   auth/                     # @korajs/auth - Authentication, sessions, MFA, RBAC
+  spaces/                   # @korajs/spaces - Sharing: invitations, roles, members on top of access rules
   devtools/                 # @korajs/devtools - Browser DevTools extension
   cli/                      # @korajs/cli - CLI tooling, bundled templates, scaffolding
   create-kora-app/          # create-kora-app - npx entry point (delegates to CLI)
@@ -116,6 +117,7 @@ The stack is settled. Propose a substitution in an issue before writing code tha
 @korajs/vue        -> @korajs/core, @korajs/store, @korajs/sync
 @korajs/svelte     -> @korajs/core, @korajs/store, @korajs/sync
 @korajs/auth       -> @korajs/core
+@korajs/spaces     -> @korajs/core (peers: @korajs/react for ./react, @korajs/server for ./server)
 @korajs/tauri      -> @korajs/core
 @korajs/devtools   -> @korajs/core
 @korajs/cli        -> @korajs/core (other packages as dev dependencies, for templates and tests)
