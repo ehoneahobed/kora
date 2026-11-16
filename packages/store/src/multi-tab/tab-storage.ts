@@ -176,8 +176,6 @@ export interface TabStorageSession {
 	channelName: string
 	/** Leader only: release the navigator lock when closing the database. */
 	releaseLock?: () => Promise<void>
-	/** Leader only: stop the broadcast RPC relay or heartbeat. */
-	stopRelay?: () => void
 	/**
 	 * Follower only: cancels the queued lock request (or, once promoted, releases
 	 * the lock this tab won). Present so callers can tear the session down.
@@ -219,7 +217,7 @@ export async function acquireTabStorageSession(
 		return { role: 'leader', channelName }
 	}
 
-	return new Promise<TabStorageSession>((resolve) => {
+	return new Promise<TabStorageSession>((resolve, reject) => {
 		let releaseHeld: (() => void) | undefined
 
 		const request = navigator.locks.request(
@@ -249,6 +247,10 @@ export async function acquireTabStorageSession(
 				})
 			},
 		)
+		// The request can reject before its callback runs (a detached document's
+		// SecurityError, for instance): fail the open instead of leaving it pending forever.
+		// After the callback resolved the session this is a no-op.
+		request.catch(reject)
 	})
 }
 
