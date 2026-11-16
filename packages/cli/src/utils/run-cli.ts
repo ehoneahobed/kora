@@ -1,5 +1,5 @@
 import { KoraError } from '@korajs/core'
-import { type CommandDef, runCommand, runMain } from 'citty'
+import { type ArgsDef, type CommandDef, runCommand, runMain } from 'citty'
 import { createLogger } from './logger'
 
 /**
@@ -8,7 +8,10 @@ import { createLogger } from './logger'
  * Help, versions and citty's own usage errors (an unknown command, a missing argument) go
  * through citty, which shows the usage they need.
  */
-export async function runCli(main: CommandDef, rawArgs: string[]): Promise<void> {
+export async function runCli<T extends ArgsDef = ArgsDef>(
+	main: CommandDef<T>,
+	rawArgs: string[],
+): Promise<void> {
 	if (
 		rawArgs.includes('--help') ||
 		rawArgs.includes('-h') ||
