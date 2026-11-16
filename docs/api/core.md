@@ -308,7 +308,7 @@ so (`sync:clock-skew`) and its unsynced writes are re-stamped (`sync:clock-rebas
 
 <!-- docs-check: signature @korajs/core -->
 ```typescript
-function generateUUIDv7(): string
+function generateUUIDv7(timestamp?: number, randomSource?: RandomSource): string
 function isValidUUIDv7(value: string): boolean
 function extractTimestamp(uuid: string): number
 ```
@@ -391,8 +391,8 @@ describes the semantics per field type; these functions expose it for tools and 
 
 `FoldOptions`: `exclude` (operation ids or a predicate to leave out), `richtext`
 (`mergeYjsUpdates` from `@korajs/store`, needed to materialize concurrent rich-text edits),
-`traces` (`'none' | 'conflicts' | 'all'`), `authoritativeNodeIds` and
-`revokedAuthoritativeNodeIds` (server authority for `merge('server-authoritative')`).
+`traces` (`'none' | 'conflicts' | 'all'`), `authoritativeNodeIds` (server authority for
+`merge('server-authoritative')`), `richtextKeyed`, `richtextSubsumes` and `transforms`.
 
 ```typescript
 import { foldRecord, materialize } from '@korajs/core'
@@ -534,7 +534,7 @@ const v2 = defineSchema({
 | `canAutoRollback(step)` | `true` for `addField`, `addIndex`, `removeIndex` and `renameField`; `false` for `removeField` and `backfill` (which `generateRollbackSteps` can still invert when they carry a descriptor or a reverse transform). |
 | `generateRollbackSteps(steps)` | Inverse steps in reverse order: `removeField` with a descriptor becomes `addField`, `backfill` with a `reverseTransform` runs it. Throws `MigrationRollbackError` (`MIGRATION_ROLLBACK`) for a step without an inverse. |
 | `createReversibleMigration(up, down \| null, from, to)` | `{ up, down, fromVersion, toVersion }`; `null` generates `down`. |
-| `migrationStepsToSQL(steps)` / `rollbackStepsToSQL(steps)` | SQL for the structural steps. |
+| `migrationStepsToSQL(steps)` / `rollbackStepsToSQL(migration)` | SQL for the structural steps; `rollbackStepsToSQL` uses `migration.rollbackSteps` or generates them from `migration.steps`. |
 
 ```typescript
 import { createReversibleMigration, generateRollbackSteps, migrate, t } from '@korajs/core'

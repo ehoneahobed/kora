@@ -5,7 +5,8 @@ description: "Every Kora.js error code: the error class, what causes it, and how
 
 # Error Codes
 
-Every error Kora throws extends `KoraError` (from `@korajs/core`) and carries a stable `code` and a
+Every error Kora throws extends `KoraError` (from `@korajs/core`), except `BlobIntegrityError`,
+`TauriAdapterError` and `TauriStoreNotOpenError` (plain `Error` subclasses), and carries a stable `code` and a
 `context` object with the details (collection, field, record id, ...). Match on `code`, not on the
 message.
 
@@ -77,7 +78,7 @@ example `HELD_ASSIGN_NO_USER`). Codes that reach the app as events (`sync:operat
 | `WORKER_INIT_ERROR`, `WORKER_TIMEOUT` | `WorkerInitError`, `WorkerTimeoutError` | The SQLite WASM worker did not start or did not answer. | Check `store.workerUrl` (it must point at the worker script; see [Storage Configuration](/guide/storage-configuration)) and the COOP/COEP headers. |
 | `NO_LEADER`, `LEADER_UNRESPONSIVE` | `NoLeaderError`, `LeaderUnresponsiveError` | A follower tab could not reach the tab that owns the database, or the owner hung; a new owner is elected. | Retry; the request is not applied twice. |
 | `BRIDGE_TERMINATED`, `REQUEST_ABORTED` | `BridgeTerminatedError`, `RequestAbortedError` | The cross-tab channel closed while a request was in flight (the tab or app closed). | Retry after reopening. |
-| (none) | `BackupFormatError` | `importBackup` was given an unknown or corrupt backup. | Use a backup made by `exportBackup`; a format-1 file is converted on import (or with `convertBackupV1`). |
+| `BACKUP_INVALID`, `BACKUP_FORMAT_OUTDATED`, `BACKUP_VERSION_UNSUPPORTED`, `BACKUP_CHECKSUM_MISMATCH`, `BACKUP_OPERATION_INVALID` | `BackupFormatError` | `importBackup` was given an unknown or corrupt backup. | Use a backup made by `exportBackup`; a format-1 file is converted on import (or with `convertBackupV1`). |
 | (none) | `BlobIntegrityError` | Blob bytes do not hash to their key (corruption or tampering). | Pull the blob again from the server. |
 | `BLOB_CHUNK_TIMEOUT` | `BlobTransferError` | `app.blobs.pull` got no answer for a chunk within 2 minutes, after re-sending it (or was throttled for longer than 10 minutes). `hash`, `attempts` and `lastReason` say which and why. | Pull again later: chunks already received are kept. |
 | `BLOB_CHUNK_UNAVAILABLE` | `BlobTransferError` | No reachable peer or server holds the chunk, or may share it with this device. | Pull again when the author's device is online, or enable server blob storage (`resolveBlobChunk` / `persistBlobChunk`). |
@@ -105,7 +106,7 @@ Thrown by `app.sync` methods or reported in `sync:*` events and `status.reason`.
 | `WRONG_RECOVERY_KEY` | `KeyUnwrapError` from `app.encryption.recover()` | The recovery key is malformed, belongs to another ring, or is a release-candidate `kora-rk1-`/`kora-rk2-` key (`context.reason: 'RECOVERY_KEY_RETIRED'`). | Use the `kora-rk3-` key of this ring; after a merge or with an old key, call `enableRecovery()` again from a device that is unlocked. |
 | `SEALED_RELATION_FIELD` | `SealedRelationFieldError` | The encryption config encrypts a foreign key of an enforced relation, which the server must read. | List the field in `encryption.cleartextFields`. |
 | `INVALID_SCOPE`, `SCOPE_VIOLATION` | `InvalidScopeError`, `ScopeViolationError` | A malformed scope map, or a write outside the scope (custom engines). | Fix the scope map. |
-| `DECRYPTION_ERROR`, `ENCRYPTION_ERROR`, `KEY_DERIVATION_ERROR`, `KEY_UNWRAP_ERROR`, `ENCRYPTION_KEY_ERROR` | encryption classes | Low-level encryption failures (wrong key, tampered data, invalid configuration such as `INVALID_CONFIG`). | See the message and [Sync Encryption](/guide/sync-encryption). |
+| `SYNC_ERROR` with `context.errorType` `DECRYPTION_ERROR`, `ENCRYPTION_ERROR`, `KEY_DERIVATION_ERROR`, `KEY_UNWRAP_ERROR` or `ENCRYPTION_KEY_ERROR` | encryption classes (extend `SyncError`) | Low-level encryption failures (wrong key, tampered data, invalid configuration such as `INVALID_CONFIG`). | See the message and [Sync Encryption](/guide/sync-encryption). |
 
 ### Quarantine codes {#quarantine}
 
@@ -231,6 +232,6 @@ public `https`). See the [Auth API reference](/api/auth#errors).
 | `SCHEMA_NOT_FOUND` | `SchemaNotFoundError` | No schema file found. | Pass `--schema` or set `schema` in `kora.config.ts`. |
 | `INVALID_PROJECT` | `InvalidProjectError` | The directory is not a Kora project. | Run inside the project. |
 | `DEV_SERVER_ERROR` | `DevServerError` | Vite or the sync server failed to start in `kora dev`. | See the output; check ports. |
-| `DEPLOY_PLATFORM_UNAVAILABLE` | `DeployPlatformUnavailableError` | `render`, `docker` or `kora-cloud` were chosen. | Use `fly`, `railway`, `aws-ecs` or `aws-lightsail`. |
+| `DEPLOY_PLATFORM_UNAVAILABLE` | `DeployPlatformUnavailableError` | `render` or `docker` was chosen. | Use `kora-cloud`, `fly`, `railway`, `aws-ecs` or `aws-lightsail`. |
 | `CLI_ERROR` | `CliError` | Other CLI failures. | See the message. |
 | `TAURI_ADAPTER_ERROR`, `STORE_NOT_OPEN` | `TauriAdapterError`, `TauriStoreNotOpenError` | The Tauri SQLite plugin failed or the database is not open. | Check the `kora-sqlite:default` capability and the plugin build. |
