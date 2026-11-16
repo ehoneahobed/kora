@@ -179,6 +179,27 @@ describe('BetterSqlite3Adapter', () => {
 			expect(rows).toHaveLength(0)
 		})
 
+		test('keeps the original error when SQLite already rolled the transaction back', async () => {
+			// RAISE(ROLLBACK) ends the transaction inside SQLite; a second ROLLBACK would fail
+			// with "no transaction is active" and hide why the write failed.
+			await adapter.execute(
+				"CREATE TRIGGER refuse_todos BEFORE INSERT ON todos BEGIN SELECT RAISE(ROLLBACK, 'refused by trigger'); END",
+			)
+			await expect(
+				adapter.transaction(async (tx) => {
+					await tx.execute(
+						'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+						['rec-1', 'A', 0, 1000, 1000],
+					)
+				}),
+			).rejects.toThrow(/refused by trigger/)
+
+			// The adapter is still usable: no transaction was left open.
+			await adapter.transaction(async (tx) => {
+				await tx.query('SELECT 1')
+			})
+		})
+
 		test('supports queries within transaction', async () => {
 			await adapter.execute(
 				'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
