@@ -349,6 +349,16 @@ export class OAuthManager {
 // User Info Normalization
 // ============================================================================
 
+/**
+ * Whether a provider's `email_verified` claim affirms the address. Only `true` (or the
+ * string `"true"`, which some OIDC providers such as Cognito send) counts: any other
+ * value, the string `"false"` included, is not a verification, since a verified address
+ * can link the sign-in to an existing account.
+ */
+function isAffirmed(value: unknown): boolean {
+	return value === true || value === 'true'
+}
+
 function normalizeUserInfo(providerId: string, profile: Record<string, unknown>): OAuthUserInfo {
 	switch (providerId) {
 		case 'google':
@@ -356,7 +366,7 @@ function normalizeUserInfo(providerId: string, profile: Record<string, unknown>)
 				providerId: profile.sub as string,
 				provider: 'google',
 				email: (profile.email as string) ?? null,
-				emailVerified: (profile.email_verified as boolean) ?? false,
+				emailVerified: isAffirmed(profile.email_verified),
 				name: (profile.name as string) ?? null,
 				avatarUrl: (profile.picture as string) ?? null,
 				rawProfile: profile,
@@ -387,7 +397,7 @@ function normalizeUserInfo(providerId: string, profile: Record<string, unknown>)
 				providerId: String(profile.id ?? profile.sub ?? ''),
 				provider: providerId,
 				email: (profile.email as string) ?? null,
-				emailVerified: (profile.email_verified as boolean) ?? false,
+				emailVerified: isAffirmed(profile.email_verified),
 				name: (profile.name as string) ?? null,
 				avatarUrl: (profile.picture as string) ?? (profile.avatar_url as string) ?? null,
 				rawProfile: profile,
