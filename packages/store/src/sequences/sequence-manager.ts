@@ -109,10 +109,11 @@ export class SequenceManager {
 		// the insert (it would recreate the row and the insert would fail), and a crash
 		// between them must not leave the counter half reset.
 		await this.adapter.transaction(async (tx) => {
-			await tx.execute(
-				'DELETE FROM _kora_sequences WHERE name = ? AND scope = ? AND node_id = ?',
-				[name, scope, this.nodeId],
-			)
+			await tx.execute('DELETE FROM _kora_sequences WHERE name = ? AND scope = ? AND node_id = ?', [
+				name,
+				scope,
+				this.nodeId,
+			])
 			if (to > 0) {
 				await tx.execute(
 					'INSERT INTO _kora_sequences (name, scope, node_id, counter) VALUES (?, ?, ?, ?)',
