@@ -116,6 +116,25 @@ export interface LogIntegrityScanOptions {
 	localNodeIds: readonly string[]
 }
 
+/**
+ * Meta key: set once a scan with repair checked every row of this database's log. Damaged rows
+ * come only from an earlier release's backup restore (beta.12 wrote JSON timestamps); every
+ * writer in this release (local writes, sync, staging, restore, rehash, repair) stores the
+ * canonical form. So after one complete repaired scan, the open-time quick scan only re-checks the
+ * log when the mark is missing: a database written or restored by an earlier release never
+ * carries it. `verifyLogIntegrity()` (full) still checks every row whenever it is called.
+ * A new value invalidates every mark (a future release that learns of a new damage shape).
+ */
+export const LOG_TRUSTED_META_KEY = 'log_integrity_trusted'
+const LOG_TRUSTED_VERSION = '1'
+
+async function logTrusted(adapter: StorageAdapter): Promise<boolean> {
+	const rows = await adapter.query<MetaRow>('SELECT value FROM _kora_meta WHERE key = ?', [
+		LOG_TRUSTED_META_KEY,
+	])
+	return rows[0]?.value === LOG_TRUSTED_VERSION
+}
+
 const OPERATION_TYPES = new Set(['insert', 'update', 'delete'])
 const CANONICAL_TIMESTAMP = /^\d{15}:\d{5}:.+$/
 const PAGE_SIZE = 500
@@ -162,7 +181,10 @@ export async function scanLogIntegrity(
 
 	const actions: Array<{ collection: string; row: RowWithRowid; verdict: LogRowVerdict }> = []
 	let checkedRows = 0
+	// A log this release (or a later one) has checked whole needs no open-time re-check.
+	const skipRows = mode === 'quick' && (await logTrusted(adapter))
 	for (const collection of Object.keys(schema.collections)) {
+		if (skipRows) break
 		const table = quoteIdent(`_kora_ops_${collection}`)
 		let rows: RowWithRowid[] | null = null
 		if (mode === 'quick') {
@@ -224,6 +246,15 @@ export async function scanLogIntegrity(
 				}
 			}
 		})
+	}
+
+	// Every row was checked and, with repair on, every finding acted on: from now on the log
+	// holds only canonical rows. A report-only scan leaves findings in place and marks nothing.
+	if (repair && !skipRows && !(await logTrusted(adapter))) {
+		await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			LOG_TRUSTED_META_KEY,
+			LOG_TRUSTED_VERSION,
+		])
 	}
 
 	const quarantined = await loadQuarantine(adapter)

@@ -1,9 +1,10 @@
 import {
+	KoraError,
 	OFFLINE_STATUS_OPENING,
 	OFFLINE_STATUS_SERVER_RENDER,
 	OFFLINE_STATUS_UNKNOWN,
-} from '@korajs/core/bindings'
-import { KoraError, type SchemaInput } from '@korajs/core/lite'
+	type SchemaInput,
+} from '@korajs/core/lite'
 import { SimpleEventEmitter, currentWriteObserver, runWithWriteObserver } from '@korajs/core/lite'
 import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store/lite'
@@ -207,12 +208,18 @@ export function createApp<const S extends SchemaInput>(
 		if (started) return started
 		const attempt = (async () => {
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
-			const { createRuntimeApp } = await loadRuntimeModule()
 			// Production builds do not validate at `createApp` (the validator is not registered):
 			// the same checks run here, from their own chunk, and a bad option ends `ready` with
-			// the error naming it. Development already threw it at the call.
-			if (!(globalThis as ConfigValidatorSlot)[CONFIG_VALIDATOR_SLOT]) {
-				const { validateCreateAppConfig } = await import('./validate-config')
+			// the error naming it. Development already threw it at the call. The two chunks load
+			// at the same time (one after the other cost a second round trip on every start).
+			const needsValidation = !(globalThis as ConfigValidatorSlot)[CONFIG_VALIDATOR_SLOT]
+			const validation = needsValidation ? import('./validate-config') : null
+			// Settled on its own so a failed validator chunk is reported after the runtime's own
+			// failure handling, not as an unhandled rejection.
+			validation?.catch(() => undefined)
+			const { createRuntimeApp } = await loadRuntimeModule()
+			if (validation) {
+				const { validateCreateAppConfig } = await validation
 				validateCreateAppConfig(config)
 			}
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')

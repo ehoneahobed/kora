@@ -21,6 +21,7 @@ import {
 	schemaAheadMessage,
 	storedSchemaVersion,
 } from '../migrations/schema-ceiling'
+import { DDL_STATE_TABLE_SQL, ddlFingerprint } from './ddl-state'
 import { opfsPoolLockName, opfsPoolNameFor, opfsPoolPath } from './opfs-names'
 import {
 	type BlockingReporter,
@@ -231,7 +232,7 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 		// database a second time (a follower's open lands here on the leader).
 		if (db) {
 			try {
-				applyDdl(db, ddlStatements)
+				applyDdlUnlessUnchanged(db, ddlStatements)
 				return { id, type: 'success', data: buildOpenData() }
 			} catch (error) {
 				return { id, type: 'error', message: (error as Error).message, code: 'INIT_ERROR' }
@@ -282,7 +283,7 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 				db.exec({ sql: `PRAGMA page_size = ${OPFS_NEW_DATABASE_PAGE_SIZE}` })
 			}
 			db.exec({ sql: 'PRAGMA foreign_keys = ON' })
-			applyDdl(db, ddlStatements)
+			applyDdlUnlessUnchanged(db, ddlStatements)
 			attachProgressHandler(db)
 			return { id, type: 'success', data: buildOpenData() }
 		} catch (error) {
@@ -354,6 +355,33 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 			// This worker understands the `batch` request (C3).
 			batch: true,
 		}
+	}
+
+	/**
+	 * Apply the schema DDL unless this exact DDL already ran on the database: its fingerprint
+	 * is stored after a successful run (`_kora_ddl_state`), so a warm open skips dozens of
+	 * idempotent statements. Identical statements carry identical schema and format
+	 * ceilings, so the newer-build checks below cannot be skipped for a database they would
+	 * refuse: a newer build's DDL differs, and the store clears the fingerprint before any
+	 * migration runs (a migration's table rebuild can drop indexes the next open re-creates).
+	 */
+	function applyDdlUnlessUnchanged(target: SqliteDb, ddlStatements: string[]): void {
+		const fingerprint = ddlFingerprint(ddlStatements)
+		target.exec({ sql: DDL_STATE_TABLE_SQL })
+		let stored: unknown = null
+		target.exec({
+			sql: "SELECT value FROM _kora_ddl_state WHERE key = 'fingerprint'",
+			rowMode: 'object',
+			callback: (row: Record<string, unknown>) => {
+				stored = row.value
+			},
+		})
+		if (stored === fingerprint) return
+		applyDdl(target, ddlStatements)
+		target.exec({
+			sql: "INSERT OR REPLACE INTO _kora_ddl_state (key, value) VALUES ('fingerprint', ?)",
+			bind: [fingerprint],
+		})
 	}
 
 	function applyDdl(target: SqliteDb, ddlStatements: string[]): void {
