@@ -81,10 +81,12 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
   let showDone = $state(false)
 </script>
 
-<KoraQuery query={app.todos.where({ completed: showDone })} let:data>
-  {#each data as todo}
-    <p>{todo.title}</p>
-  {/each}
+<KoraQuery query={app.todos.where({ completed: showDone })}>
+  {#snippet children(data)}
+    {#each data as todo}
+      <p>{todo.title}</p>
+    {/each}
+  {/snippet}
 </KoraQuery>
 ```
 

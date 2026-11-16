@@ -14,12 +14,6 @@ export function useMutation<TData, TArgs extends unknown[], TContext = void>(
 	mutationFn: (...args: TArgs) => Promise<TData>,
 	options?: UseMutationOptions<TData, TArgs, TContext>,
 ): UseMutationResult<TData, TArgs> {
-	const fnRef = { current: mutationFn }
-	fnRef.current = mutationFn
-
-	const optionsRef = { current: options }
-	optionsRef.current = options
-
 	const isLoading = ref(false)
 	const error = ref<Error | null>(null)
 	const rejected = shallowRef<MutationRejection<TArgs> | null>(null)
@@ -32,8 +26,9 @@ export function useMutation<TData, TArgs extends unknown[], TContext = void>(
 	})
 
 	const controller = createMutationController<TData, TArgs, TContext>({
-		mutationFn: (...args) => fnRef.current(...args),
-		resolveOptions: () => optionsRef.current,
+		mutationFn,
+		// Setup runs once: the function and options given here are the latest.
+		resolveOptions: () => options,
 		events,
 		onStateChange: (state) => {
 			if (!mounted) return

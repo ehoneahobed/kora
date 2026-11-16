@@ -32,15 +32,10 @@ export function createMutation<TData, TArgs extends unknown[], TContext = void>(
 	mutationFn: (...args: TArgs) => Promise<TData>,
 	options?: UseMutationOptions<TData, TArgs, TContext>,
 ): UseMutationResult<TData, TArgs> {
-	const optionsRef = { current: options }
-	optionsRef.current = options
-
-	const fnRef = { current: mutationFn }
-	fnRef.current = mutationFn
-
 	const controller = createMutationController<TData, TArgs, TContext>({
-		mutationFn: (...args) => fnRef.current(...args),
-		resolveOptions: () => optionsRef.current,
+		mutationFn,
+		// Setup runs once: the function and options given here are the latest.
+		resolveOptions: () => options,
 		events: optionalEvents(),
 	})
 
