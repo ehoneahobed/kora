@@ -55,7 +55,7 @@ describe('chaos real-path convergence (Store + MergeAware + TestServer)', () => 
 
 		// Heal chaos-dropped relays: retry exchange rounds until the fleet actually
 		// converges, then assert. A fixed pass would depend on real event-loop timing
-		// (chaos latency is real setTimeout delay), which CLAUDE.md rules out; mirror
+		// (chaos latency is real setTimeout delay), which AGENTS.md rules out; mirror
 		// the contended test's healing loop below.
 		for (let round = 0; round < 30; round++) {
 			for (const device of network.devices) {
@@ -157,7 +157,7 @@ describe('chaos real-path convergence (Store + MergeAware + TestServer)', () => 
 		// latency is real setTimeout delay), not just the seeded drop/reorder
 		// decisions. A fixed round count assumes those rounds always do enough
 		// real work in time, which is exactly the kind of timing dependency
-		// CLAUDE.md rules out. Mirror the seed-phase healing loop above: check
+		// AGENTS.md rules out. Mirror the seed-phase healing loop above: check
 		// actual convergence after each round and stop as soon as it holds,
 		// with generous headroom (30 rounds) for a slow/contended machine.
 		for (let round = 0; round < 30; round++) {

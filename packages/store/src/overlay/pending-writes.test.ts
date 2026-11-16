@@ -670,7 +670,7 @@ describe('PendingWrites entry groups (S6a transactions)', () => {
 	})
 })
 
-describe('remote-apply activity is scoped to the collection (S6b review)', () => {
+describe('remote-apply activity is scoped to the collection', () => {
 	test('an apply in another collection does not weaken the commit check', () => {
 		const registry = new PendingWrites({ now: () => 0 })
 		const added = registry.add(

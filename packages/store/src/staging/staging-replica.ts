@@ -163,7 +163,7 @@ export interface StagingMergeOptions {
 
 /**
  * A scratch replica of the live database that a large first sync is applied into before it
- * is merged (`docs/design/first-visit-parity.md` 5.7).
+ * is merged (`docs/design/first-visit-parity.md` 6).
  *
  * `store` is an ordinary {@link import('../store/store').Store} over an in-memory database of
  * the same engine, so `applyRemoteBatch`, the batch prefetch and the fold run unmodified; its
@@ -171,7 +171,7 @@ export interface StagingMergeOptions {
  * merge, and nothing about it survives the page: a crash, a reload or a replaced worker loses
  * it, and replication simply starts again from the live database's watermark (decision D10).
  * Because it is in memory it has no rollback journal to write, which is where the first sync's
- * cost went (docs/design/first-visit-parity.md, "S3 result").
+ * cost went (docs/design/first-visit-parity.md 6, "The replica").
  */
 export class StagingReplica {
 	private closed = false

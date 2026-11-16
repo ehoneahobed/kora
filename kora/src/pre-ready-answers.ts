@@ -4,7 +4,7 @@ import type { ReadAnswer, ReadQuery, ReadRecord } from '@korajs/sync/read'
 
 /**
  * In-memory answers for queries that run before the store opens (first-visit parity S4b,
- * `docs/design/first-visit-parity.md` 5.4.6).
+ * `docs/design/first-visit-parity.md` 5.1).
  *
  * A subscription made before `app.ready` asks the server's read endpoint for its answer and
  * delivers it from memory; the store's own first result replaces it when the store opens. An

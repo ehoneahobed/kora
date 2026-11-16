@@ -1,1481 +1,285 @@
-# Design: fast first sync (beta.15 workstream C)
+# Design: fast first sync
 
-Status: C2 (the visibility index) is BUILT, C2.1 to C2.7 (see "C2 as built" at the end of
-section 2). C1 and the rest remain PROPOSED. Internal design doc (not published). The benchmark
-is `packages/test/bench/`. Main since the last round: the
-retraction-ordering bug found here is fixed (#54, with delivery-order visibility and
-`forceFullResync`), `insertMany` and batched worker statements landed (#55), and the IndexedDB
-snapshot ordering (#52) and multi-tab transaction isolation (#59) fixes merged; this round
-aligns the doc with them.
+Status: the visibility index (C2), batched delivery apply (C3), batch-level content-id
+verification (C1.0(a)) and batched device reads (C3b) are shipped. The record snapshot (C1,
+section 3) is designed but **not built**; section 4 explains why.
 
-Targets (beta.15 plan): on a new device, for an LMS-shaped scope (20,000 operations over 30
-scoped collections, 4G), **first usable data in under 2 s** and **the full scope in under
-10 s**. Field reports say it takes minutes today. This doc does three things:
+Targets for a new device syncing an LMS-shaped scope (20,000 operations, 30 scoped collections,
+4G): **first usable data under 2 s**, **full scope under 10 s**. Related:
+[durable delivery](durable-delivery.md), [server fold authority](server-fold-authority.md),
+[offline readiness](offline-readiness.md), [access rules](../guide/access-rules.md),
+[benchmark baseline](../benchmarks/baseline.md).
 
-1. Specifies a benchmark that can be reproduced, and records the first numbers.
-2. Designs the server's visibility index (C2).
-3. Designs a cold start from current state (C1).
+## 1. Measuring first sync
 
-It ends with a decision on whether C1 is needed for beta.15.
+`packages/test/bench/first-sync.bench.test.ts` (`pnpm --filter @korajs/test bench:first-sync`, not
+in `pnpm test`), with `lms-first-sync-fixture.ts` and `throttled-link.ts`:
 
-Code read for this doc:
-- `packages/server/src/session/client-session.ts`: `streamDelivery`, `filterDeliveryChunk`,
-  `collectVisibleNodeIds`, `rescopeUnit`, `scopeEntryFor`.
-- `packages/server/src/store/{sqlite,postgres,memory}-server-store.ts` and
-  `drizzle-{,pg-}schema.ts`: `getOperationsAfterDelivery`, `kora_fold_state`, the delivery
-  counter.
-- `packages/server/src/access/access-delivery.ts`: interval gating and re-scope basis.
-- `packages/server/src/store/scope-snapshot.ts`, `packages/server/src/session/scope-entry.ts`.
-- `docs/design/durable-delivery.md`: the watermark.
-- `packages/core/src/fold/` and `packages/store/src/fold/record-folder.ts`: the fold.
-- `packages/sync/src/engine/sync-engine.ts`: `handleOperationBatch`.
+- **Fixture.** 30 collections, every record with `schoolId`; the device belongs to `school-0`.
+  `KORA_BENCH_VISIBLE_OPS` operations of that school are interleaved with as many for each of
+  `KORA_BENCH_TENANTS - 1` other schools (default 100,000 operations, 20,000 visible), skewed toward
+  high-volume collections; 60% inserts, 35% partial updates, 5% deletes; optional moves between
+  schools (`KORA_BENCH_MOVE_RATE`). Deterministic per seed, with real content-hash ids.
+- **Server and device.** A real `KoraSyncServer` (SQLite; `KORA_BENCH_STORE=memory|postgres`)
+  seeded through `applyRemoteOperation`, granting `{ schoolId }` with `scope: ['schoolId']` declared;
+  a real `Store` and `SyncEngine` wired as `createApp` wires them, with `scopeExit: 'retract'`.
+- **Network.** An in-process link modelling bandwidth, RTT, ordering and `bufferedAmount()`, with
+  deflated wire bytes. Profiles `slow-4g` (1.6 Mbps / 750 kbps / 150 ms), `fast-4g`, `unthrottled`.
+- **Metrics.** `handshakeMs`, `firstBatchMs`, `firstHomeRowMs` (a home query subscribed before the
+  start first returns a row: **first usable data**), `homeCompleteMs`, `fullScopeMs` (streaming, and
+  every collection holds exactly the school's records: **full scope**), apply time, bytes.
+- **Correctness check.** Every collection must equal the server's rows and fold states for the
+  school, so a speed change cannot win by dropping data. The bench also estimates the payload of a
+  C1 snapshot of the same scope.
 
-## 1. Measure first
+`KORA_BENCH_AB=1` alternates the index on and off against one seeded log; `KORA_BENCH_BREAKDOWN=1`
+replays the received messages into server-less devices and attributes time per statement kind. The
+nightly workflow runs the bench on Postgres (`delivery-index-postgres` in `chaos-nightly.yml`). A
+browser variant, `packages/test/bench/browser/` (`bench:first-sync:browser`; not in CI), runs the real
+`createApp` in Chromium on the SQLite WASM worker with OPFS against a real server over WebSocket, with
+CDP throttling and a digest check.
 
-### The benchmark
+**What the first measurements showed.** The network was not the bottleneck (deflate brings 10 MB of
+JSON to about 1.4 MB, overlapped with apply). The scoped handshake pre-pass
+(`collectVisibleNodeIds`) and then `streamDelivery` scanned the whole global log, costing seconds
+before the first byte on multi-tenant logs. Full scope was bound by one storage transaction per
+operation on the device, which in the browser (10 to 17 ms per OPFS commit) is minutes. Stored fold
+state is a poor wire format: about 2.3 KB per record against 0.5 KB per operation.
 
-`packages/test/bench/first-sync.bench.test.ts`, with
-`packages/test/bench/lms-first-sync-fixture.ts` and `packages/test/bench/throttled-link.ts`.
-Run it with `pnpm --filter @korajs/test bench:first-sync`. It is not part of `pnpm test`.
-
-What the run uses:
-
-- **Fixture.** 30 collections (`users` ... `audit_logs`). Every record carries `schoolId`, and
-  the device under test belongs to `school-0`.
-  - The log holds `KORA_BENCH_VISIBLE_OPS` operations of that school. They are interleaved
-    round robin with the same number for each of `KORA_BENCH_TENANTS - 1` other schools, so
-    the default log is 100,000 operations, of which the device may read 20,000.
-  - The distribution is skewed: progress, answers, attempts, attendance and audit dominate,
-    and the home-screen `courses` collection is about 1/80 of the log.
-  - 60% of operations are inserts, 35% are partial updates that do not restate `schoolId`,
-    and 5% are deletes.
-  - Optionally, a share of updates moves a record to another school (`KORA_BENCH_MOVE_RATE`).
-  - The fixture is deterministic for a seed: timestamps start at a fixed epoch, so the same
-    options give the same operations, ids included. Operation ids are real version-2 content
-    hashes, so the server and the device verify them like any upload.
-- **Access.** `TokenAuthProvider` grants `{ schoolId: 'school-0' }` on every collection. This
-  is a server-granted scope, so the server filters the delivery stream. Every collection
-  declares `scope: ['schoolId']`, so `schoolId` is in `P(c)` (C2, "Partition key") and these
-  grants exercise the visibility index, not the partition-miss fallback. An access-rules
-  variant, with schools as groups and a membership per user, is listed under follow-ups. It
-  exercises interval gating and re-scope units.
-- **Server.** A real `KoraSyncServer` on the SQLite store (`KORA_BENCH_STORE=memory|postgres`
-  are also accepted; Postgres runs in a fresh schema that is dropped afterwards), seeded
-  through `applyRemoteOperation`, so fold state and scope snapshots are the server's own.
-- **Device.** A real `Store` on better-sqlite3 with the W7 fold, a real `SyncEngine`, and the
-  korajs adapters (`MergeAwareSyncStore`, `StoreQueueStorage`, `StoreSyncStatePersistence`),
-  wired as `createApp` wires them. `scopeExit: 'retract'` is set so the device holds exactly
-  its scope.
-- **Network.** An in-process link that carries JSON text. It models per-direction bandwidth,
-  RTT, in-order delivery and the server's `bufferedAmount()`, so delivery backpressure
-  behaves as it does over a socket. Bytes on the wire are the permessage-deflate size that
-  `ws` sends by default. Profiles:
-  - `slow-4g` (default): Lighthouse mobile, 1.6 Mbps down, 750 kbps up, 150 ms RTT.
-  - `fast-4g`: 9 Mbps, 1.5 Mbps, 60 ms.
-  - `unthrottled`: CPU only.
-- **What is timed**, from `engine.start()`:
-  - `handshakeMs`: the handshake response arrives.
-  - `firstBatchMs`: the first delivery batch is applied (`sync:received`).
-  - `firstHomeRowMs`: the home query (`courses where schoolId`, subscribed before the start)
-    first returns a row. **This is "first usable data".**
-  - `homeCompleteMs`: the home query holds every live course of the school.
-  - `fullScopeMs`: the engine reaches `streaming` and every collection holds exactly the
-    school's live records. **This is "full scope".**
-  - `clientApplyMs`: the sum of the device's per-operation apply time.
-  - Bytes down, as JSON and on the wire.
-- **Correctness check.** After the run, every collection on the device must equal the
-  server's materialized rows for the school: the same records with the same values of every
-  schema field, and the same fold state per record. The benchmark fails otherwise, so a
-  fast-sync change cannot win by dropping data, a dropped update or a stale field.
-- **C1 payload estimate.** The bench also serializes what a record snapshot of the same scope
-  would carry, in the exact `RecordSnapshotMessage` shape (section 3): every in-scope record,
-  **tombstones included** (soft-deleted rows whose last values match the scope,
-  `queryCollection({ includeDeleted: true })`), each as `{ collection, recordId, state }` with
-  `state` the stored fold state serialized (`serializeFoldState`) and no separate values, in
-  batches of the delivery batch size with the envelope fields (`type`, `messageId`,
-  `snapshotId`, `baseline`, `batchIndex`, `isFinal`, `cursor`), as JSON and deflated. It reports
-  live and tombstone counts separately. The state is today's canonical encoding; the compact
-  encoding (section 3) is estimated from it once it exists, so the number is an upper bound.
-
-### Where it runs and how CI uses it
-
-- **Pull requests: correctness smoke.** Add a step to `benchmark-gates.yml`:
-  `KORA_BENCH_VISIBLE_OPS=2000 KORA_BENCH_TENANTS=5 KORA_BENCH_PROFILE=unthrottled`, about
-  20 s on a shared runner. It enforces the correctness check, with no time gate.
-- **Nightly: the full fixture.** Add to `chaos-nightly.yml`: SQLite, and Postgres where
-  `KORA_PG_TEST_URL` is set, at `slow-4g`. It reports `firstHomeRowMs` and `fullScopeMs` as
-  `benchmark` annotations, like the store gates. Seeding 100,000 operations takes about
-  2 minutes on SQLite, so the seeded server database should be cached by fixture hash.
-- **Gates, once C2 lands.** Use absolute targets (2 s and 10 s, x1.1) on dedicated runners.
-  Shared runners use the relative A/B check (`scripts/bench/ab-regression.mjs`), as the store
-  gates do (`docs/benchmarks/baseline.md`).
-- **The browser number.** This one decides the C1 question (section 4). It needs a browser
-  variant: record the delivery batches of a node run to a JSON file, then replay them into
-  `@korajs/store` in Chromium on the worker and OPFS, next to
-  `packages/store/benchmarks/browser/store-browser-bench.mjs`. Node measures the server and
-  the protocol, but the browser apply path is where "minutes" comes from.
-
-### Baseline
-
-Measured on the 2-core shared review container (load average about 0.3), one run each,
-SQLite server store, delivery batch 100, October 2026:
-
-| Run | handshake | first batch | first home row | home complete | full scope | client apply | down (wire / JSON) |
-|---|---|---|---|---|---|---|---|
-| 100k log, 5 schools, device sees 20k, **slow-4g** | (not captured) | 3,359 ms | **3,293 ms** | 14,042 ms | **14,148 ms** | (not captured) | 1.44 MB / 10.0 MB |
-| same, unthrottled | 2,866 ms | 3,127 ms | 3,035 ms | 13,841 ms | 13,896 ms | (not captured) | 10.0 MB |
-| 20k log, 1 school (only visible ops), unthrottled | 439 ms | 568 ms | 541 ms | 11,476 ms | 11,549 ms | 7,491 ms | 10.0 MB |
-| same, **slow-4g** | 1,014 ms | 1,401 ms | 1,328 ms | 12,653 ms | 12,703 ms | 8,077 ms | 1.42 MB / 10.0 MB |
-
-Record snapshot of the same scope, in the `RecordSnapshotMessage` shape (11,024 live records
-plus 971 tombstones, fold state as stored, no separate values, 120 batches): **25.2 MB JSON,
-1.82 MB deflated**, compared with 10.0 MB and 1.42 MB for the 20,000 operations.
-
-What the numbers say:
-
-- **The network is not the bottleneck on node.** Slow 4G adds 0.3 to 1.2 s to runs of
-  11 to 14 s. Deflate brings 10 MB of JSON down to 1.4 MB, which takes about 7 s at
-  1.6 Mbps, and that transfer overlaps with apply.
-- **The global log scan costs about 2.4 s before the first byte of data.** The handshake
-  takes 2.9 s against a 100k log and 0.44 s against the 20k log of the same visible data. The
-  cause is `collectVisibleNodeIds` (`client-session.ts`), the scoped handshake pre-pass. It
-  reads `getOperationsAfterDelivery` from the watermark, and it reads to the end of the log
-  whenever another tenant's nodes never become visible. That is the normal multi-tenant case.
-  After the handshake, `streamDelivery` scans the global log a second time. This is the cost
-  C2 removes.
-- **The full scope is bound by per-operation apply on the device.** Apply alone takes 7.5 to
-  8 s for 20,000 operations on native SQLite (about 0.4 ms each). That is one storage
-  transaction per operation: `Store.applyRemoteFolded`, called once per operation from
-  `SyncEngine.handleOperationBatch`.
-- **In the browser that same loop is the "minutes".** The recorded OPFS measurements in
-  `docs/benchmarks/baseline.md` are 15 to 17 ms per commit (DELETE
-  journal), and 47 to 98 ms for a single-insert app-path transaction. 20,000 transactions at
-  15 ms or more is at least 5 minutes, before any fold work. This is an inference from those
-  numbers, not a browser measurement of this fixture. The browser variant above measures it.
-- **The fold state as stored is a poor wire format.** Per record it is about 2.3 KB of JSON,
-  against about 0.5 KB per operation. Every field carries a stamp holding a 64-hex operation
-  id and a serialized HLC, and `reg` states store the value twice (`e[].v` and `val`). At this
-  fixture's 1.8 operations per live record, a naive C1 sends more bytes than the operation
-  stream.
-
-### Found while measuring: retractions overtake the operations of their own batch
-
-**Fixed by #54 (merged).** Retractions now carry `afterOperations` and clients that declare
-`orderedRetractions` apply them in stream order; older clients get batches cut before such a
-retraction; a retracted record's visibility follows delivery order (latest delivered operation
-vs latest retraction); `KoraSyncServer.forceFullResync()` repairs devices that already kept such
-a record. `packages/test/tests/batch-retraction-order.test.ts` is the convergence test. The
-analysis below is kept as the record of how the benchmark found it; the PR smoke can now run
-with a move rate above zero.
-
-With `KORA_BENCH_MOVE_RATE=0.01` (1,000 visible operations, 2 schools) the correctness check
-fails. The device keeps `lesson_progress-154`, which was inserted in `school-0` and moved to
-`school-1` 98 operations later. With delivery batch 1 the same fixture passes. That points to
-ordering within a batch, and the code confirms it.
-
-The cause:
-1. `sendDeliveryBatch` puts a batch's retractions in a separate `retractions` array.
-2. `handleOperationBatch` (`sync-engine.ts`) applies every retraction before the batch's
-   operations.
-3. When a record's insert and its scope exit share a batch, the retraction runs first,
-   against a row that does not exist yet. `Store.applyScopeRetraction` hides nothing.
-4. The insert then materializes a live row, because `materializeRow` consults
-   `_kora_scope_retractions` only for an existing row.
-
-Retractions for access-rule collections are sent whatever the exit policy, so this affects
-beta.15 access rules by default. It is independent of C1 and C2 and should be fixed first.
-Two possible fixes:
-- Make the order explicit on the wire (additive): each retraction carries the index of the
-  operation it follows, and the client applies items in stream order.
-- For old clients, the server cuts a batch before a retraction whose record has an earlier
-  operation in the same batch.
-
-Add a convergence test for it in `packages/test`. The PR smoke above should then run with a
-move rate above zero.
+The benchmark also found that a batch's retractions were applied before its operations. Retractions
+now carry their stream position (`afterOperations`), clients declaring `orderedRetractions` apply
+them in order, older clients get batches cut before such a retraction, visibility follows delivery
+order, and `KoraSyncServer.forceFullResync()` repairs affected devices
+(`packages/test/tests/batch-retraction-order.test.ts`).
 
 ## 2. C2: a visibility index `(partition_key, delivery_seq)`
 
 ### Problem
 
-Every delivery read is `operations WHERE delivery_seq > cursor ORDER BY delivery_seq`. Today
-the only index for it is the global `idx_delivery_seq` (`drizzle-pg-schema.ts`,
-`drizzle-schema.ts`), and `filterDeliveryChunk` judges every row. The costs:
-
-- **First sync** costs O(log after the watermark). For a device that sees 1/T of the log,
-  that is T times the work that matters, paid twice (the handshake pre-pass and the stream).
-- **Resume** after a long offline period costs O(everything written since), including every
-  other tenant.
-- **Live delivery** (`pushDeliveryStream` on each wake-up) scans each new operation once per
-  session. With S sessions that is O(S x new ops) judgments.
+Every delivery read was `operations WHERE delivery_seq > cursor ORDER BY delivery_seq`, each row
+judged by `filterDeliveryChunk`. A device seeing 1/T of the log paid T times the useful work, twice
+(pre-pass and stream); a resume read every tenant's writes since; live delivery judged every new
+operation per session.
 
 ### The invariant
 
-The index only narrows what is read. It never decides delivery:
-`filterDeliveryChunk` stays the single authority on what a session receives, and the index
-must return a **superset** of the operations that `filterDeliveryChunk` would act on below a
-known frontier. A false positive costs one wasted judgment. A false negative is a lost
-operation, which the watermark cannot recover, because the stream would advance past it.
-
-Every rule below follows from that. In particular, keys can be 64-bit hashes: a collision
-only adds rows.
+The index only narrows what is read; it never decides delivery. `filterDeliveryChunk` stays the
+single authority, and the index must return a **superset** of what it would act on below a known
+frontier. A false positive costs one judgment; a false negative is a lost operation the watermark
+cannot recover. Keys may therefore be 64-bit hashes: a collision only adds rows.
 
 ### What `filterDeliveryChunk` acts on
 
-The index has to cover each of these:
-
-1. Operations visible to the session, judged on the **post** scope snapshot (RT-14), or on
-   current row plus `op.data` when there is no snapshot. Query views narrow this further.
-2. **Scope entries**: an update whose pre snapshot is outside the scope and whose post is
-   inside. The entry is synthesized at read time from the trigger operation and shares its
-   delivery sequence, so no index row is needed beyond the trigger's post key.
-3. **Retractions**: an update whose pre was inside and whose post is outside. These need the
-   **pre** key. `accessPreHeld` also gates them on `historyAllows` over the pre values.
-4. **The client's own accepted writes that leave the read grant** (`ownWriteLeavesGrant`).
-   The record may be in no partition the session reads (a write rule broader than the read
-   rule), so these must be found by **node**.
-5. **Membership changes** (`operationTouchesMemberships`), which trigger re-scope units:
-   - rows of the memberships collection naming the user;
-   - group records that the user owned or now owns;
-   - deletion or restore of a group the user belongs to (also `grantedGroups`, which
-     terminates the session);
-   - `revivesGroupOfMine`: a group revived while the user holds a membership row with no
-     interval.
-6. The **frontier**: the final batch claims `maxScanned` (or the reserved access frontier),
-   so the session must know that nothing it acts on lies below that sequence.
+1. Operations visible to the session, judged on the **post** scope snapshot.
+2. **Scope entries** (pre outside, post inside), synthesized from the trigger at its sequence.
+3. **Retractions** (pre inside, post outside): these need the **pre** key.
+4. **The client's own accepted writes that leave the read grant** (`ownWriteLeavesGrant`), found
+   by **node**, since the record may be in no partition the session reads.
+5. **Membership changes** (`operationTouchesMemberships`): membership rows naming the user; groups
+   the user owned or now owns; deletion or restore of a held group; revival of a group the user has
+   a membership row for.
+6. **The frontier** the final batch claims: nothing acted on may lie below it unread.
 
 ### Partition key
 
-`partition_key = int64(sha256(collection \0 field \0 canonicalJSON(value)))` for each field
-in the collection's partition set `P(c)`, and for each distinct value that field has in the
-operation's **pre or post** scope snapshot.
+`partition_key = int64(sha256(collection \0 field \0 canonicalJSON(value)))` for each field in the
+partition set `P(c)` and each value it has in the operation's **pre or post** scope snapshot. `P(c)`
+comes from the schema (`scope`, sync-scope bindings, fields named by access read rules, membership
+`userId` and group field, group `id` and owner field) plus `deliveryPartitions` on `KoraSyncServer`
+for provider scopes the schema does not declare. It is stored with a fingerprint (prefix `dp2:`).
 
-`P(c)` is derived from the schema, and stored with a fingerprint in `kora_server_meta`
-(`delivery_partition_fields`):
-
-- `schema.collections[c].scope` and the sync-scope bindings (`core/src/scopes/sync-scope-bindings.ts`);
-- every field that an access read rule of `c` names (`owner`, `member`, `memberOfKey`,
-  `where`, recursively through `or` and `and`);
-- for the memberships collection: `userId` (a user's own rows are always sent) and the group
-  field;
-- for each group collection: `id` (deletion, restore and revival of a group) and its owner
-  field;
-- `deliveryPartitions: { [collection]: string[] }` on `KoraSyncServer`, for providers whose
-  scopes name fields the schema does not declare. `TokenAuthProvider` scopes are arbitrary
-  maps, so the server cannot infer them.
-
-Two cases need special keys:
-
-- **Snapshot-less operations** (legacy rows that RT-14 could not backfill) get the key
-  `collection \0 ?`. Every session that reads `c` includes it. Today these are judged on the
-  current row, which can move after indexing, so no value key is safe for them.
-- **Snapshot gaps**: a snapshot captured before a scope field existed lacks that field
-  (RT-20). The partition fields are scalars, so they are exactly the fields
-  `scopeSnapshotFingerprint` covers. A fingerprint change already recomputes every snapshot.
-  The index rebuild is tied to the same step, and an operation whose snapshot still lacks a
-  field in `P(c)` also gets the `?` key. Over-long strings are recorded as `null` in
-  snapshots. They are indexed under `null` and fail closed in the filter, as they do today.
-
-Two cases need no rows at all, because indexes on `operations` serve them:
-
-- **Collection-wide reads**: an `anyone()` rule, a provider grant of `{}` for a collection, or
-  a scope whose branches constrain no partition field. These use a new composite
-  `idx_collection_delivery (collection, delivery_seq)`.
-- **The session's own node** (case 4): a new `idx_node_delivery (node_id, delivery_seq)`.
-
-Write cost is about |P(c)| + 1 rows per operation, a few more for an update that moves a
-record. The LMS fixture declares `scope: ['schoolId']` on every collection and writes 1 row per
-operation.
+- Operations without a usable snapshot get `collection \0 ?`, read by every session reading `c`.
+- **Tombstones**: a delete (or an operation leaving the record deleted) is also filed under every
+  partition the record was in before, because a session sends a delete when the record was ever in
+  its view. The property test found this case.
+- Collection-wide reads and the session's own node use `idx_collection_delivery` and
+  `idx_node_delivery` on `operations`.
 
 ### Tables
 
-Postgres:
-
-```sql
-CREATE TABLE IF NOT EXISTS kora_delivery_partitions (
-  partition_key BIGINT NOT NULL,
-  delivery_seq  BIGINT NOT NULL,
-  PRIMARY KEY (partition_key, delivery_seq)
-);
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_collection_delivery ON operations (collection, delivery_seq);
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_node_delivery ON operations (node_id, delivery_seq);
-```
-
-SQLite uses the same table `WITHOUT ROWID` and plain `CREATE INDEX IF NOT EXISTS`. The memory
-store keeps `Map<bigint, number[]>`, an append-only sorted array per key, read by binary
-search, as `getOperationsAfterDelivery` already does.
-
-`CONCURRENTLY` cannot run inside `ensureTables`' transaction. It runs after it, once per
-start, and treats an `INVALID` index left by a crash as absent (`DROP INDEX CONCURRENTLY`,
-then retry). Until the indexes are valid, sessions use today's scan.
+`kora_delivery_partitions (partition_key, delivery_seq)` primary-keyed on both (`WITHOUT ROWID` on
+SQLite; Postgres indexes built `CONCURRENTLY` after startup, with invalid ones rebuilt), and sorted
+arrays in the memory store. Until indexes are valid, sessions use the global scan.
 
 ### Writing
 
-Index rows are written **in the append transaction** that writes the operation and its scope
-snapshot (`applyRemoteOperation`, conditional apply, route apply, side effects), after the
-snapshot is known. A reader therefore never sees an operation without its rows, or rows
-without their operation.
-
-The rows are server-internal and never leave the server, so they reveal nothing across
-tenants. A session reads operations only through `filterDeliveryChunk`, exactly as today.
-Compaction, the log-integrity quarantine (`operations_quarantine`), and a replace-mode
-restore delete the rows of the operations they remove, in the same transaction.
-
-A contiguous `delivery_partitions_through` counter in `kora_server_meta` marks how far the
-index is complete. The append transaction already holds the delivery-counter lock (Postgres)
-or is the single writer (SQLite). In that same transaction it advances `through` to its own
-sequence when `through` equals that sequence minus 1. Access-index reconciles that reserve a
-sequence without an operation also advance it.
+Rows are written **in the append transaction** with the operation and its snapshot, so neither is
+ever visible without the other; compaction, log quarantine and replace-mode restore delete them in
+the same transaction. A contiguous `delivery_partitions_through` counter, advanced under the
+delivery-counter lock (or the single SQLite writer), marks how far the index is complete. Because
+every Postgres append holds the counter row lock to commit, a tombstoning write always sees every
+earlier snapshot.
 
 ### Reading
 
-A new optional store method:
-
-```ts
-getOperationsAfterDeliveryIn?(
-  sources: DeliverySources, // partition keys, collections, node ids
-  afterDeliverySequence: number,
-  limit: number,
-): Promise<{ operations: DeliveredOperation[]; complete: boolean; coveredThrough: number }>
-```
-
-It returns the operations in any source, after the cursor and at or below `coveredThrough`
-(the value of `through` read before the query), in delivery order, deduplicated. When it
-returns fewer than `limit` with `complete: true`, nothing the session acts on lies in
-`(cursor, coveredThrough]`.
-
-Postgres uses one statement, one LATERAL index range per key, merged:
-
-```sql
-SELECT o.* FROM (
-  SELECT DISTINCT s.seq FROM (
-    SELECT p.delivery_seq AS seq FROM unnest($keys::bigint[]) k(key)
-      CROSS JOIN LATERAL (SELECT delivery_seq FROM kora_delivery_partitions
-        WHERE partition_key = k.key AND delivery_seq > $after AND delivery_seq <= $through
-        ORDER BY delivery_seq LIMIT $limit) p
-    UNION ALL
-    SELECT c.delivery_seq FROM unnest($collections::text[]) k(name)
-      CROSS JOIN LATERAL (SELECT delivery_seq FROM operations
-        WHERE collection = k.name AND delivery_seq > $after AND delivery_seq <= $through
-        ORDER BY delivery_seq LIMIT $limit) c
-    UNION ALL
-    SELECT delivery_seq FROM operations WHERE node_id = $node
-      AND delivery_seq > $after AND delivery_seq <= $through
-  ) s ORDER BY s.seq LIMIT $limit
-) w JOIN operations o ON o.delivery_seq = w.seq ORDER BY o.delivery_seq
-```
-
-The node branch also needs `ORDER BY delivery_seq LIMIT $limit`.
-
-SQLite runs one bounded query per source and merges the results in JS (k-way, by sequence).
-Each read costs O(|sources| x log n + |sources| x limit). That is not O(visible ops), so key
-sets above `MAX_DELIVERY_SOURCES` (proposed 256) fall back:
-- `$in` grants collapse to their collection (still a superset);
-- past that, the session uses the global scan.
-
-Access grants may hold up to 10,000 group ids (`MAX_ACCESS_GRANT_VALUES`), which is why the
-fallback exists.
+`getOperationsAfterDeliveryIn(sources, after, limit)` returns operations from any source above the
+cursor and at or below `coveredThrough`, in order, deduplicated (Postgres: one statement merging
+`LATERAL` ranges; SQLite: per-source queries merged in JavaScript). Source sets above
+`MAX_DELIVERY_SOURCES` (256) collapse the widest collection to a whole read, never narrower. The read
+re-checks the plan fingerprint, `through` and a reset epoch after probing and falls back to the
+global scan if any changed (`through` alone is not a generation across restore and rebuild).
 
 ### The session
 
-At handshake, and again after each `refreshAccessGrant` and re-scope unit,
-`DeliverySources` is computed from the downlink scope:
-- for each collection, the branches of its scope (`scopeBranches`);
-- in each branch, one partition field it constrains by equality or `$in` (the first in
-  `P(c)` order), giving that field's value keys plus `c \0 ?`;
-- the collection itself when no branch constrains a partition field, and nothing for a
-  denied collection.
+Sources are computed at handshake and after each grant refresh or re-scope unit: per collection, per
+scope branch, one partition field constrained by equality or `$in` (its value keys plus `c \0 ?`), or
+the whole collection. For access rules, one source per case of `operationTouchesMemberships`: the
+user's `userId` key; the owner-field key for the user on each group collection (finds a group
+transferred to someone who held nothing in it); the `id` keys of held groups and capability grants
+(group collections are read whole past 10,000 membership rows); the session's node.
 
-Then, for access rules:
-
-- `userId` keys on the memberships collection.
-- For each group collection, its **owner-field key for the session's user**
-  (`group \0 <owner field> \0 canonicalJSON(userId)`). `operationTouchesMemberships` re-scopes
-  on any group operation whose pre or post owner is the user, including a group the user does
-  not hold yet being transferred to them (and one being transferred away). The id keys below
-  cannot find that operation, since the group is not held; the owner field is in `P(c)` for
-  group collections and is indexed on both pre and post values, so this key does.
-- The `id` keys of every group the user holds an interval for, or a membership row for. The
-  row comes from the memberships collection, not the intervals, because `revivesGroupOfMine`
-  covers rows that have no interval. The `grantedGroups` are added as well.
-- The client's own node.
-
-Each bullet maps to one case of `operationTouchesMemberships` (memberships rows naming the user;
-owner pre or post equal to the user; deletion or restore of a held group; revival). A test
-enumerates them against the source set: for each case, the triggering operation is returned by
-`getOperationsAfterDeliveryIn` and produces the same re-scope unit as the global scan,
-including a group transferred to a user who held nothing in it.
-
-A source set derived from intervals changes when memberships change. The re-scope unit is
-the point where the stream switches source sets, so the unit's own sequence is the boundary:
-the new set is used for reads after the unit. The existing unit logic covers everything at
-or before the boundary: it narrows, then sends entries for what the old set never saw.
-
-`streamDelivery` and `collectVisibleNodeIds` read through `getOperationsAfterDeliveryIn` up
-to `coveredThrough`, then fall back to today's global scan for the tail. The tail is empty in
-steady state, and short after a rolling upgrade. The claimed max is `coveredThrough` (or the
-tail's `maxScanned`), as `maxScanned` is today. `filterDeliveryChunk` and every gate inside it
-are unchanged:
-- interval gating (`historyAllows`, which still judges each operation against the interval
-  open at its sequence);
-- re-scope units;
-- scope entries sharing their trigger's sequence;
-- the rule that a batch never ends on an entry;
-- the narrowing that starts a batch.
-
-`historyAllows` could also prune by `joinedSeq` per key. That is not done: operations before
-`joinedSeq` still produce retractions and membership units, so pruning would break the
-superset invariant for a small gain.
-
-A session whose scope constrains a field that is not in `P(c)` logs `delivery.partition_miss`
-once, with the collection and field. It then reads that collection by collection. This tells
-the developer to declare `scope` or `deliveryPartitions`.
+A re-scope unit ends the chunk so the next read uses the new sources; a grant change while a chunk is
+judged drops the index for the rest of that stream. `streamDelivery` and the pre-pass read through
+the index to `coveredThrough`, then scan the tail globally. Every gate inside `filterDeliveryChunk`
+is unchanged. Pruning by `joinedSeq` is deliberately not done: earlier operations still produce
+retractions and membership units. A scope field outside `P(c)` reads the collection whole and logs
+`delivery.partition_miss` once.
 
 ### Migration and backfill on existing databases
 
-1. **Startup** (`ensureTables` / `setSchema`): create the table, and compute `P` and its
-   fingerprint. If the stored fingerprint differs, or the table is new:
-   - set `delivery_partitions_through = 0`;
-   - record `delivery_partitions_from = current counter`;
-   - truncate the table, in one transaction under the counter lock.
-
-   New appends index immediately but cannot advance `through` (it is not contiguous). The
-   delivery index's rebuild marker follows the pattern of the scope-snapshot rebuild marker
-   (`SCOPE_SNAPSHOT_PENDING_KEY`).
-2. **Background backfill.** It runs after the server is ready and is not on the startup path.
-   - It reads `operations` in delivery order in chunks of 5,000 above `through`.
-   - It inserts the rows (`ON CONFLICT DO NOTHING`, so it is idempotent) and advances
-     `through`, one transaction per chunk.
-   - On Postgres it takes the counter lock only for the final catch-up, so live writes are not
-     blocked.
-   - It is resumable: a restart continues from `through`.
-   - The scope-snapshot rebuild (RT-20) runs first. An operation whose snapshot is still
-     pending is indexed under `c \0 ?`.
-3. **Rolling upgrade (Postgres).** An older instance appends without index rows, so `through`
-   stops at its first such write. The backfill loop runs on every delivery poll and indexes
-   the gap, which advances `through` again. Until then sessions read the tail by global scan.
-   This is correct, only slower, and the fallback is automatic.
-4. **Access-rules deploy, or a schema change of scope fields.** The fingerprint changes, so
-   the index rebuilds as in step 1. During the rebuild every session uses the global scan.
-   Access sessions are re-scoped anyway, because `accessUnenforceable` sees the read-rules
-   fingerprint change.
-5. **Backup.** A restore rebuilds the index. Exports skip it, because it is derived data.
-
-### Expected effect
-
-Reads become O(visible operations + |sources| per chunk) for:
-- the first sync,
-- resume,
-- the handshake pre-pass,
-- live pushes.
-
-The benchmark's 1-school run approximates the upper bound of that effect. It holds the same
-visible volume and shape, but it is not the same records:
-the handshake falls from 2.9 s to 0.44 s, and the first home row from 3.0 s to 0.54 s
-unthrottled (1.33 s on Slow 4G).
-
-### C2 as built (C2.5 to C2.7)
-
-- **Sources of an access session.** The grant's scope gives the scope sources. The membership
-  sources add one key per case of `operationTouchesMemberships`: membership rows naming the
-  user (`userId` key); a group whose owner is, or becomes, the user (owner-field key, so a group
-  transferred to a user who held nothing is found); deletion, restore or revival of a held group
-  and capability grants (group `id` key); and the session's own node. A field missing from the
-  collection's partition set reads the collection whole. Sources that exceed the cap collapse the
-  widest collection to a whole read, never narrower. Past 10,000 membership rows the group
-  collections read whole.
-- **Split on a unit.** A re-scope unit changes the grant, hence the sources. The chunk ends after
-  the unit's operation and the next read recomputes sources under the new grant. If the grant
-  changes while a chunk is read (the delivery poll refreshes it), the rest of that stream falls
-  back to the global scan.
-- **Reads through the index.** `streamDelivery` and `collectVisibleNodeIds` (handshake pre-pass)
-  read to `coveredThrough`, then scan the tail globally. Held writes still use the global scan.
-  `filterDeliveryChunk` remains the only authority on delivery.
-- **Rolling upgrade.** The delivery poll calls `ServerStore.catchUpDeliveryIndex`, one read when
-  nothing is behind, otherwise it kicks the backfill. Restore rebuilds the index; exports skip it.
-- **Logging.** `delivery.partition_miss` is logged once per store, collection and field.
-- **Tests.** Six membership scenarios (catch-up and connected), a burst test of a grant landing
-  inside a chunk, a fast-check superset property against the global scan over a school fixture
-  (catch-up, live, burst; final watermark included), a store-level property that membership
-  sources alone cover every membership-touching operation, rolling-deploy and backfill-resume
-  tests on SQLite and Postgres, and a nightly Postgres job (`delivery-index-postgres` in
-  `chaos-nightly.yml`). Mutations (no split, missing owner or userId key) fail them.
-- **Tombstones.** A delete (and any operation after which the record is deleted) is also filed
-  under every partition the record was in before, because a session sends a delete when the
-  record was ever in its view, whatever partition the delete's own pre-image names. Without this,
-  a lesson moved out of a school and then deleted there reached a reader of the old school by
-  the global scan but not by the index (found by the property test; now a permanent regression
-  example). The prior partitions come from the record's earlier stored snapshots, in the write's
-  transaction; the backfill and the snapshot replay do the same. Group-collection snapshots
-  carry `id` (scope-snapshot values start with `{ id: recordId }`), so operations on a group are
-  filed under its `id` key and narrowed by it. Because the owner key adds the collection's unknown
-  key, the membership `id` key is redundant for a signed-in user whose grant holds the group; it
-  is needed for sessions without a user id (capability grants only) and is covered by the
-  source-builder and store-level properties, not by a session-level stream difference.
-- **Stale sources.** A grant the delivery poll installs while a chunk is judged drops the index
-  for the rest of the stream. The stream is correct either way (the membership row is still
-  found by the user key), so this is defense in depth; a test pins it by the global scan reading
-  the rest of the stream.
-- **Plan version.** The fingerprint is `dp2:`. An index built by the first C2 code (`dp1:`, deletes
-  filed under their own partition only) reads as unusable under the new plan and is rebuilt once;
-  a delete an unpatched instance writes in a rolling deploy lands above the frontier or under a
-  different fingerprint, so sessions read it by the global scan.
-- **Index reset race.** `getOperationsAfterDeliveryIn` reads the partition state (plan
-  fingerprint, `through` and a reset epoch) again after the probes and falls back to the global
-  scan if any changed. The epoch is a random token written by every reset (plan change, restore):
-  `through` alone is not a generation, because a restore followed by a rebuild brings it back to
-  its old value while a probe in between saw rows missing.
-- **Concurrent Postgres writers.** The prior-snapshot query of a tombstoning write cannot miss a
-  concurrent writer's earlier-partition snapshot: every append takes the delivery-counter row lock
-  in `nextDeliverySeq` and holds it to commit, so each operation with a lower sequence (and its
-  snapshot, written in the same transaction) committed before this transaction got its own
-  sequence, and a READ COMMITTED statement after the lock sees it. The backfill reads committed
-  operations only, whose predecessors committed before them.
-- **Regression guard.** The failing log (a lesson moved out of the reader's school, then deleted)
-  changes the stream only where the global scan sends the delete: the memory store, whose
-  live-view summary is unknown, sends it; SQLite and Postgres know the record had left the
-  reader's view and send nothing. So the property's regression examples fail without the fix on
-  the memory store only, and the store-level test "a delete is filed under every partition its
-  record was in" guards the filing on SQLite and Postgres as well.
-- **Measurement.** 100,000-operation log, 20,000 visible, 5 tenants, SQLite, node, on the
-  `feat/c2-5-to-c2-7` base (which includes C3 batched apply). One process seeded the log once,
-  then ran 10 devices alternating the index on and off (`KORA_BENCH_AB=1`,
-  `KORA_BENCH_RUNS=10`): 5 per arm, median with min and max. This is a shared 2-core
-  container, so absolute times are noisy and only the on/off ratio within a run is comparable.
-
-  | Profile | Metric | Index off (global scan) | Index on |
-  |---|---|---|---|
-  | Unthrottled | Handshake | 7,278 ms (4,114 to 8,137) | 974 ms (908 to 1,798) |
-  | Unthrottled | First home row | 7,411 ms (6,412 to 8,256) | 1,098 ms (982 to 1,878) |
-  | Unthrottled | Full scope | 14,044 ms (12,778 to 15,027) | 8,375 ms (7,743 to 9,249) |
-  | Slow 4G | Handshake | 4,526 ms (4,260 to 7,353) | 1,307 ms (1,082 to 1,629) |
-  | Slow 4G | First home row | 4,564 ms (4,317 to 7,491) | 1,341 ms (1,111 to 1,683) |
-  | Slow 4G | Full scope | 16,926 ms (10,875 to 26,453) | 8,503 ms (8,367 to 16,489) |
-
-  Read these numbers as a direction, not a magnitude. The unthrottled index-off handshake
-  (7.3 s) is slower than the Slow 4G index-off one (4.5 s), which is physically odd (a throttled
-  link cannot be faster) and points to noise in the shared container. The index lowers the
-  handshake and the first home row by a factor of about 3.4 to 7.5 in this container, and the
-  full scope by 1.7 to 2 at the median. Caveats: the index-off arm here is
-  slower than the earlier pre-C2 single runs in section 1 (2.9 s handshake, 14.1 s full scope
-  unthrottled), so those single runs and this table must not be compared with each other; the
-  full-scope spread is wide (the Slow 4G arms overlap at their extremes: 10.9 s off, 16.5 s on at
-  worst); and the full-scope time contains the device's batched apply (C3), which the index does
-  not change, so the 1-school bound of 11.5 to 12.7 s in section 1 was measured before C3 and
-  does not apply to this base. The first home row on Slow 4G (1.34 s median) is near the
-  1.33 s bound of the plan, not below it. Postgres is not measured here; the nightly job runs it.
-
-## 3. C1: cold start from current state
-
-The idea: for a view the device has never synced (watermark 0), the server sends each
-visible record's fold state instead of its history, then jumps the watermark to a baseline.
-The client stores each state as the record's base and folds later operations on top.
-
-Rejected alternative: synthetic operations (one insert per record carrying current values).
-They beat older offline edits under last-write-wins, because they carry new HLCs, or else
-they forge old ones. They also fail id verification, because they are not the operations
-that produced the state. Scope entries already carry `foldState` (RT-29), and C1
-generalizes that path.
-
-### Negotiation (additive, within protocol v2, two phases)
-
-The fold plan includes the authoritative node ids (server-authoritative fields), and a new
-device learns them only from the handshake response. A plan the client computes before the
-handshake would therefore never match on deployments that have authorities, and C1 would never
-turn on for exactly the devices it targets. So the plan is settled in two phases, and no
-snapshot batch is sent before the client has confirmed the full plan:
-
-1. **Handshake.** The client sends
-   `recordSnapshot?: { foldStateVersion: number; schemaPlan: string }`, where `schemaPlan` is
-   the authority-independent part of the plan fingerprint: field kinds, merge strategies,
-   resolver source, transforms, fold-state version (the same function that writes the server's
-   `fold_plan_fingerprint`, with the authority set left out).
-2. **Offer.** The server compares `schemaPlan` and the version with its own and checks the
-   other conditions:
-   - the view's watermark is 0 **and** the view never had a delivery run on this device: the
-     handshake's per-view state says so (no stored watermark, no `fullResync` pending). A view
-     reset to 0 by `resetDeliveryForFullResync()`, a server restore or `forceFullResync()`
-     (#54) does not negotiate C1: those exist to repair a device that may hold records outside
-     its view, which a replay judges and a snapshot (a join of current states) would not remove;
-   - the scope has no end-to-end-encrypted collection (see below);
-   - the session is not in an access rebuild.
-   If all hold, `handshake-response` carries
-   `recordSnapshot: { offered: true, plan: string, authoritativeNodeIds: string[] }`, the
-   server's full plan fingerprint and the authority set it was computed with. Otherwise the
-   field is absent and the session streams operations exactly as today.
-3. **Confirm.** The client computes the full plan from its schema and the response's
-   `authoritativeNodeIds`. Equal: it sends `record-snapshot-accept { plan }` and the server
-   starts paging (the server re-checks `plan` against its own on receipt, so an authority
-   change between offer and accept falls back). Different, or the client cannot compute it:
-   `record-snapshot-decline { reason }` and the server streams operations from the watermark.
-   The server sends no delivery batch and no snapshot batch between the offer and the answer;
-   a client that answers neither within the handshake timeout is treated as a decline.
-
-Old clients never send the field and old servers ignore it, so neither phase runs. The
-authority set used is the one the snapshot's states were folded with; a later authority
-change is an ordinary plan change for the stream above B (red team, case 6).
-
-### Message
-
-```ts
-interface RecordSnapshotMessage {
-  type: 'record-snapshot'
-  messageId: string
-  snapshotId: string      // one per snapshot run
-  baseline: number        // delivery sequence B, captured before any read
-  batchIndex: number
-  isFinal: boolean
-  cursor: string          // opaque resume position (collection, record id)
-  records: Array<{
-    collection: string
-    recordId: string
-    state: string         // compact fold state (below)
-  }>
-  accessRulesKey?: string // on the final batch, as on delivery batches
-}
-```
-
-After the final snapshot batch, the session streams ordinary delivery batches from
-`baseDeliverySequence = B`.
-
-Delivery-order visibility (#54): every snapshot record is treated as delivered at position B
-(the baseline) for the store's visibility rule, so a retraction above B hides it and any
-operation or scope entry above B decides after it, exactly as if its history had been
-delivered at or below B.
-
-The client acks each snapshot batch with its `messageId`. The final ack commits the watermark
-jump to B, in the same transaction as the last records, through `commitDeliveryProgress` and
-the view watermark.
-
-### Compact state encoding
-
-As measured, a snapshot in today's fold-state encoding is about 2.5x the JSON bytes of the
-operations it replaces (1.3x deflated) at 1.7 operations per in-scope record, tombstones
-included. C1 needs `encodeFoldStateCompact` / `decodeFoldStateCompact` in
-`@korajs/core`:
-
-- one stamp table per record (distinct `(t, o, c)` triples), with fields referencing stamps
-  by index;
-- `reg` without the cached `val`;
-- operation ids are never shortened. Stamps are compared on the full id, so a shortened id
-  could change an order. The full id travels once per distinct stamp, not once per field.
-
-The gate is a property test that `decode(encode(s))` deep-equals `s` for every field kind.
-The estimate is about 0.6 KB of JSON per record that was written once. Measure it with the
-bench's payload estimate (which serializes this message with today's encoding, tombstones
-included) before building the client side, and re-run it with the compact encoding.
-
-### Server: building a consistent snapshot
-
-Order of the reads:
-
-1. Read the delivery counter, giving **B**. On Postgres, read
-   `max(delivery_seq, access frontier)` after taking and releasing the counter lock, so every
-   sequence at or below B is committed (commit order is sequence order, per durable-delivery).
-2. Read the membership intervals and compile the grant **after** B. A membership change at or
-   below B is then in the grant, and one above B is met again by the stream. That repeat is
-   harmless: `rescopeBasis(held = current)` yields no unit.
-3. Page through the records matching the downlink scope, using the existing
-   `recordsMatching` with an id cursor. Each page reads the row and the fold state in **one
-   statement** (`JOIN kora_fold_state`), so the pair is consistent. Both are written in the
-   same transaction.
-
-Snapshot isolation across pages is **not** required. The argument:
-
-- Every state read after B contains every operation at or below B. Fold states only grow:
-  `joinStates` is monotone.
-- A state may also contain operations above B. The stream from B re-delivers them, and
-  merging an operation already in the state is a no-op, because the fold is idempotent.
-- A record that left the scope between B and its page is not sent. Its exit operation is
-  above B, so the stream carries it as a retraction of a record the client lacks, which is
-  harmless.
-- A record that entered between B and its page is sent. Its entry operation above B produces
-  a scope entry with the same state, which joins idempotently.
-
-Freshness is required. `kora_fold_state` can lag the log:
-- during a rolling upgrade, an older instance appended without folding ("merge the missing
-  tail", `server-fold-authority.md`);
-- `covered_seq` is set to -1 after a restore or a quarantine;
-- the `plan` may differ.
-
-The snapshot reads states through the same freshness check the apply path uses: `covered_seq`
-and `covered_op_id` against the record's newest operation, plus the plan. A stale state is
-brought up to date (tail merge or re-fold) before it is sent. A raw read would silently
-omit operations at or below B.
-
-Read replicas are not allowed for the snapshot read: they can lag B.
-
-**Tombstones are included.** A deleted record whose last values match the scope is sent as
-its dead state. Without it, an operation above B that revives the record diverges: the
-client folds an update onto an empty state, gets no insert and no row. Full replay revives
-the record with every field's merged value. (Red team, case 3.)
-
-A future optimization: send dead records only when a later revival operation exists, via a
-"revival entry" at that operation, like a scope entry. That needs its own proof and is out
-of scope.
-
-Under access rules, the snapshot is the current state of the records the current grant
-admits. That is exactly what a late joiner receives today through scope entries, so interval
-gating needs no new rule. The session sets:
-- `run.held` to the live intervals the grant was compiled from;
-- `run.asOfSeq` to null;
-- `rulesChanged` to false, with the rules key sent on the final batch.
-
-The stream from B then re-scopes only on membership operations above B.
-
-### Client: applying a snapshot
-
-`record-snapshot` is applied inside one storage transaction per batch:
-
-1. For each record, decode the state. If it cannot be read, or `mismatchedFoldFields` is not
-   empty, the batch is not acked (see quarantine below).
-2. `joinIntoBase` into `_kora_fold_base`. That table is for exact, operation-built states, and
-   the server's state is one.
-3. Re-fold the record: `join(base, snapshot, fold(log - rejected))`. This keeps any local
-   operation, including **unsent offline edits**: on a device that is not new, the view is new
-   but the device may hold data. Then materialize the row (`clearRetraction: true`).
-4. Record `(snapshotId, B, cursor)` in `_kora_meta`, and add the record to
-   `_kora_snapshot_records (snapshot_id, collection, record_id)`.
-
-Records become visible to queries as soon as their batch commits. That is the point of C1:
-the home screen renders from page 1.
-
-Unsent local edits upload as usual. The server folds them, the stream above B does not echo
-them (`ownOperationsIncludedThrough`), and the join already shows them locally. Terminal
-rejection re-folds from base and log without the rejected operation, so the record returns to
-the server's state. The version vector is not advanced by a snapshot. This is fine, because
-v2 clients count pending from their own acks (RT-28).
-
-**Resume.** A reconnect mid-snapshot sends `snapshotResume: { snapshotId, baseline, cursor }`
-in the handshake. If the server still accepts B, it continues paging with the **same** B. This
-is correct by the argument above, because the stream from B covers every change after B,
-including changes to records already sent. The server does not accept B when:
-- the access generation or rules key changed;
-- the delivery index fingerprint changed;
-- the server was restored below B.
-
-In that case it answers `snapshotRestart`. The restart is usually caused by an access or
-rules change, so a record from run 1 may be outside run 2's scope, and run 2 will neither send
-it nor retract it. Every contribution of run 1 must therefore go, not only records that
-received nothing else. In one storage transaction, before run 2's first batch, for **every**
-record in `_kora_snapshot_records` for that snapshot:
-1. drop its snapshot base (`_kora_fold_base`, restoring the base the record had before run 1,
-   which is empty on a device new to the view; the pre-run base is saved in the tracking row
-   when the record is first joined);
-2. drop the remote operations of that view the device received above run 1's B (the stream
-   from B that followed run 1's final batch, if any): they were applied against run 1's
-   baseline and are re-delivered by run 2 when they are in its scope. Their log rows are
-   removed by delivery position (the store records each remote operation's delivery sequence,
-   #54), never by record id alone, so an operation another view delivered stays;
-3. keep the device's own local operations (unsent, or sent but not yet echoed): the eligible
-   local edits;
-4. re-fold the record from what remains (pre-run base, the kept local operations, operations
-   delivered by other views) and re-materialize it. A record left with nothing is removed as
-   a never-synced record (no tombstone, no operation). A record whose only remaining content
-   is an unsent local edit outside run 2's scope stays, as unsent writes always do under
-   narrowing, and is judged by the server when it uploads.
-Then the snapshot's tracking rows and its `_kora_meta` entries are deleted and the view's
-watermark is set back to 0 (a never-synced view: C1 may be offered again). Run 2's records
-rematerialize under the new scope as they arrive. Without this, a record sent in run 1 (or
-updated by the stream after it) and out of scope by run 2 would stay on the device with nothing
-to retract it.
-
-**Quarantine.** A record state the client cannot store must not be dropped. That covers an
-unknown collection after a downgrade, a plan mismatch the handshake missed, and a corrupt
-payload. The batch is not acked, and the existing stall path applies. After
-`MAX_SNAPSHOT_ATTEMPTS`, the client persists `recordSnapshot: disabled` for the view,
-discards the snapshot as for a restart, and syncs from operations. The data is still
-complete, just slower.
-
-On the server, records with quarantined history (RT-70, `quarantine-base.ts`) fold onto a row
-snapshot with sentinel stamps. Sending that state gives the client exactly the server's view.
-Their states are flagged, and the property test below compares against the server's state for
-them, not against log replay. The server's own replay of its log is incomplete for those
-records.
-
-**Offline readiness.** A snapshot run is a delivery unit of its view, so it follows the
-completion rules of `docs/design/offline-readiness.md` section 15, and C1.4 builds them in:
-- Installation clears every completion mark of the view before the first record is
-  installed (like an `accessNarrowing` batch or a watermark reset), so a crash mid-run reads
-  `incomplete`, never `complete`.
-- A run that is not one transaction writes its unit key first (`base 0`, `upTo B`); the
-  final snapshot ack sets the completion mark and closes the key in the same transaction
-  that moves the watermark to B (`saveDeliveryWatermarkInTx` with the `OfflineCompletion`).
-- `snapshotRestart` clears every mark of the view in the same transaction that resets the
-  watermark to 0.
-- The stream above B delivers ordinary batches and follows the existing rules for those.
-No path may move a watermark or install records of a view without those functions.
-
-### Access-rule retraction during and after a snapshot
-
-- **Revocation above B.** The stream meets the membership operation and builds a narrowing
-  unit with the existing logic. The narrowing runs on the client's own values, so it removes
-  records that came from the snapshot like any others. Records with unsent writes are kept,
-  as today.
-- **Revocation between the grant read and B.** This cannot happen, because B is read first.
-- **A rules deploy during the snapshot.** `accessUnenforceable` fires
-  (`ACCESS_RULES_CHANGED`), and the session ends. The resume is refused (the rules key
-  changed), so the client restarts, as above.
-- **The found retraction-ordering bug.** Fixed by #54; the post-snapshot stream uses the same
-  ordered retractions and delivery-order visibility (snapshot records at position B).
-
-### Yjs rich text
-
-The `rt` state is the set of Yjs updates plus a reset register. The snapshot sends the
-server's set as is (base64 in the compact encoding). The client joins by set union, and
-materialization runs `mergeYjsUpdates` exactly as it does from operations. The output
-encoding depends only on content, so it is byte-identical.
-
-The set is not collapsed into one merged update. That would make the client's state differ
-from the server's (a different set), which breaks the state-equality property and the
-subsumption bound for later updates.
-
-Rich text is the largest field kind on the wire. `richtextSubsumes` compaction already keeps
-the server's set small. The Yjs doc channel (`yjs-doc-relay.ts`) is unaffected.
-
-### Blobs
-
-Blob fields are registers holding a `BlobRef`. The snapshot carries the refs, and the bytes
-are pulled as today through the chunk relay. `BlobAccessIndex` authorizes a pull by "a live
-record in the requester's scope references this hash", which the snapshot does not change.
-No blob bytes travel in a snapshot.
-
-### End-to-end encryption
-
-The server folds only the cleartext scope fields of envelope operations, and never
-materializes sealed members. It has no state to send for them, and the device needs the
-envelopes to decrypt. A scope containing an encrypted collection does not negotiate C1. A
-later refinement is C1 for the plaintext collections and operations for the encrypted ones.
-
-### Disclosure
-
-A fold state carries more than current values:
-- element-set and key-map removal markers (an element set keeps removed values);
-- resolver write logs with each writer's base;
-- atomic chains since the last plain write;
-- Yjs structure.
-
-A late joiner already receives this through scope entries (RT-29), redacted since issue #80
-(`docs/design/server-fold-authority.md`), so C1 adds no new class of disclosure if it sends the
-same redacted form. It does extend the exposure from "records entering a scope" to "every record".
-This needs a decision, listed in the open questions.
-
-### The property test that gates C1
-
-In `@korajs/core`, `fast-check`, beside the existing fold property tests. It generates:
-
-- a set of operations O over a few records, covering every field kind:
-  - `reg` with atomic chains, `ctr`, `max`, `min`;
-  - an element set, including append-only;
-  - a key map;
-  - a resolver;
-  - `rt` with real Yjs updates;
-  - server-authoritative fields with an authority set;
-- deletes and revivals, and inserts onto existing records;
-- a commit order of O, a cut B (a prefix of it), and a read lag L: operations above B that a
-  page's state already includes;
-- the device's local unsent operations U, and a set R of them the server terminally rejects.
-
-The assertion, for every record:
-
-```
-fold(base = foldRecord(prefix(B) ∪ L), then merge (O after B, in commit order, with
-     duplicates and re-deliveries of L) ∪ U, minus R)
-  == foldRecord(O ∪ U - R)
-```
-
-Both serialized states are compared after the compact encode and decode round trip. The
-materialized rows (`materialize`) are compared as well.
-
-The end-to-end variant lives in `packages/test`. Two devices sync the same scope, one from
-operations under `retract` and one from a snapshot. While the snapshot pages, writes are
-injected through a store hook:
-- scope moves in and out;
-- deletes and revivals;
-- membership grants and revokes;
-- rules deploys (resume refused);
-- reconnects mid-snapshot.
-
-Both devices must then hold identical rows and states, and keep converging under the chaos
-transport.
-
-Under the default `retain` policy, a device synced from operations keeps records that left
-its scope before it first connected. A snapshot device never had them. The test asserts that
-the snapshot device's records are a subset of the operation device's, and that the difference
-is exactly those records. This is documented as intended.
-
-### Red team: where snapshot plus later operations could diverge from replay
-
-| # | Case | Outcome in this design |
-|---|---|---|
-| 1 | The state is read before B, or from a replica behind B, so operations at or below B are missing. | B is read first; reads go to the primary only. |
-| 2 | The server's fold state lags its log (rolling upgrade, `covered_seq = -1`, a plan change). | The freshness check and tail merge run before sending. |
-| 3 | A tombstone is omitted and a later update revives the record. | Tombstones in scope are sent. |
-| 4 | A state includes operations above B that the stream re-delivers. | The fold is idempotent (property-tested, with duplicates). |
-| 5 | Pruned history (a plain write prunes older chain entries) meets a late, older operation. | The fold is a CRDT, and the late operation is ignored, as in replay (property-tested). |
-| 6 | Client and server fold plans differ: resolver source, merge kinds, authoritative ids, transforms. | Two-phase negotiation: schema part at handshake, full plan (with the server's authority ids) confirmed by the client before any snapshot batch. Any mismatch uses the operation stream. |
-| 7 | A membership change between the grant read and B. | Ruled out by the read order (B, then grant, then records). |
-| 8 | A resume with a new baseline B' > B. | Not allowed: a resume keeps B or restarts, and a restart removes every record's snapshot contribution and the stream after it, keeping only local edits. |
-| 9 | A retraction in the same batch as the record's insert. | Fixed by #54 (stream order, delivery-order visibility); snapshot records take position B. |
-| 15 | A view reset to 0 (`forceFullResync`, server restore) on a device holding out-of-view records. | Not offered C1: only a never-synced view negotiates it; a reset replays. |
-| 10 | A record that left the scope before first connect (`retain`). | It differs by design, and the test pins it. |
-| 11 | Server records with quarantined history. | The client equals the server, not log replay. Flagged in the test. |
-| 12 | The client's unsent edits and terminal rejections. | Kept by the join, and removed by re-fold from base and log. |
-| 13 | E2E-encrypted collections. | Excluded. |
-| 14 | The version vector and dedup of operations at or below B delivered later (a full resync from 0). | They are appended and merged idempotently. The only cost is log size. |
-
-### C1.0(c) result: re-review against main (2026-10-29)
-
-An independent read of this design against the shipped code (C2.1 to C2.4 built, C2.5 partial)
-found four blockers and a set of required design edits. C1 stays gated until each is resolved in
-this document.
-
-**Blockers**
-
-- **R16, clock.** Snapshot stamps never pass through `clock.receive`. A device whose clock trails a
-  snapshot stamp issues edits that lose LWW to the value it just installed. The snapshot apply must
-  advance the HLC from every installed stamp and route invalid stamps (`logical` above 99,999,
-  drift above 5 minutes) to quarantine per record, never stall the batch.
-- **R17, stale-record sweep.** "New view" is not "new device". An evicted view, a changed scope or a
-  pre-C1 database has watermark 0 with rows already on the device, and replay would retract records
-  that left scope. Negotiation must require that the device holds no remotely delivered rows in the
-  view's collections, signalled by an explicit handshake field, or the snapshot must carry a sweep.
-- **R18/M5, restart cleanup.** Delivery positions of remote operations live only in memory
-  (`store.ts` `deliveryPositions`) and `_kora_ops_<c>` has no delivery column. Decide before C1.6:
-  a persisted per-run list of operation ids received above B, or a stored delivery position.
-- **R19, resume.** `snapshotResume { snapshotId, baseline, cursor }` must be bound to scope key,
-  subsets, grant, rules key and fold plan; otherwise a widened scope plus an old cursor silently
-  skips records. Replace the "delivery index fingerprint" condition (M9) with these.
-
-**Required design edits**
-
-- Handshake: an explicit view-history field (M1); the server cannot tell never-run from reset,
-  evicted or scope-changed.
-- Paging: a keyset method `getRecordStatesPage(collection, scope, afterId, limit)` on all three
-  stores, byte-bounded pages (M2, R20). Offset paging skips records under churn.
-- Freeze the access grant used for paging at snapshot start (M15, R21).
-- Server session phase: no operations stream above B before the final ack, no rewind during the
-  snapshot (R22). Add to C1.3/C1.4.
-- Stale fold states after a restore are re-folded on every read and never persisted (M3): say
-  whether the snapshot writes back, or defer C1 while stale rows exist.
-- Quarantine-affected (approximate) states go to `_kora_fold_snapshot`, not `_kora_fold_base`
-  (M6, R26). Rename this design's "snapshot" to "record state" to avoid the collision.
-- Rich text compares on materialized value, not serialized state (M7, C1.1 test).
-- Plan fingerprints use explicit resolver and transform ids, not `String(fn)`, or minified clients
-  never negotiate (M11, R25). Compute the plan from the effective authoritative set (M10).
-- Authority revocation (R23) and kind change (R24) after a snapshot are lossy against base content:
-  case 5 and 6 are not covered by the CRDT argument. Specify the repair (re-fetch affected
-  records) or exclude those fields from C1.
-- Encryption: the server has no per-collection E2E marker (R27); offer no snapshot when the client
-  has `sync.encryption` set or sealed rows exist.
-- Two tabs (R28): a per-view run key and compare-and-set watermark writes for snapshot finals.
-- Snapshot apply goes through `writeGate` and a transaction size bound (R31).
-- Wire: new messages need guards, JSON and protobuf serializers and the long-poll transport; C1 is
-  JSON-only unless specified (M12). Fix the `docs/design/access-rules.md` references (M13).
-- Disclosure: resolver logs and removal markers are not redacted for history-gated collections
-  today (M14); decide open question 3 before including access collections.
-
-**Test and plan corrections**: C1.8 compares ignoring `_deleted` rows and asserts a subset with an
-exit operation above the snapshot start (R29, R30); C1.9 needs the unbuilt C2.5 handshake pre-pass
-(M8) and a pass/fail budget; C1.3 needs injection hooks and a two-connection Postgres test; add
-tests for R16 to R35.
-
-## 4. Decision: is C1 needed for beta.15?
-
-**First usable data under 2 s.** C2 alone plausibly meets this. The benchmark's 1-school run
-is the best C2 can do on this fixture, because the server reads only visible operations:
-- the first home row arrives at **1.33 s on Slow 4G** on node, against 3.29 s today;
-- the handshake falls from 2.9 s to 0.44 to 1.0 s.
-
-C2 also makes the pre-pass in `collectVisibleNodeIds` O(visible). C1 would not improve the
-first page much, because the first batch of 100 operations and the first page of 100 records
-cost about the same.
-
-The browser is the risk. If the first batch is applied as 100 OPFS transactions at 15 ms or
-more, it adds about 1.5 s and misses the target. Applying a delivery batch in one storage
-transaction ("C3", below) removes that.
-
-**Full scope under 10 s.** No variant measured so far meets this, C2 included: 11.5 to 12.7 s
-on node with C2's upper bound. The bound is per-operation apply on the device (7.5 to 8 s
-native), and it is far worse in the browser (inferred at more than 5 minutes for 20,000
-per-operation OPFS commits). This is the "minutes in the field".
-
-The first lever is **C3: apply each delivery batch in one storage transaction** (built; see
-"C3 as built" below):
-- `Store.applyRemoteBatch`, called from `handleOperationBatch`, sending its statements through
-  the batched worker path #55 added (`Transaction.executeBatch`, one worker message per batch
-  of statements), as `insertMany` does for local writes;
-- quarantine semantics stay per operation, with a savepoint for each; a stall rolls the batch
-  back and applies it per operation (below);
-- the watermark commit moves into the same transaction.
-
-C3 is smaller and lower-risk than C1, and helps every sync, not just cold starts.
-
-C1 then divides the remaining work by the ratio of operations to live records, and removes
-the log rows. On this fixture that ratio is only 1.8. In a real LMS after a term, progress
-records are updated many times, so it is likely much higher. That is an assumption, and field
-data should settle it.
-
-**The measurement that decides.** Run the browser variant of the benchmark in Chromium, with
-the worker and OPFS, on this fixture, after C2 and C3, at Slow 4G. Run it at operations-per-
-record ratios of 1.8 and of the ratio measured on a real LMS database:
-- if `fullScopeMs` is at or below 10 s at the real ratio, **C1 is not needed for beta.15**;
-- if not, the same run reports how much C1's per-record path would save, from the payload
-  estimate and a record-apply micro-benchmark, before any protocol work.
-
-**Recommendation.** For beta.15, build:
-1. ~~the retraction-ordering fix~~ (done, #54);
-2. C2, with the pre-pass on the index;
-3. C3 (batched client apply).
-
-Then run the browser measurement.
-
-Keep C1 designed but unbuilt until that measurement says the full-scope target cannot be met
-without it. C1 has the largest correctness surface in this workstream: tombstones, resume,
-fold-plan negotiation, disclosure of fold-state history, and the E2E exclusion. CLAUDE.md
-ranks correctness over performance and says to optimize only the measured bottleneck. Today
-the measured bottleneck is per-operation apply, which C3 targets directly.
-
-## C3 as built
-
-`SyncEngine.handleOperationBatch` first tries `SyncStore.applyDeliveryBatch` (korajs:
-`MergeAwareSyncStore` over `Store.applyRemoteBatch`). Inside one storage transaction it applies
-the batch's retractions and operations in stream order (#54), each in its own savepoint whose
-write statements are buffered and sent to the worker in `batch` requests (#55), then writes the
-quarantine rows and the watermark advance. Everything the device publishes (store
-notifications, `operation:applied`, merge traces, `sync:apply-failed`,
-`sync:scope-retracted`, `constraint:violated`) is queued and runs only after the
-commit, in stream order, coalesced into one query refresh.
-
-**Mid-batch stalls: roll back, then apply per operation.** A batch may not be fully applied (a
-retriable failure: a busy database, a failed retraction, no durable quarantine). Two options were
-considered:
-
-1. commit the prefix with a watermark just before the stalled operation;
-2. roll the whole transaction back and apply the batch with the per-operation path.
-
-Option 2 is built. It is provably no weaker than before C3: after the rollback nothing of the
-attempt exists (the database, the published events, `blockedFailure`), and what follows is
-exactly the pre-C3 code path, which leaves the watermark at the batch's base and does not
-acknowledge it, so the server re-sends it. Option 1 needs an intermediate watermark, which is
-sound only if every in-scope delivery sequence below it was applied; retractions and scope
-entries have their own sequences between operations, an older server sends no per-operation
-positions, and the server's retransmit is per batch anyway. Stalls are rare, so applying such a
-batch twice costs little.
-
-**Constraint reports per operation.** The optimistic check of cross-record constraints runs right
-after each operation, inside the batch, reading through the batch's transaction
-(`RemoteApplyBatch.read`, the same queries as `store.collection`); only the report waits for
-the commit. Checking after the commit instead would read the batch's end state: with several
-writes to one constrained record, a valid operation could be reported, or a violation resolved
-or introduced mid-batch missed (found in review of #71). A failing check stalls the operation,
-as on the per-operation path.
-
-**Bounded transactions.** A batch of more than `MAX_DELIVERY_TRANSACTION_OPERATIONS` (500)
-operations is applied in chunks of at most 500, one transaction each: live queries, local
-writes and other tabs' requests (each with a 30 s worker timeout) wait behind an open
-transaction, and a batch applied at about 0.75 ms per operation on a loaded native host takes
-about 0.4 s per 500. Only the last chunk writes the watermark. A chunk boundary carries no
-intermediate watermark, so a crash between chunks leaves the earlier chunks applied under the
-old watermark and the server re-sends the whole batch, whose applied part is then duplicates:
-exactly the per-operation path's guarantee, never weaker. A chunk that cannot be fully applied
-rolls back alone and the batch is applied per operation.
-
-**No paying twice.** A batch re-sent after its batched attempt fell back (same base and max), or
-holding the operation that blocks the stream (`blockedFailure`), goes straight to the
-per-operation path.
-
-**Also kept on the per-operation path:** batches with an access narrowing, and batches retracting
-a record with unsent local writes (both write bookkeeping outside the store's transaction:
-kept-outside-narrowing state, the outbound queue, rejection markers); a store holding records an
-access narrowing kept; the legacy materialization; a sync store and sync-state persistence that
-do not share one database (`storageIdentity`).
-
-**Crash safety.** The batch's operations, its quarantine rows and its watermark commit together, so
-a crash leaves the whole batch with its watermark or none of it. A step that fails is undone by
-its savepoint (its buffered statements settle first, so none lands after the rollback) and is
-quarantined or stalls exactly as before.
-
-**Measured (October 2026, 2-core container shared with other agents, load average 5 to 8: read
-the ratios and shares, not the absolute times).** Fixture: 20,000 operations of one school,
-delivery batch 100, native SQLite (better-sqlite3, WAL).
-
-*Live benchmark* (`bench:first-sync`, server and device in one process), `main` and this change
-alternated three times per profile, full scope:
-
-| Profile | before (3 runs) | after (3 runs) | after / before per round |
-|---|---|---|---|
-| unthrottled | 21,880 / 19,317 / 17,937 ms | 15,856 / 18,387 / 16,812 ms | 0.72, 0.95, 0.94 |
-| slow-4g | 21,262 / 41,798 / 30,653 ms | 17,547 / 28,723 / 17,216 ms | 0.83, 0.69, 0.56 |
-
-The live numbers mix the server's work (same event loop) and the host's load; the device-only
-replay below is the measurement to use.
-
-*Device-only replay* (`KORA_BENCH_BREAKDOWN=1`, `bench/apply-breakdown.ts`,
-`bench/replay-device.ts`): the 201 messages the live device received are replayed into fresh
-devices with no server in the process, per operation (the pre-C3 path) and batched, alternating,
-two rounds in each of two runs. Every SQLite statement is timed inside better-sqlite3 and
-attributed by kind; async regions record wall time and the SQL inside them.
-
-| Replay | per operation | batched | batched / per operation |
-|---|---|---|---|
-| device apply, 20,000 operations | 20,150 / 21,419 / 18,210 / 20,077 ms | 16,986 / 15,143 / 15,581 / 15,280 ms | 0.84, 0.71, 0.86, 0.76 (median 0.80) |
-| storage transactions | 20,003 | 201 to 203 | |
-| BEGIN / COMMIT time | 6.1 to 7.0 s (0.31 to 0.35 ms per commit) | 2.5 to 2.9 s (13 to 14 ms per commit) | about 0.42 |
-
-Where the device's time goes after C3 (share of the batched replay's busy time, range over the
-four replays; per-operation path for comparison):
-
-| Part | batched | per operation |
-|---|---|---|
-| engine per operation, outside the store: content-id verification (SHA-256 over the canonical body, WebCrypto, async), decode, transform check, positions | 31 to 41% (4.8 to 7.0 s) | 28 to 40% |
-| fold JavaScript (`mergeOp`, fold-state (de)serialization, row materialization) | 18 to 20% | 11 to 14% |
-| BEGIN / COMMIT | 16 to 18% | 31 to 34% |
-| fold SQL (fold state read/write, row write) | 10 to 11% | 5 to 9% |
-| store apply outside the fold, JavaScript (dedup and visibility decisions, op-log row build) | 7 to 8% | 6 to 7% |
-| pipeline and savepoint glue (korajs pipeline, savepoint and write-behind flush awaits) | 6 to 7% | 4% |
-| savepoints and other SQL around the store apply | 3% | 0% |
-| store apply outside the fold, SQL (dedup, retraction markers, op-log append, version vector) | 2% | 4 to 5% |
-| batch rest (decode of the message, ack, bookkeeping), publish after commit, live-query re-runs | 2% (publish 0.1 to 0.3%; live queries 60 to 90 ms in all) | 1 to 2% |
-| quarantine rows and watermark write | 0% | 0% |
-
-Content-id verification alone, measured in isolation on the same 20,000 operations, is 114 µs
-per operation (2.3 s); decode 8 µs, the transform check and legacy-clear canonicalization under
-1 µs. The rest of that bucket is the event-loop hop of each async digest and garbage collection
-on a loaded host.
-
-What this says:
-
-- **Per-operation commits were about a third of device apply on native SQLite, not most of it.**
-  The baseline's `clientApplyMs` (7.5 to 8 s) summed `operation:applied` durations, which cover
-  the store's transaction and fold but not the engine's verification or the commit's page
-  writes in the same proportion. C3 removed about 58% of commit time; what remains is page
-  volume (a batch of 100 writes rows, op-log rows and fold states across up to 30 tables, about
-  13 ms per commit in WAL), not a per-commit fixed cost.
-- **In the browser the commit is a fixed cost** (OPFS, rollback journal: 10 to 15 ms per commit
-  even for one row, `docs/benchmarks/baseline.md`), so there C3 removes about 99 of every 100
-  commits of a first sync; that is inferred from those measurements, not measured on this
-  fixture. The browser variant of this benchmark decides it.
-- **The largest remaining device cost is per-operation content-id verification** (about a third),
-  then the fold (about 30%, JavaScript and SQL together). Neither depends on transactions.
-  Verification could run for a whole batch before the transaction (one digest pass, overlapped),
-  or on a synchronous SHA-256 where one exists; that is a separate change, and it must keep
-  verifying every operation.
-- **For C1** this sharpens the question rather than settling it: C1 replaces per-operation
-  verification, fold and op-log append (about 70% of today's device time) with per-record
-  application, so its gain scales with the operations-per-record ratio (1.67 on this fixture,
-  20,000 operations for 11,995 records), minus the larger snapshot payload and its own
-  per-record work. Batch-level verification would capture a third of the device time without
-  C1's correctness surface. Measure that and the browser variant before deciding C1.
-
-**Known limitation (part of M2, "commit outcome unknown", solved by the offline-readiness build).**
-When `adapter.transaction()` rejects although its commit landed (an IndexedDB snapshot
-bookkeeping failure after COMMIT, a lost COMMIT reply from the leader worker), the engine treats
-the batch as not applied and the per-operation fallback re-applies it as duplicates: the data,
-the watermark, the acknowledgement and live queries are right, but `operation:applied` and the
-merge traces of that batch are never emitted (a DevTools gap). The per-operation path has the
-same gap for one operation; batching widens it to a batch.
-
-**Tests.** `packages/store/src/store/remote-batch.test.ts`: one transaction, nothing published
-before the commit, a mid-batch throw leaves nothing (no rows, log, watermark, vector or
-notification), a failing step's partial writes are undone alone.
-`packages/store/tests/integration/remote-batch-worker.test.ts`: one span and `batch` requests on
-the worker protocol, a failing buffered statement undoes only its step, a follower tab's batch on
-the leader worker. `packages/test/tests/batched-delivery-apply.test.ts`: quarantine in the
-batch's transaction, a retraction and its record's operations in one batch, a stall mid-batch
-(watermark unchanged, no ack, no event twice, recovery on re-send), a storage failure mid-batch
-followed by a restart (nothing of the batch, watermark unchanged), a retraction of a record with
-unsent writes, a cascade relation, chunked batches (three chunks; a crash between chunks; a stall
-in a later chunk and its re-send without a second batched attempt), and 40 seeded random delivery
-streams over two related collections (inserts, updates, deletes with provisional cascades,
-duplicates, unknown collections, retractions at random positions, a re-sent batch; and a second
-pair with random mid-batch stalls and re-sends) where the batched device ends with exactly the
-rows, fold states, provisional cascades, op logs, retraction markers, version vector (table and
-in memory), quarantine with payloads, watermark, live-query results, acknowledgements and every
-event but `query:*`, in order, of a per-operation device.
-
-### C1.0(a) result: batch-level content-id verification
-
-A delivery batch is decrypted and verified before its storage transaction opens
-(`SyncEngine.prepareInboundBatch`): operations are digested in concurrent groups of 64 (WebCrypto
-digests run off the main thread, so they overlap instead of paying an event-loop hop each inside
-the apply path). Every operation is still verified, exactly once; `applyInbound` consumes the
-result through a weak map keyed by the delivered operation object (internal only), and a batch
-that falls back to operation-by-operation application reuses it. Only successes are recorded: an
-operation that fails to decrypt, or whose verification throws, is handled in `applyInbound` as
-before, and a forged id (a normal `ok: false` result) is quarantined there with the same code,
-message and events, in stream order. No public API changed.
-
-Measured with `packages/sync/src/benchmarks/batch-verification-bench.test.ts`
-(`pnpm --filter @korajs/sync test:benchmarks`): one 5,000-operation delivery batch (half hash
-version 1, half version 2, real ids) through the one-transaction path into a no-op store, so the
-figure is the engine's own per-operation work. Node 22, 2 CPUs, a loaded host; three invocations
-each, five runs per invocation.
-
-| | steady-state batch time | per operation |
-|---|---|---|
-| before (inline in `applyInbound`) | 250 to 290 ms | 50 to 58 us |
-| after (batch pre-pass) | 130 to 145 ms | 26 to 29 us |
-
-About a 2x reduction of the engine's per-operation cost (best single runs 36 to 52 us before,
-22 to 28 us after; the host was noisy, the ratio was stable). Absolute time is below the 114 us
-of the table above because this fixture's operations are small; on the LMS fixture the saving
-is a share of that 114 us, and the browser variant (C1.0(b)) still decides what it is worth
-there. Not done: a synchronous SHA-256 (no pure-JS hash is bundled; the gain would need a new
-dependency or an in-house implementation).
-
-### C1.0(b) result: browser first sync (Chromium, OPFS, 2026-10-29)
-
-**Verdict.** C1 is **not needed for beta.15**, and it would not fix the thing that fails. First
-usable data meets the "under 2 s" target in Chromium at Slow 4G without C1 (home row 1.55 s
-median, 1.81 s worst of 5; handshake 0.42 s). It misses the node-derived 1.33 s figure by 0.2 to
-0.5 s. Full scope is nowhere near 10 s: **556 s (9.3 min) at 20,000 operations on Slow 4G, 423 s
-unthrottled**, about 36 to 47 operations per second. C1 divides that by the operations-per-record
-ratio at best (1.8 here), which leaves 4 to 5 minutes. The cost is about 19 worker round trips per
-operation, so the lever is the number of storage round trips per operation (below).
-
-**Harness.** `packages/test/bench/browser/` (README there; `pnpm --filter @korajs/test
-bench:first-sync:browser`; not in CI). The real `createApp` from `korajs` runs in Chromium 153 on
-the shipped SQLite WASM worker with OPFS (`opfs-sahpool`, `durable=true`, `sqlite-wasm` adapter),
-syncing over a real WebSocket with a real `KoraSyncServer` (SQLite store, delivery batch 100)
-loaded with the Node benchmark's fixture (`lms-first-sync-fixture.ts`, same seed, server grant
-`{ schoolId }`). Built from `main` at `b1866e3`, so with C2.1 to C2.4, C3 and C1.0(a), without C2.5
-(the handshake pre-pass is still the global scan).
-
-**Method.**
-- Every run is a fresh browser context (empty OPFS and HTTP cache), a new device. The page boots
-  (database open, no sync), idles for 1 s, then the harness applies the network profile and times
-  from the call to `app.sync.connect()`.
-- Network: `slow-4g` is the D8 preset over CDP (`Network.emulateNetworkConditions`, 150 ms,
-  1.6 Mibit/s down, 750 Kibit/s up). Checked first that Chromium applies it to WebSocket traffic
-  (1 MiB took 7.6 s throttled, 30 ms not). `unthrottled` is loopback.
-- Handshake: first `handshake-response` arrives. First home row: `courses where schoolId` (subscribed
-  before `connect()`) first returns a row, the Node benchmark's definition. Full scope: engine
-  `streaming`. Afterwards a per-collection digest of every row (count and field hash) must equal the
-  server's; **no run mismatched**.
-- Bytes: wire bytes from a counting TCP proxy in front of the server; JSON bytes as decoded in the page.
-- Peak JS heap is the page's `usedJSHeapSize` (not the worker or WASM memory). Main-thread blocking
-  is a 10 ms timer's gaps over 60 ms (the `longtask` API reports nothing in this headless Chromium:
-  checked with a 300 ms busy loop, so its zeros are not evidence).
-- Statistics: median / p95, nearest rank, so p95 is the maximum at 5 runs. Raw per-run output is
-  printed by the harness; the table is its output.
-
-**Results** (median / p95 in seconds unless noted; 5 runs per cell except where stated).
-
-Full scope, `querySubsets: disabled` (closest to the Node benchmark; the single handshake case):
-
-| Fixture (visible ops / log, ops per record) | Network | Handshake | First home row | Full scope | Ops/s | Peak heap (MiB) | Down wire / JSON |
-|---|---|---|---|---|---|---|---|
-| small, 2,000 / 10,000, 1.85 | Slow 4G | 0.55 / 0.70 | 1.82 / 1.96 | 45.5 / 48.1 | 44 | 19 | 152 KiB / 1.0 MiB |
-| small | unthrottled | 0.44 / 0.52 | 1.57 / 1.65 | 46.6 / 49.0 | 43 | 19 | same |
-| 20k-1, 20,000 / 20,000, 1.81 | Slow 4G | 0.42 / 0.52 | 1.55 / 1.81 | **556 / 579** | 36 | 35 | 1.5 MiB / 10.1 MiB |
-| 20k-1 | unthrottled | 0.23 / 0.24 | 1.29 / 1.42 | **423 / 505** (one extra run: 377) | 47 | 38 | same |
-| 20k-1 high ratio, 20,000 / 20,000, 6.44 | unthrottled | 0.24 / 0.27 | 1.04 / 1.38 | **735 / 755** (2 runs) | 27 | not kept | not kept |
-
-First usable data only (stopped at the first home row, 5 runs; `disabled` / `reactive` query subsets):
-
-| Fixture | Network | Handshake | First home row |
-|---|---|---|---|
-| small, 10,000 log | Slow 4G | 0.45 / 0.50 and 0.49 / 0.98 | 1.53 / 1.62 and 1.97 / 2.27 |
-| 20k-1, 20,000 log | Slow 4G | 0.34 / 0.40 and 0.41 / 0.44 | 1.68 / 1.79 and 1.93 / 2.30 |
-| 20k-1 | unthrottled | 0.17 / 0.18 and 0.20 / 0.21 | 1.46 / 1.51 and 1.10 / 1.18 |
-| 60k-1, 60,000 log | Slow 4G | 0.34 / 0.37 (disabled) | 1.36 / 1.39 |
-| 20k-5, 100,000 log (4 other schools) | Slow 4G | **1.67 / 1.75** and **3.01 / 3.11** | 2.85 / 3.13 and 4.15 / 4.32 |
-| 20k-5 | unthrottled | 1.46 / 1.49 and 2.89 / 3.15 | 2.64 / 2.87 and 4.21 / 4.37 |
-
-The 20k-1 full-scope runs with `reactive` query subsets (3 runs, Slow 4G): handshake 0.44 / 0.45,
-home row 1.86 / 1.96, full scope 430 / 432 s (faster than the 556 s of the `disabled` cell:
-see the caveat on run-to-run variance). Main-thread stalls (timer gaps over 60 ms): none, in the one
-20k-1 run that used the sampler (unthrottled, 377 s); the `longtask` zeros of the other runs prove
-nothing. Storage requests per operation, identical in every run:
-12.9 queries, 2.8 executes, 3.3 batch statements, and 0.01 begin/commit (203 commits for 20,000
-operations).
-
-**What the numbers say.**
-1. **Budget.** Handshake 0.34 to 0.55 s at Slow 4G for logs up to 60k with one school: inside
-   0.44 to 1.0 s. First home row 1.36 to 1.82 s: under the 2 s target, over the 1.33 s node figure
-   (median 1.55 s, 17 percent over). The 100,000-operation, five-school log takes 1.7 s to
-   handshake and 2.9 s to the first row: that is the unbuilt C2.5 pre-pass, not the apply path.
-2. **Full scope is round-trip bound, and C3 did what it was built for.** Commits fell to one per
-   100 operations, yet an operation still costs about 19 worker round trips (about 26 ms at 36 to
-   47 operations per second). Most are reads inside the batch's transaction. Time scales with
-   operations, not with the log (2,000 operations: 45 s; 20,000: 423 to 556 s), is not network
-   (Slow 4G adds 0 to 130 s; the payload is 1.5 MiB), and does not fall with fewer records: at 6.4
-   operations per record, with fewer inserts, it rose to about 745 s (updates read more).
-3. **C1's gain.** C1 replaces operations with records: 11,024 live records for 20,000 operations
-   here. If a record costs what an operation does, full scope would be about 4 to 5 minutes at
-   1.8 and about 80 s at 6.4 operations per record. Reaching 10 s needs a ratio near 50 or a
-   different per-record cost; neither is measured. Real LMS ratio is still open question 5.
-4. **Query subsets.** With the default `reactive` mode a home-screen live query registers a
-   subset, and the engine handshakes a second time. Costs seen: handshake 0.93 s vs 0.55 s and
-   home row +0.4 s on Slow 4G for the small fixture; for the five-school log, handshake 3.0 s vs
-   1.7 s; and up to twice the batches delivered on some runs (39 vs 20). It did not change full
-   scope. Worth fixing independently of C1.
-
-**Recommendation.** Do not build C1 for beta.15. First usable data meets 2 s without it, and C1
-cannot close the full-scope gap at any ratio we can expect from an LMS. Instead:
-(a) land C2.5 (otherwise a multi-school log costs 1.7 to 3 s before the first byte);
-(b) open a "C3b" item to cut worker round trips per delivery operation (read the fold states and
-existing rows for a whole batch in a few queries, as C3 did for commits), measured with this
-harness; it helps every sync, and a C1 record apply would need it too;
-(c) avoid the second handshake for reactive subsets;
-(d) restate the full-scope target as "first usable data plus progressive completion" until (b)
-is measured, because 10 s for 20,000 operations in a browser is a 40 to 55 times gap today.
-Revisit C1 after (b), with the real LMS ratio.
-
-**Caveats.** One shared 2-core VM runs the server, Chromium and the harness (load average 0.6 to
-2.7 at start); full-scope times vary by ±20 percent between runs (unthrottled 20k-1: 377 to 505 s)
-and the `reactive` Slow 4G cell (430 s) came out faster than the `disabled` one (556 s) although
-it does more work, so read the order of magnitude, not the digits. Headless desktop Chromium is faster than a mid-range phone. CDP
-throttling is a bandwidth and latency model, not TCP loss or slow start, and it is somewhat
-harsher than its numbers (1 MiB in 7.6 s against 5 s ideal). The `20k-1-high-ratio` cell has 2 runs
-(the third was lost when the container restarted) and its per-run output was lost; the figures
-come from the logged lines. The `reactive` 20k-1 cell has 3 runs, not 5, and Slow 4G only. A 60,000-operation full scope was
-not run (about 25 minutes each). Real LMS ratio and scope size are unknown. IndexedDB fallback,
-multi-tab and an installed PWA were not measured. Bytes in the first-home-row-only runs are cut
-off when the run stops and are not reported.
-
-### C3b result: device apply round trips
-
-Goal: cut the per-operation worker round trips of the device apply path (`Store.applyRemoteBatch`,
-`SyncStore.applyDeliveryBatch`, the fold read path) so browser first sync gets about 10x faster
-without changing semantics. Result: round trips fell from about 18.3 to 1.07 per operation (17x),
-but browser wall time fell only about 2.7x. The target of 10x was not reached; the remainder is
-not round trips.
-
-**Profile (counting adapter, `packages/test/tests/device-apply-round-trips.test.ts`).** Every
-storage call of a delivery batch counted per operation, before the change: about 13 reads
-(already-logged and compacted checks, sequence-number holder, fold state, base, snapshot,
-provisional effects, retraction marker, the row, the version vector) and about 5 writes (op-log
-row, fold state, row upsert, version vector, savepoint release), 18.3 in all. Merge-trace prior
-lookups and one `INSERT` per audit trace added more on conflicting operations.
-
-**What changed.**
-- `SyncStoreBatch.prefetch` (optional): the engine announces a chunk's operations and the store
-  reads what they need once (`RemoteBatchPrefetch`): which are logged or compacted, who holds
-  their sequence numbers, and per record the fold state, base, snapshot, provisional effects,
-  retraction marker and row. Operations fold from that cache, which their own earlier writes keep
-  current, so same-record sequences in one batch see each other.
-- Prior operations for merge traces are read together before the commit.
-- A step's `SAVEPOINT`, statements and `RELEASE` travel in one request. Audit traces appended in
-  one turn are written in one transaction.
-- Records the cache cannot answer for (retraction marker, base or snapshot, shared node id, taken
-  sequence number, a record the batch changed by another route) take the old per-operation path.
-  The old path stays as the fallback everywhere.
-
-**Kept.** One storage transaction per delivery batch with its quarantine rows and watermark
-advance, one savepoint per operation, the same fold results, the same events after the commit.
-A cross-step write buffer (0.085 round trips per operation) was built and rejected: it broke the
-documented rule that a failing statement undoes only its own step. It would need that contract
-changed; listed under follow-ups.
-
-**Tests.** `remote-batch-prefetch.test.ts`: a property test (120 generated runs) comparing a
-per-operation device against a prefetched batch and an unprefetched batch over same-record
-sequences, duplicates, deletes, out-of-order delivery, taken sequence numbers, a far-future
-clock and mid-batch retractions: rows, fold states, logs, conflicts, retractions, version vectors,
-events and results are identical. `device-apply-round-trips.test.ts`: a counting adapter with a
-budget of at most 1.5 round trips per operation (measured 1.07). `audit-queue.test.ts`: grouping.
-
-**Browser, Chromium on OPFS, 20k-1 school, 20,000 operations, shared 2-core host** (noise about
-20%; `pnpm --filter @korajs/test bench:first-sync:browser`):
-
-| cell | before | after (3 runs) |
-|---|---|---|
-| unthrottled, disabled | 383.6 s, 379.7 s (2 runs) | 139.9 s, 140.2 s, 140.7 s |
-| slow-4g, disabled | not measured | 148.9 s, 143.2 s, 145.3 s |
-| slow-4g, reactive | not measured | 141.9 s, 139.8 s, 140.6 s |
-
-A confirmation run of the unthrottled-disabled cell on the final build (2 runs) gave 141.6 s and 141.5 s.
-
-Handshake and first home row stayed in the same range (home row 0.85 to 0.93 s after against
-1.24 to 1.26 s before; handshake 0.16 to 0.20 s). Worker requests for the unthrottled run fell
-from about 259,000 queries and 55,000 executes to the order of one request per operation. Only
-the unthrottled-disabled cell has a same-session before; the other two cells were measured after
-only, so their gain is inferred from it, not observed. Slow-4g and reactive match unthrottled
-because the full scope is bound by the device, not the network.
-
-**Node first-sync bench** (slow-4g profile, one run): handshake 995 ms, first home row 1032 ms,
-full scope 8468 ms. Replay of the batched-delivery-apply test, batched 6.2 s against
-per-operation 13.3 to 13.9 s.
-
-**Why not 10x.** After the change the worker spends about 3.9 ms per operation step inside SQLite
-writing pages through the OPFS rollback journal, which is not a round trip. Evidence: an unsafe
-experiment with `journal_mode = MEMORY` (not shipped, durability lost) cut batch busy time from
-7.7 s to 0.39 s and total time from 11.5 s to 4.0 s on the small fixture. Journal and page I/O
-is the floor now.
-
-**Reproducing the browser numbers.** The browser harness is merged in main
-(`packages/test/bench/browser`, from the C1.0(b) change, PR #109; its README lists the
-environment variables). The cells above are `KORA_BROWSER_BENCH_SIZES=20k-1`,
-`KORA_BROWSER_BENCH_PROFILES=unthrottled` or `slow-4g`, `KORA_BROWSER_BENCH_SUBSETS=disabled` or
-`reactive`, run with `pnpm --filter @korajs/test bench:first-sync:browser`. The "before" figures
-come from the same harness on the commit before this change. The C3b measurements ran with a
-local copy of the harness that carries extra worker-request counters; the shipped harness gives
-the same wall-clock figures.
-
-**Review fixes.** The prefetch cache now follows every append, not only the fast path's: an
-operation applied by the per-operation path (or whose step failed) marks its node and sequence
-number as taken, and an operation the batch never announced is not answered from memory, so a
-later operation with the same node and number is kept as a sequence conflict as before, not
-inserted into the unique index. A failing prior-operation lookup (`resolveDeferredPriors`, which
-runs once after the last step, outside any savepoint) fails the batch as a whole: the transaction
-rolls back and the engine applies the chunk operation by operation. This is tested, not a gap.
-`Store.appendAuditTrace` stays an async function. The property test now covers counter, max,
-min, append-only, resolver and richtext fields, a unique constraint, a cascading relation with
-provisional side effects, atomic increments, field versions, failing statements, delivered
-twice, taken sequence numbers on other records, retractions, the audit traces, the quarantine
-rows and the watermark. Not covered by it: encrypted operations, schema transforms, scope-entry
-fold states, and the merge-aware sync store (exercised by the counting-adapter test and the
-sync suites only).
-
-**Not measured.** The IndexedDB fallback, multi-tab (follower relay), phone-class hardware, the
-60k school, the real LMS operation mix, an access-rules fixture. The node counting test excludes
-audit-trace writes. The browser harness (`packages/test/bench/browser/`) is a local tool and is
-not part of this change.
-
-**Follow-ups.** C3c: journal and page I/O (fewer pages touched per step, larger transactions
-where the savepoint contract allows). Audit trace volume. Optional cross-step write buffering,
-which needs the per-step failure contract changed.
-
-## Follow-ups
-
-- An access-rules variant of the fixture: schools as groups, one membership per user, and
-  membership changes during the sync.
-- A Postgres baseline (nightly, `KORA_PG_TEST_URL`).
-- Send the first delivery batch without the one-batch lookahead in `streamDelivery`. Today
-  the first batch waits until a second one is cut.
-
-## Open questions for Obed
-
-1. **Partition fields.** Is it acceptable to require `scope: [...]` in the schema, or
-   `deliveryPartitions` on the server, for provider-granted scopes to get the fast path? The
-   alternative is learning fields from live session scopes, which is implicit and harder to
-   make correct.
-2. **The handshake pre-pass.** `collectVisibleNodeIds` exists for beta.12 clients and for
-   `kora compact`'s peer entries. Can a protocol v2 client opt out of it (handshake flag)?
-   That removes a log read from every handshake, not just a faster one.
-3. **Fold-state disclosure (C1, and today's scope entries).** Do we accept that a late joiner
-   receives removal markers, resolver logs and Yjs structure written before they joined? Or
-   do we want a redaction design for both paths?
-4. **The `retain` exit policy.** Should a snapshot device match `retain` semantics (it cannot:
-   it never saw those records), or is "a new device holds its current scope" the documented
-   behavior?
-5. **Ops-per-record ratio.** Can we get it, and the scope size, from a real LMS deployment?
-   It decides C1's value.
-
-## Deferred to the build
-
-Questions this design cannot settle on paper; the build PRs answer each with code and a test.
-
-- **C3 on the IndexedDB fallback and multi-tab.** Answered by the build (below): a follower
-  tab's batch is one span on the leader worker (tested through the leader relay); a span the
-  leader change refuses (#59) fails the whole attempt, which rolls back and is applied operation
-  by operation, so the retry granularity is one batch, then one operation. The IndexedDB
-  snapshot cost of one batch transaction is not measured yet (the browser variant of the
-  benchmark measures it).
-- **`MAX_DELIVERY_SOURCES`** (256 proposed) and the `$in` collapse threshold: tuned with the
-  access-rules fixture variant on Postgres.
-- **Backfill chunk size and the Postgres catch-up lock window** (C2 migration step 2).
-- **C1, if the browser measurement calls for it:** the compact encoding's real size, the
-  handshake timeout for the accept/decline answer, how the store records a remote operation's
-  delivery sequence for the restart cleanup (whether #54's stored positions suffice), and the
-  disclosure decision (open question 3).
+A fingerprint change (or a new table) resets `through` and truncates, under the counter lock. A
+background backfill, resumable and idempotent, indexes 5,000 operations per transaction after the
+scope-snapshot rebuild. In a rolling upgrade an older instance's appends stop `through`; every
+delivery poll calls `ServerStore.catchUpDeliveryIndex`, and sessions read the gap by global scan:
+slower, never wrong. Restores rebuild the index; exports skip it.
+
+### C2 as built: testing and effect
+
+Membership scenarios; a grant landing mid-chunk; a fast-check property that the indexed stream
+equals the global scan over a school fixture (catch-up, live, burst); a property that membership
+sources cover every membership-touching operation; "a delete is filed under every partition its
+record was in" on every store; rolling-deploy and backfill tests on SQLite and Postgres; the nightly
+Postgres job. Removing the unit split or a membership key fails them. In A/B runs (100,000-operation
+log, 20,000 visible, node, shared host) the index cut handshake and first home row roughly 3 to 7
+times and full scope roughly 2 times at the median.
+
+## 3. C1: cold start from current state (designed, not built)
+
+For a never-synced view the server would send each visible record's fold state, then jump the
+watermark to a baseline B; the device stores states as bases and folds later operations on top,
+generalizing how scope entries carry fold state. Synthetic insert operations were rejected: new HLCs
+would beat older offline edits, and they fail content-id verification.
+
+- **Negotiation, two phases** (the plan includes authoritative node ids, which a new device learns
+  only from the handshake response): the handshake sends the authority-independent plan part; the
+  server offers only for a view that never had a delivery run (not a reset view, which must be able
+  to remove out-of-view records), with no end-to-end-encrypted collection and no access rebuild; the
+  client confirms the full plan or declines before any batch is sent.
+- **Server.** Read B first, then the grant, then page records with their fold state. Isolation
+  across pages is unnecessary because fold states only grow and the fold is idempotent; freshness is
+  required (stale states brought up to date, no read replicas). Tombstones in scope are sent, or a
+  later revival diverges from replay.
+- **Device.** One transaction per batch: join into the base, re-fold with the local log (unsent edits
+  kept), materialize. Resume keeps B or restarts; a restart removes every contribution of the run
+  except local operations. Unstorable states are never dropped (no ack; after retries, fall back to
+  operations). Completion marks follow [offline readiness](offline-readiness.md), section 10. Rich
+  text sends the server's Yjs update set as is; blobs travel as refs; encrypted collections are
+  excluded.
+- **Gate.** A fast-check property over every field kind: snapshot base at a cut B (with read lag)
+  plus the later stream (with duplicates) plus unsent local operations minus rejected ones equals
+  folding all operations directly. Under the default `retain` policy a snapshot device lacks records
+  that left its scope before it connected; that difference is intended.
+- **Blockers found in review.** R16: snapshot stamps must pass through `clock.receive` (invalid
+  stamps quarantined per record). R17: "new view" is not "new device", so negotiation needs an
+  explicit view-history field or a sweep. R18: restart cleanup needs a persisted record of remote
+  operations received above B. R19: resume must bind scope key, subsets, grant, rules key and fold
+  plan. Also: keyset byte-bounded paging, a frozen grant, plan ids that survive minification,
+  handling authority and field-kind changes, two tabs, and every serializer and transport.
+- **Fold-state disclosure.** A fold state carries removal markers, resolver logs, atomic chains and
+  Yjs structure. Scope entries send a redacted form to late joiners; C1 would extend that exposure to
+  every record, and redaction for history-gated collections is incomplete. This must be settled
+  before C1 covers access-controlled collections.
+- **Size.** In today's encoding a snapshot is about 2.5 times the operations' JSON (1.3 times
+  deflated); a compact encoding (one stamp table per record, full operation ids) would be required.
+
+## 4. Whether C1 is needed
+
+First usable data: C2 removes the server cost before the first byte, and a page of records costs
+about what a batch of operations does, so C1 barely helps; Chromium on OPFS at Slow 4G reaches the
+first home row in about 1.5 s median without it. Full scope: the bottleneck is device apply, which C1
+divides at best by the operations-per-record ratio (1.8 on the fixture), at the cost of the largest
+correctness surface in the workstream. Correctness ranks above performance and only measured
+bottlenecks are optimized, so the chosen levers were C3 and C3b, which help every sync. Revisiting C1
+needs a real deployment's operations-per-record ratio and a per-record cost well below a
+per-operation one.
+
+## 5. C3 as built: one storage transaction per delivery batch
+
+`SyncEngine.handleOperationBatch` first tries `SyncStore.applyDeliveryBatch` (`Store.applyRemoteBatch`
+underneath): retractions and operations in stream order, each in a savepoint with buffered statements
+sent to the worker in `batch` requests, then quarantine rows and the watermark advance, all in one
+transaction. Everything published (notifications, `operation:applied`, merge traces, apply failures,
+retractions, constraint reports) runs after the commit, in order, in one query refresh.
+
+- **A mid-batch stall rolls back, then applies per operation**, which leaves the watermark at the
+  base and does not acknowledge. Committing a prefix would need an intermediate watermark, unsound
+  because retractions and scope entries have sequences of their own and retransmission is per batch.
+- **Constraint checks** run after each operation through the batch's transaction; only reports wait.
+- **Bounded transactions:** chunks of at most `MAX_DELIVERY_TRANSACTION_OPERATIONS` (500), so other
+  work is not blocked; only the last chunk moves the watermark, and a re-sent batch's applied part
+  folds as duplicates.
+- **Per-operation path kept** for re-sent fallen-back batches, the blocking operation, access
+  narrowings, retractions of records with unsent writes, and split storage.
+
+Tests: `packages/store/src/store/remote-batch.test.ts`,
+`packages/store/tests/integration/remote-batch-worker.test.ts`, and
+`packages/test/tests/batched-delivery-apply.test.ts`, including 40 seeded random streams in which a
+batched device must match a per-operation device in rows, fold states, logs, markers, version vector,
+quarantine, watermark, query results, acknowledgements and events. On native SQLite commits turned
+out to be about a third of device time; in the browser, where a commit is a fixed cost, C3 removes
+almost all of them.
+
+## 6. C1.0(a) result: batch-level content-id verification
+
+`SyncEngine.prepareInboundBatch` decrypts and verifies a batch before its transaction, digesting in
+concurrent groups of 64 so WebCrypto work overlaps. Every operation is still verified exactly once;
+results pass through an internal weak map and are reused by a per-operation fallback. Failures are
+handled in `applyInbound` as before, with the same quarantine codes and events.
+`packages/sync/src/benchmarks/batch-verification-bench.test.ts` shows the engine's per-operation
+cost roughly halved.
+
+## 7. C1.0(b) result: browser first sync
+
+With C2, C3 and C1.0(a), in Chromium on OPFS: first home row about 1.4 to 1.8 s at Slow 4G for
+single-school logs, under target (a five-school log was slower until the pre-pass moved onto the
+index). Full scope was minutes: each operation still cost about 19 worker round trips, mostly reads
+inside the batch transaction, and time scaled with operations, not network or log size. Reactive query
+subsets caused a second handshake that delayed the first row slightly. Every run's digest matched the
+server. Caveats: shared 2-core host (about 20% variance), desktop Chromium, CDP throttling without
+loss; the IndexedDB fallback, multi-tab and installed PWAs were not measured.
+
+## 8. C3b result: device apply round trips
+
+Applying one operation cost about 18 storage calls (13 reads, 5 writes). Now:
+
+- `SyncStoreBatch.prefetch`: the engine announces a chunk's operations and the store reads what they
+  need once (`RemoteBatchPrefetch`: logged or compacted status, sequence-number holders, and per
+  record the fold state, base, snapshot, provisional effects, retraction marker and row). Operations
+  fold from the cache, which their own writes keep current.
+- Merge-trace priors are read together before the commit (`resolveDeferredPriors`; failure rolls the
+  batch back to the per-operation path). A step's `SAVEPOINT`, statements and `RELEASE` travel in one
+  request; audit traces are grouped.
+- Anything the cache cannot answer takes the per-operation path, which remains the fallback.
+
+Semantics are unchanged. A cross-step write buffer was rejected: it broke the rule that a failing
+statement undoes only its own step. Round trips fell to about 1.07 per operation and browser full
+scope fell about 2.7 times; the remaining floor is SQLite page and journal I/O through the OPFS
+rollback journal. Tests: `packages/store/src/store/remote-batch-prefetch.test.ts` (property test
+against a per-operation device across merge kinds, constraints, cascades, duplicates, retractions and
+failing statements; not covering encryption, transforms or scope-entry fold states) and
+`packages/test/tests/device-apply-round-trips.test.ts` (budget of 1.5 round trips per operation).
+
+## 9. Known limits and follow-ups
+
+- Browser full scope for 20,000 operations is still far above 10 s; the floor is page and journal
+  I/O. The practical target is fast first data plus progressive completion.
+- Provider-granted scopes need declared partition fields (`scope` or `deliveryPartitions`) to use
+  the index; learning them from live sessions was rejected as implicit and harder to prove.
+- The handshake pre-pass remains for older clients and `kora compact`; a v2 opt-out would save a log
+  read per handshake. The first delivery batch waits for a one-batch lookahead.
+- If a transaction rejects although its commit landed, the fallback re-applies the batch as
+  duplicates: data and watermark are right, but that batch's `operation:applied` events and merge
+  traces are not emitted.
+- Not measured: IndexedDB fallback, multi-tab, phone hardware, an access-rules fixture, a real
+  operation mix. `MAX_DELIVERY_SOURCES` and backfill sizing are untuned.
+- C1 remains unbuilt.

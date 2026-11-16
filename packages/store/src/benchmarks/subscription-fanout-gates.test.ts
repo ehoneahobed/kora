@@ -5,7 +5,7 @@ import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
 
 /**
- * STORE-16: 1,000-subscription fan-out gates against the CLAUDE.md targets.
+ * STORE-16: 1,000-subscription fan-out gates against the AGENTS.md targets.
  * - Subscription check per mutation: < 1 ms with 1,000 active subscriptions.
  * - Mutation to subscriber notification: < 16 ms (one frame at 60 fps).
  *

@@ -117,7 +117,7 @@ None are complete. If you cannot upgrade immediately:
 ## Credits
 
 Found during an internal security review of Kora.js in October 2026, with field reports from the
-Bozoma Innovation Hub LMS team.
+team running a production learning platform.
 
 ## Timeline
 

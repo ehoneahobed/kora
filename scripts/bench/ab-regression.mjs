@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Relative performance regression check (CLAUDE.md: fail the build on a regression of more
+ * Relative performance regression check (AGENTS.md: fail the build on a regression of more
  * than 10%), immune to how fast the machine is.
  *
  * Shared CI runners differ in speed from run to run by more than the 10% buffer of the

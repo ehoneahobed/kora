@@ -1,7 +1,7 @@
 /**
  * The delivery position of a sync engine: the watermark the live view has applied, the
  * watermark of every view seen (the per-view cache), and the access-rules key the device was
- * last scoped under (docs/design/first-visit-parity.md, S3 review round 6).
+ * last scoped under (docs/design/first-visit-parity.md 6, "One writer for the delivery position").
  *
  * Four review rounds found the same bug four times (a write of the position after an await
  * with no re-check that the position the batch was received at still exists), and the fifth

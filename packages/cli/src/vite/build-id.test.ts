@@ -159,7 +159,7 @@ describe('koraServiceWorker() includes the build id', () => {
 	})
 })
 
-describe('Codex re-audit of the build id plugin', () => {
+describe('build id plugin: edge cases', () => {
 	const fresh = (): void => {
 		rmSync(dir, { recursive: true, force: true })
 		mkdirSync(dir, { recursive: true })

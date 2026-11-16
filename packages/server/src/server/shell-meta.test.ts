@@ -5,12 +5,12 @@ const SHELL = `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>KoraForms: build forms that work anywhere</title>
+    <title>Acme Forms: build forms that work anywhere</title>
     <meta name="description" content="Generic description" />
-    <meta property="og:title" content="KoraForms" />
+    <meta property="og:title" content="Acme Forms" />
     <meta property="og:description" content="Generic" />
     <meta property="og:image" content="https://forms.example/og.png" />
-    <meta name="twitter:title" content="KoraForms" />
+    <meta name="twitter:title" content="Acme Forms" />
     <link rel="canonical" href="https://forms.example/" />
   </head>
   <body><div id="root"></div></body>

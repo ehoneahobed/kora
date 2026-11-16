@@ -406,7 +406,7 @@ describe('form drafts (version gate section 6.1)', () => {
 		expect(storage.length).toBe(0)
 	})
 
-	test('allowSensitive keeps a nested sensitive path: the whole field, or that dotted path (Codex re-audit)', () => {
+	test('allowSensitive keeps a nested sensitive path: the whole field, or that dotted path', () => {
 		const answers = { ssn: '000', diagnosis: 'x' }
 		for (const allowSensitive of [['answers'], ['answers.ssn']]) {
 			const storage = new MemoryStorage()
@@ -422,7 +422,7 @@ describe('form drafts (version gate section 6.1)', () => {
 		}
 	})
 
-	test('clearFormDrafts takes the app (its store base name) as documented, or a database name (Codex re-audit)', () => {
+	test('clearFormDrafts takes the app (its store base name) as documented, or a database name', () => {
 		const storage = new MemoryStorage()
 		createFormDraft('a', { fields: ['name'] }, app, storage).save({ name: '1' }, text)
 		const kora = { storeInfo: () => ({ baseName: 'clinic' }), encryption: null }
@@ -430,7 +430,7 @@ describe('form drafts (version gate section 6.1)', () => {
 		expect(storage.length).toBe(0)
 	})
 
-	test('clear() while the user is unknown keeps the stored draft (Codex re-audit)', () => {
+	test('clear() while the user is unknown keeps the stored draft', () => {
 		const storage = new MemoryStorage()
 		createFormDraft('intake', { fields: ['name'], userId: 'alice' }, app, storage).save(
 			{ name: 'A' },

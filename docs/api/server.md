@@ -233,7 +233,7 @@ affected.
 Answers are never cacheable (`Cache-Control: no-store, private`, `Vary: Authorization, Cookie`).
 A custom `ServerStore` must implement `recordsWithEncryptedOperations` to be read through;
 without it every collection answers `unsupported`. Design: `docs/design/first-visit-parity.md`
-(S2 result).
+(section 4).
 
 ## Stores
 

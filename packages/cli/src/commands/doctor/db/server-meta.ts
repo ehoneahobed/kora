@@ -3,7 +3,7 @@ import type { SchemaDefinition } from '@korajs/core'
 
 /*
  * What `kora doctor --db` knows about a Kora server database's layout. `@korajs/cli` may
- * not depend on `@korajs/server` at runtime (CLAUDE.md dependency rules), so the meta keys
+ * not depend on `@korajs/server` at runtime (AGENTS.md dependency rules), so the meta keys
  * and the scope-snapshot fingerprint are restated here; `server-meta.test.ts` asserts they
  * equal the server's own definitions, so a change there fails the build here.
  */

@@ -126,7 +126,7 @@ describe('a record deleted outside a view does not come back through a stale wri
 		await serverApply(net, { type: 'delete', recordId: r.id })
 		await settle([admin, retract])
 		expect(await ids(retract)).toEqual([])
-		// A later write wins over the delete (CLAUDE.md: the later of the newest delete and
+		// A later write wins over the delete (AGENTS.md: the later of the newest delete and
 		// the newest write decides) and moves the record into school-0.
 		await serverApply(net, { type: 'update', recordId: r.id, data: { school: 'school-0' } })
 		await settle([admin, retract])

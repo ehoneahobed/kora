@@ -303,7 +303,7 @@ describe('useFormDraft', () => {
 		expect(JSON.parse(stored).values).toEqual({ user: 'ada' })
 	})
 
-	describe('users (Codex re-audit)', () => {
+	describe('users', () => {
 		const KEY_U = 'kora-draft:notes-db:user-form'
 		function UserForm({
 			userId,

@@ -1,6 +1,6 @@
 # Kora.js performance baseline
 
-Targets from `CLAUDE.md` (repo root) with a **10% CI regression buffer** (`REGRESSION_FACTOR = 1.1`). Gates run on every PR via [benchmark-gates.yml](../../.github/workflows/benchmark-gates.yml).
+Targets from `AGENTS.md` (repo root) with a **10% CI regression buffer** (`REGRESSION_FACTOR = 1.1`). Gates run on every PR via [benchmark-gates.yml](../../.github/workflows/benchmark-gates.yml).
 
 ## Run locally
 
@@ -25,7 +25,7 @@ Loosening the limit would hide real regressions, so the gates are enforced in tw
   base revision (the pull request's base, or the previous commit on `main`) and runs
   `scripts/bench/ab-regression.mjs`, which measures the store's insert and query workloads
   alternately against base and head on the same runner (fastest of five each) and fails when the
-  head is more than 10% slower (CLAUDE.md). Run it locally with
+  head is more than 10% slower (AGENTS.md). Run it locally with
   `node scripts/bench/ab-regression.mjs --base <built checkout of main> --head .`.
 - **Adapter protocol overhead** (blocking everywhere): the adapter-protocol gate also compares the
   `SqliteWasmAdapter` protocol path with the direct native adapter in the same process; the
@@ -57,7 +57,7 @@ Node measurements on the 2-core review container (October 2026, under load from 
 
 ## Store in a real browser (`benchmarks/browser/store-browser-bench.mjs`)
 
-Runs the built `@korajs/store` in Chromium on Kora's dedicated worker, SQLite WASM and OPFS (`opfs-sahpool`), plus the IndexedDB fallback with its real snapshot persistence, and gates against the CLAUDE.md targets (×1.1). It also probes which journal modes `opfs-sahpool` accepts.
+Runs the built `@korajs/store` in Chromium on Kora's dedicated worker, SQLite WASM and OPFS (`opfs-sahpool`), plus the IndexedDB fallback with its real snapshot persistence, and gates against the AGENTS.md targets (×1.1). It also probes which journal modes `opfs-sahpool` accepts.
 
 ```bash
 pnpm --filter @korajs/core --filter @korajs/store build
@@ -124,7 +124,7 @@ Profile of the 10,000-insert transaction after the change (16 KiB pages, quiet h
 
 The single-insert, reactive and fan-out gates still miss their one-frame targets in the browser: each single write is its own durable OPFS commit (about 10 ms for the commit alone on this host, 34 ms in total), and the notification waits for that commit. Shortening it needs a cheaper durable commit (journal mode, `locking_mode = EXCLUSIVE`), measured below and not adopted here. With `instantUpdates` on they meet it; see "Instant updates: browser gates (S5)" below. The rows above are the committed (flag off) path.
 
-Where write-to-callback time goes (instant-UI stage S0, 5,000 rows, one 1,000-row subscription, OPFS): single insert 42.1 ms p50 to callback = tx open 0.4 + body 22.4 (sequence reservation 5.2) + commit 11.2 + re-read 8.6 + under 0.1 for notify, flush and callback; update 43.8 ms, delete 40.6 ms. With 1,000 subscriptions (50 affected) the write is about 30 ms and the 50 sequential re-runs add about 36 ms (corrected in S1: the first S0 figure of 96 ms came from warm-up re-runs still in flight, and the gated `fanout()` figures above carry the same artefact). Details: `docs/design/instant-ui-updates.md`, "S0 result". Reproduce with `store-browser-bench.mjs`.
+Where write-to-callback time goes (instant UI updates, 5,000 rows, one 1,000-row subscription, OPFS): single insert 42.1 ms p50 to callback = tx open 0.4 + body 22.4 (sequence reservation 5.2) + commit 11.2 + re-read 8.6 + under 0.1 for notify, flush and callback; update 43.8 ms, delete 40.6 ms. With 1,000 subscriptions (50 affected) the write is about 30 ms and the 50 sequential re-runs add about 36 ms (corrected in S1: the first S0 figure of 96 ms came from warm-up re-runs still in flight, and the gated `fanout()` figures above carry the same artefact). Details: `docs/design/instant-ui-updates.md`, "S0 result". Reproduce with `store-browser-bench.mjs`.
 
 ### Fan-out harness correction (instant-UI stage S2)
 
@@ -214,7 +214,7 @@ where each OPFS commit is a 10 to 15 ms fixed cost, is still to be measured.
 | Incremental sync 1 op | &lt; 200 ms | 220 ms | same |
 | Version-vector delta (100 nodes) | &lt; 10 ms | 11 ms | same |
 
-**Production target:** initial sync of 10,000 operations end-to-end in &lt; 5s with real `Store` + SQLite (CLAUDE.md). The CI gate uses in-memory mock stores and validates completion under a relaxed ceiling.
+**Production target:** initial sync of 10,000 operations end-to-end in &lt; 5s with real `Store` + SQLite (AGENTS.md). The CI gate uses in-memory mock stores and validates completion under a relaxed ceiling.
 
 ## Recording a new baseline
 

@@ -197,7 +197,7 @@ See the [1.0.0-beta.13 release notes](https://github.com/ehoneahobed/kora/blob/m
   unconditionally, independent of `dropRate`. This lets convergence tests reproduce an
   exact fault (for example dropping one specific operation to force a version-vector
   gap) instead of relying on probabilistic drops, keeping such tests deterministic per
-  CLAUDE.md's no-timing-dependent-tests rule.
+  AGENTS.md's no-timing-dependent-tests rule.
 - Fix multi-tenant scoped sync dropping any update that does not restate the scope
   field, which silently diverged tenants across devices.
 

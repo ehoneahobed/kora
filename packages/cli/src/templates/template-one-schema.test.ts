@@ -5,7 +5,7 @@ import { describe, expect, test } from 'vitest'
 /**
  * D6, one schema on client and server: every bundled template declares its schema once
  * (`src/schema.ts`) and the client, the sync server entry and `kora.config.ts` all point
- * at that module. A second `defineSchema` is how koraforms ended up with a client schema
+ * at that module. A second `defineSchema` is how a production app ended up with a client schema
  * and a server schema that drifted apart.
  */
 const templatesDir = resolve(__dirname, '../../templates')

@@ -246,7 +246,7 @@ describe('useFormDraft (Vue)', () => {
 		expect(JSON.parse(stored).values).toEqual({ user: 'ada' })
 	})
 
-	describe('users, clearing, values (Codex re-audit)', () => {
+	describe('users, clearing, values', () => {
 		const KEY_U = 'kora-draft:notes-db:user-form'
 		type U = { title: string; body: string }
 		const mountForm = (userId: unknown, ctx = context()) => {

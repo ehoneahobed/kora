@@ -2,7 +2,7 @@
 "@korajs/cli": patch
 ---
 
-`kora doctor` no longer warns about things that aren't problems, found by running it on Bozoma Learn:
+`kora doctor` no longer warns about things that aren't problems, found by running it on a production app:
 
 - **One schema:** once the app's schema has loaded, only definitions that repeat its collections are reported. A self-contained script or test harness with its own throwaway schema is no longer flagged.
 - **Runtime storage:** an adapter chosen in one branch of a conditional (`backend === 'indexeddb' ? { adapter: 'indexeddb' } : {}`, to reopen a fallback copy) no longer counts as the app forcing that adapter, so the worker and WASM delivery check still runs.

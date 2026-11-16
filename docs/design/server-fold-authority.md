@@ -1,12 +1,18 @@
-# Server fold, side effects and cross-record rules (W7 Stage B2)
+# Design: server fold, side effects and cross-record rules
+
+Every replica computes a record with one deterministic per-field fold (`foldRecord` / `mergeOp`
+in `packages/core/src/fold/`). This note covers what the sync server adds on top: how it
+materializes records from that fold cheaply, how it re-folds after a plan change, how it authors
+side effects that every instance derives identically, how it is the single authority for
+cross-record rules, and what a scope entry reveals of a record's history.
 
 ## Materialization
 
 Every server store (memory, SQLite, Postgres) keeps one fold state per materialized
 record (`kora_fold_state` on SQLite and Postgres, a map in memory) and projects the
 collection row from it. Applying an operation appends it, then merges it with
-`mergeOp`: the cost is O(fields the operation touches), whatever the record's history
-(SRV-7). The rows equal what any replica holding the same operations folds (SRV-1).
+`mergeOp`: the cost is O(fields the operation touches), whatever the record's history.
+The rows equal what any replica holding the same operations folds.
 
 `kora_fold_state (collection, record_id, state, covered_seq, covered_op_id)`:
 `state` is `serializeFoldState` output; `covered_seq` / `covered_op_id` name the
@@ -26,19 +32,19 @@ orders writes by HLC stamps compared in JavaScript, never by a database collatio
 Server fold options: the Yjs richtext merger, no traces, and the authority set:
 every node id in the reserved `kora:server:` namespace (the prefix rule) plus the
 explicit legacy ids. Every server-authored operation's node id is
-`kora:server:<deploymentId>:<instanceId>` (RT-62): the deployment id is persisted in
+`kora:server:<deploymentId>:<instanceId>`: the deployment id is persisted in
 `kora_server_meta` on first start and shared by every instance of the database; the
 instance id is persisted (SQLite) or drawn per start from a database counter
 (Postgres, unless configured), so no two instances share a node id or its sequence
-numbers. At the first start of beta.13 the store records every node id whose
+numbers. When a database that predates per-instance server ids first starts, the store records every node id whose
 operations hold authority class 1 in a stored fold state (decisions folded under an
 earlier, per-process server id), plus a configured plain `nodeId`, as legacy
 authoritative ids; the fold plan fingerprint covers them. `KoraSyncServer.authoritativeNodeIds`
 (`ServerStore.getAuthoritativeNodeIds()`) lists this instance's id, the other
 `kora:server:` ids with history and the legacy ids; every session advertises exactly
-it in the handshake and refuses a device presenting any of them, or any `kora:` id
-(RT-61). Stores persist `hash_version`
-(CORE-1) and the encryption envelope (`encrypted`, protocol v2) with each operation.
+it in the handshake and refuses a device presenting any of them, or any `kora:` id.
+Stores persist `hash_version` and the encryption envelope (`encrypted`, protocol v2) with each
+operation.
 
 Envelope operations (end-to-end encryption) are folded like any other, over their
 cleartext scope fields only; sealed members are never materialized. An envelope with
@@ -47,7 +53,7 @@ server's record existence agrees with the devices'.
 
 ## Re-materialization migration
 
-Runs in `setSchema` (and after a replace-mode backup import), after the W8b log
+Runs in `setSchema` (and after a replace-mode backup import), after the log
 integrity scan:
 
 - A record is re-folded when its state is missing, stale (covers another operation
@@ -69,7 +75,7 @@ integrity scan:
   restart on an up-to-date database does one aggregate read.
 - Unclean log (quarantined rows): a record that owns a quarantined operation (from
   `operations_quarantine.row_json`) has an incomplete log and is never re-folded from
-  it (RT-70). Its base is its stored fold state, or `createSnapshotState` of its kept
+  it. Its base is its stored fold state, or `createSnapshotState` of its kept
   row (fields stamped at least at the quarantined operations' newest HLC); its
   remaining operations, and every later write, merge onto that base. Records with a
   complete log fold from it. `getFoldMigrationReport().skippedUnclean` counts the
@@ -79,7 +85,7 @@ integrity scan:
 
 Server-generated effects of a delete get `deriveServerOpId(store, parentOpId,
 "server/relation:<relation>:<cascade|set-null>", targetRecordId)` (HMAC-SHA-256 keyed
-with the deployment's persisted secret, RT-64: every instance derives the same id,
+with the deployment's persisted secret: every instance derives the same id,
 no client can predict it and store an operation under it first) and the timestamp
 right after the parent's (`timestampAfter`: same wall time, next logical tick, server
 node). Every instance, session or retry that generates the same effect produces the
@@ -94,8 +100,8 @@ server's: right after the delete (the delete's HLC, next logical ticks, the devi
 node), not with the device's current time. Both copies are stored; under the fold they
 are idempotent in effect (two deletes, two writes of null), and a write to the child
 that is later than the delete wins over every copy, whenever each device applied the
-delete (seam 5; stamped with "now", a late-applying device's copy used to erase such a
-write on every replica).
+delete. (Stamped with the device's current time instead, a late-applying device's copy would
+erase such a write on every replica.)
 
 ## Cross-record rules (unique, capacity, referential)
 
@@ -126,14 +132,14 @@ Only a write that could have caused the violation is re-checked (an insert, or a
 to a constrained field or a reference), so pre-existing legacy data is never
 "corrected" by an unrelated write.
 
-## Scope entry (RT-29)
+## Scope entry
 
 A scope-entry insert carries `foldState`: the record's serialized fold state filtered
 to the fields it restates. A receiver joins it with its own state (`joinStates`) and
-reaches the server's value for every field kind; `fieldVersions` (now derived from the
-fold) stays for older clients.
+reaches the server's value for every field kind; `fieldVersions` (derived from the fold)
+is still sent alongside it.
 
-The state is redacted first (`redactFoldState`, issue #80), because its reader may have no
+The state is redacted first (`redactFoldState`, `packages/core/src/fold/entry-state.ts`), because its reader may have no
 right to the record's earlier values. Hidden array elements and hidden object keys keep
 their stamps under a digest of the value, salted per record and field
 (`SHA-256("kora/blind/v1", collection, recordId, field, key)`), with the value removed.
@@ -151,7 +157,9 @@ same content. Each kept update is re-encoded alone in a fresh document: an edito
 history keeps deleted text in its snapshots, and the update's own delete set removes it
 there. Both steps leave every merge result unchanged.
 
-What redaction does not cover:
+## Known limits
+
+What scope-entry redaction does not cover:
 
 - A reader who guesses a removed value exactly can confirm the guess against its digest.
   The salt stops one table from serving every record, not a targeted guess.
@@ -161,3 +169,21 @@ What redaction does not cover:
 - Richtext deleted by one device stays in a later-stamped update from a device that had not
   seen the deletion, because a late reset between the two must still show that update. The
   same holds for updates written as separate deltas, which no other update contains.
+
+Re-materialization keeps a record that owns a quarantined operation on its stored state rather
+than its log, so such a record is not re-folded under a new plan until the quarantine is
+resolved; `getFoldMigrationReport().skippedUnclean` counts them.
+
+## Tests
+
+- Materialization and re-folds: `packages/server/src/store/record-fold.test.ts`,
+  `record-fold-richtext.test.ts`, `fold-plan-fingerprint.test.ts`, `per-collection-refold.test.ts`,
+  `fold-migration-resume.test.ts`, `fold-migration-cost.test.ts`, `refold-rolling.test.ts`, and
+  `packages/server/tests/integration/fold-materialization.test.ts`.
+- Side effects: `packages/core/src/fold/side-effect-id.test.ts`,
+  `packages/server/tests/integration/authored-side-effects.test.ts`.
+- Cross-record rules: `packages/server/src/constraints/constraint-authority.test.ts`.
+- Scope entries and redaction: `packages/core/src/fold/entry-state.property.test.ts`,
+  `packages/server/tests/integration/access-delete-redaction-property.test.ts`,
+  `packages/test/tests/fold-scope-entry-richtext.test.ts`.
+- Convergence across devices and the server: `packages/test/tests/fold-gate/fold-gate-e2e.test.ts`.

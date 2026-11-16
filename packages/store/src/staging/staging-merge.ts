@@ -369,7 +369,7 @@ async function parentsFirst(
 }
 
 /**
- * Merge a staging replica into the live database (`docs/design/first-visit-parity.md` 5.7.4).
+ * Merge a staging replica into the live database (`docs/design/first-visit-parity.md` 6, "The merge").
  *
  * The staging database holds exactly what applying the same delivery stream to an empty
  * database would hold: per record the operations, the fold state, the materialized row, the

@@ -1042,7 +1042,7 @@ function printReport(report: Report): void {
 	console.log(targetLines.join('\n'))
 	if (process.env.KORA_PARITY_ENFORCE === '1') {
 		// The nightly gate: any failing relative cell or Kora target (the absolute P1 is reported only
-		// off a dedicated host) fails the job, so the two weeks of green S6 asks for are countable.
+		// off a dedicated host) fails the job.
 		const failedCells = rows.filter((row) => !row.pass).length
 		const failedTargets = targetLines.filter(
 			(line) => /\| FAIL \|\s*$/.test(line) && !line.includes('not enforced'),

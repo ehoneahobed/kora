@@ -651,7 +651,7 @@ async function defaultReadFoldState(
 	}
 }
 
-// --- transactions: one entry group (stage S6a, design "S6a design") ---
+// --- transactions: one entry group (design 5.9) ---
 
 /** Key of a record in the maps keyed by collection and id (also the write-order key). */
 export const recordKey = (collection: string, id: string): string => `${collection}\u0000${id}`

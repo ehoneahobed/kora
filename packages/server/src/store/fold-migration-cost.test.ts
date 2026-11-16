@@ -1,6 +1,6 @@
 /**
  * Cost regression for the startup re-materialization and for steady-state richtext
- * writes (koradocs upgrade incident, beta.12 -> canary). A record with many richtext
+ * writes (an upgrade incident, beta.12 -> canary). A record with many richtext
  * edits must migrate with O(n) richtext merges, not O(n^2): per-operation scope
  * snapshots keep scalar fields only, so they must never materialize the richtext body.
  * A later richtext write must merge only what it adds, not the whole history.

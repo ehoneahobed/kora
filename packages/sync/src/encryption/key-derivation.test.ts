@@ -8,7 +8,7 @@ import {
 } from './key-derivation'
 
 // Behaviour tests use a low iteration count: 600,000 PBKDF2 rounds take seconds on a
-// loaded CI machine and made these tests time out (a timing dependency, CLAUDE.md
+// loaded CI machine and made these tests time out (a timing dependency, AGENTS.md
 // anti-pattern 9). The production default is pinned by its own test below.
 const TEST_ITERATIONS = 1_000
 

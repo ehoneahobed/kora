@@ -1,5 +1,5 @@
 /**
- * First-visit parity S3, review round 6: a dropper at every await of a delivery batch.
+ * Staged replication: a dropper at every await of a delivery batch.
  *
  * Four review rounds each found one more await at which something that moves the delivery
  * position (a scope change, a query subset, a stop, a reconnect, a closed transport, a sign-in

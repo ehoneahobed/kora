@@ -1,5 +1,5 @@
 /**
- * RT-110 repro (Codex review of PR #4, server-backup.ts restoreBackupKeyRecords): a
+ * RT-110 repro (review of PR #4, server-backup.ts restoreBackupKeyRecords): a
  * backup's end-to-end key records were restored insert-only (compare-and-set against
  * "no record"). A store that already held an OLDER revision of the same keyring kept
  * it, in merge mode and in replace mode alike (the key table is never cleared). The

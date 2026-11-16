@@ -10,7 +10,7 @@
  * device upgrades (and even then only resent by accident, see RT-36).
  *
  * Verified end to end with the unreleased Phase 1 client (build 33bca46) in
- * remediation/evidence/redteam-phase2.md; this repro drives the same upload at the
+ * the security review; this repro drives the same upload at the
  * protocol level (what a beta.12 engine sends for such a pair).
  *
  * Asserts the CORRECT behaviour (fails today): an upload from a client that does not

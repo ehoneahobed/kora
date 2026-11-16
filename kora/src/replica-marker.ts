@@ -2,7 +2,7 @@
  * Whether this device has a completed replica, readable before the store opens.
  *
  * A device whose replica completed answers its queries from the store and catches up through
- * the stream (`docs/design/first-visit-parity.md` 5.3): it must not read through. Seeding skips
+ * the stream (`docs/design/first-visit-parity.md` 5.1): it must not read through. Seeding skips
  * a record that already has local history, so a server answer shown first would be replaced by
  * the older local row until delivery caught up, and the page would go fresh, stale, fresh. A
  * device whose first download never finished is not returning: its live database can still be

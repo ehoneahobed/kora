@@ -4,7 +4,7 @@
  * The node gates run better-sqlite3 in-process; this one runs the built
  * @korajs/store in Chromium on Kora's dedicated SQLite worker, SQLite WASM and OPFS
  * (opfs-sahpool), plus the IndexedDB fallback with its real snapshot persistence,
- * and gates the results against the CLAUDE.md targets (10% regression buffer).
+ * and gates the results against the AGENTS.md targets (10% regression buffer).
  *
  * Run (from the repo root, after `pnpm --filter @korajs/core --filter @korajs/store build`):
  *   PW_CHROMIUM_PATH=/opt/pw-browsers/chromium node packages/store/benchmarks/browser/store-browser-bench.mjs
@@ -20,7 +20,7 @@
  * a write before its durable commit, which is about 30 ms on OPFS and hundreds of ms on the
  * IndexedDB fallback at 10,000 rows, so a frame budget there was a red line that no change
  * to the flag-off code could turn green. They are printed against the old limit, not gated.
- * Every other gate (CLAUDE.md targets for bulk inserts, queries, the subscription check)
+ * Every other gate (AGENTS.md targets for bulk inserts, queries, the subscription check)
  * is unchanged. Needs `pnpm --filter @korajs/react build` for the React scenario.
  */
 import { existsSync, readdirSync } from 'node:fs'
@@ -100,7 +100,7 @@ function findChromium() {
 const FACTOR = 1.1
 /** One frame at 60 Hz, with the 10% regression buffer. */
 const FRAME_MS = 16 * FACTOR
-/** Gates: CLAUDE.md targets (x1.1). Measurements without a CLAUDE.md target are reported only. */
+/** Gates: AGENTS.md targets (x1.1). Measurements without a AGENTS.md target are reported only. */
 const GATES = [
 	['OPFS insert 10,000 records (one transaction)', (r) => r.opfs.insertMs, 2_000 * FACTOR],
 	['OPFS insertMany 10,000 records', (r) => r.opfs.insertManyMs, 2_000 * FACTOR],
@@ -396,7 +396,7 @@ try {
 				16,
 			])
 		: []
-	console.log('\nGates (CLAUDE.md targets, x1.1)')
+	console.log('\nGates (AGENTS.md targets, x1.1)')
 	for (const [name, pick, limit] of [...GATES, ...instantGates]) {
 		const value = pick(results)
 		const pass = typeof value === 'number' && value < limit

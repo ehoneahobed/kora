@@ -1,7 +1,7 @@
 /**
  * Shared fixtures of the staged-replication suites: a device (store, engine and in-memory
  * server over a real SQLite file), a direct reference, chained delivery batches and the
- * state a device is compared by (docs/design/first-visit-parity.md 5.7).
+ * state a device is compared by (docs/design/first-visit-parity.md 6).
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'

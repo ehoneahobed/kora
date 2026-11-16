@@ -59,3 +59,7 @@ _to_delete/
 
 # Test artifacts written by store tests
 packages/store/:memory:*
+
+# Local editor and agent settings
+.claude/settings.local.json
+.claude/worktrees/

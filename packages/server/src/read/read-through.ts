@@ -46,7 +46,7 @@ import {
 
 /**
  * The read-through endpoint (`POST <syncPath>/read`), first-visit parity S2
- * (`docs/design/first-visit-parity.md` section 5.4).
+ * (`docs/design/first-visit-parity.md` section 4).
  *
  * It answers a query from the server's current rows under exactly the grant a sync session
  * would stream to the same credential: authenticated per request, the scope taken from the

@@ -1,4 +1,4 @@
-// RT-113 tsc probe (Codex review of PR #4, core schema/infer.ts InferUpdateField). Correct
+// RT-113 tsc probe (review of PR #4, core schema/infer.ts InferUpdateField). Correct
 // typing => ZERO errors: every op.* helper returned the same broad AtomicOpSentinel, so an
 // update accepted any helper on any number, timestamp or array field and an item of any
 // type in op.append / op.remove. The runtime refuses those writes (the resolved value is

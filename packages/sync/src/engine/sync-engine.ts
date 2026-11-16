@@ -3734,7 +3734,7 @@ export class SyncEngine {
 	/**
 	 * First-visit parity S3: apply a delivery batch of a large initial stream into the
 	 * scratch replica, and on the final batch merge the replica into the live database in
-	 * one controlled pass (`docs/design/first-visit-parity.md` 5.7).
+	 * one controlled pass (`docs/design/first-visit-parity.md` 6).
 	 *
 	 * The batch goes through `applyBatchInOneTransaction` unchanged, aimed at the replica's
 	 * store and sync state, so decryption, verification, transforms, quarantine and the

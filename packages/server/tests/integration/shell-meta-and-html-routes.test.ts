@@ -29,9 +29,9 @@ const schema = defineSchema({
 })
 
 const SHELL = `<!doctype html><html><head>
-<title>KoraForms</title>
+<title>Acme Forms</title>
 <meta name="description" content="Build forms that work anywhere" />
-<meta property="og:title" content="KoraForms" />
+<meta property="og:title" content="Acme Forms" />
 </head><body><div id="root"></div></body></html>`
 
 function get(
@@ -78,7 +78,7 @@ describe('shellMeta and HTML routes', () => {
 				})
 				if (!form) return null
 				return {
-					title: `${String(form.title)} | KoraForms`,
+					title: `${String(form.title)} | Acme Forms`,
 					description: metaExcerpt(String(form.description ?? '')),
 					url: `https://forms.example${path}`,
 				}
@@ -132,8 +132,8 @@ describe('shellMeta and HTML routes', () => {
 		})
 		expect(r.status).toBe(200)
 		expect(r.type).toMatch(/text\/html/)
-		expect(r.body).toContain('<title>Pump 3 handover | KoraForms</title>')
-		expect(r.body).toContain('<meta property="og:title" content="Pump 3 handover | KoraForms" />')
+		expect(r.body).toContain('<title>Pump 3 handover | Acme Forms</title>')
+		expect(r.body).toContain('<meta property="og:title" content="Pump 3 handover | Acme Forms" />')
 		expect(r.body).toMatch(
 			/<meta name="description" content="Check the seals before restart\.[^"]*…" \/>/,
 		)
@@ -145,16 +145,16 @@ describe('shellMeta and HTML routes', () => {
 		for (const path of ['/f/draft-1', '/f/nope']) {
 			const r = await get(`${base}${path}`, { accept: 'text/html' })
 			expect(r.status).toBe(200)
-			expect(r.body).toContain('<title>KoraForms</title>')
+			expect(r.body).toContain('<title>Acme Forms</title>')
 			expect(r.body).not.toContain('Secret draft')
 		}
 	})
 
 	test("the app's own pages and the root get the shell with metadata applied per URL", async () => {
 		const root = await get(`${base}/`, { accept: 'text/html' })
-		expect(root.body).toContain('<title>KoraForms</title>')
+		expect(root.body).toContain('<title>Acme Forms</title>')
 		const results = await get(`${base}/f/pump-3/results`, { accept: 'text/html' })
-		expect(results.body).toContain('<title>Pump 3 handover | KoraForms</title>')
+		expect(results.body).toContain('<title>Pump 3 handover | Acme Forms</title>')
 	})
 
 	test('custom routes answer HTML, raw bytes, or JSON', async () => {
