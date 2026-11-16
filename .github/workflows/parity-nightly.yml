@@ -1,6 +1,6 @@
 name: parity-nightly
 
-# First-visit parity (docs/design/first-visit-parity.md, section 11, S6): the contract against the
+# First-visit parity (docs/design/first-visit-parity.md, section 2.6): the contract against the
 # plain-REST baseline with read-through on, every night. S6 flips the default only after two
 # weeks of green runs here plus an LMS rehearsal, so this job must fail when the contract does.
 # Shared runners: the relative cells are enforced, the absolute P1 is reported only
