@@ -15,7 +15,7 @@ import {
 	isServerNodeId,
 	operationSchemaView,
 } from '@korajs/core'
-import { HybridLogicalClock, SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
+import { generateUUIDv7, hashBlob } from '@korajs/core'
 import {
 	groupKey,
 	isScopeDisjunction,
@@ -308,14 +308,6 @@ function generateNodeToken(): string {
 	let binary = ''
 	for (const byte of bytes) binary += String.fromCharCode(byte)
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-
-/**
- * The node-claim owner of an anonymous device holding `nodeToken`. Only the hash is
- * stored, so the claims table never holds a usable secret.
- */
-async function anonymousNodeOwner(nodeToken: string): Promise<string> {
-	return `${ANONYMOUS_NODE_OWNER_PREFIX}${await nodeTokenHash(nodeToken)}`
 }
 
 async function nodeTokenHash(nodeToken: string): Promise<string> {

@@ -91,7 +91,6 @@ import {
 	type LiveViewWrite,
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
-	MAX_TOMBSTONE_LOOKBACK,
 	NO_LIVE_VIEW_WRITE,
 	type RecordLiveViews,
 	type RecordLiveViewsState,
@@ -108,7 +107,6 @@ import {
 	parseLiveViewFields,
 	parseLiveViews,
 	serializeLiveViews,
-	tombstoneStartOf,
 	yieldToEventLoop,
 } from './live-views'
 import {
@@ -119,12 +117,7 @@ import {
 	checkServerOperationRow,
 	quarantineRowJson,
 } from './log-integrity'
-import {
-	deserializeFieldValue,
-	generateAllCollectionDDL,
-	serializeFieldValue,
-	validateFieldName,
-} from './materialization'
+import { generateAllCollectionDDL, validateFieldName } from './materialization'
 import {
 	EMPTY_PLAN_STAMPS,
 	FOLD_PLAN_FINGERPRINTS_KEY,
@@ -166,7 +159,6 @@ import {
 	refoldRecord,
 	serializeServerFoldState,
 	serverFoldOptions,
-	serverFoldPlanFingerprint,
 } from './record-fold'
 import {
 	RecordHistoryReplayer,
@@ -485,10 +477,6 @@ export class SqliteServerStore implements ServerStore {
 		this.explicitAuthorities = identity.history.explicitAuthorities
 		this.authorityHistory = identity.history
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
-		for (const row of this.db.all<{ node_id: string }>(
-			sql`SELECT node_id FROM sync_state WHERE node_id LIKE ${`${SERVER_NODE_PREFIX}%`}`,
-		)) {
-		}
 	}
 
 	/**

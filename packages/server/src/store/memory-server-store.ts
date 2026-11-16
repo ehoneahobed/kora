@@ -45,7 +45,6 @@ import {
 } from './delivery-partitions'
 import {
 	MAX_LIVE_VIEW_FIELDS,
-	MAX_TOMBSTONE_LOOKBACK,
 	type RecordLiveViews,
 	type RecordLiveViewsState,
 	advanceLiveViews,
@@ -55,7 +54,6 @@ import {
 	liveViewTrackingFor,
 	liveViewsAccountFor,
 	normalizeFields,
-	tombstoneStartOf,
 } from './live-views'
 import { validateFieldName } from './materialization'
 import {
@@ -86,7 +84,6 @@ import {
 	deriveKeyedServerOpId,
 	generateDeploymentId,
 	generateDerivationSecret,
-	normalizeLegacyAuthorities,
 	parseIdentityOptions,
 	resolveAuthorityHistory,
 	serverNodeIdFor,

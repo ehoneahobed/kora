@@ -20,7 +20,7 @@ import type { OperationValidator } from '../apply/operation-validator'
 import { NoAuthProvider } from '../auth/no-auth'
 import { type AwarenessAudience, AwarenessRelay } from '../awareness/awareness-relay'
 import { PresenceRecords, presenceRecordKey } from '../awareness/presence-records'
-import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
+import { ServerMetricsCollector } from '../diagnostics/server-metrics-collector'
 import { EncryptionKeyService } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
 import { createDefaultLogger } from '../logging/structured-logger'
@@ -1365,90 +1365,6 @@ export class KoraSyncServer {
 			sessionId: failure.context.sessionId,
 			operationIds,
 			message,
-		})
-	}
-
-	/**
-	 * Subscribe to session-level events for metrics collection and logging.
-	 * Called when a new session is created.
-	 */
-	private attachSessionEvents(sessionId: string, sessionEmitter: KoraEventEmitter): void {
-		sessionEmitter.on('sync:connected', (event) => {
-			this.metrics.recordHandshake(sessionId, event.nodeId)
-			this.logger.log({
-				timestamp: Date.now(),
-				level: 'info',
-				event: 'session.handshake',
-				sessionId,
-				nodeId: event.nodeId,
-			})
-		})
-
-		sessionEmitter.on('sync:received', (event) => {
-			const byteSize = estimateByteSize(event.operations)
-			this.metrics.recordReceived(sessionId, event.batchSize, byteSize, {
-				unique: event.uniqueOperations ?? event.batchSize,
-				duplicates: event.duplicateOperations ?? 0,
-				rejected: event.rejectedOperations ?? 0,
-			})
-			this.logger.log({
-				timestamp: Date.now(),
-				level: 'info',
-				event: 'operations.received',
-				sessionId,
-				count: event.batchSize,
-				bytes: byteSize,
-			})
-		})
-
-		sessionEmitter.on('sync:forged-duplicate', () => {
-			this.metrics.recordForgedDuplicate()
-		})
-
-		// Logged by the session; surfaced on the server's emitter, and counted as an error
-		// unless the stream was only held.
-		sessionEmitter.on('server:tombstone-delivery-undetermined', (event) => {
-			if (event.action === 'sent' || event.reason === 'lookup-failed') this.metrics.recordError()
-			this.emitter?.emit(event)
-		})
-
-		sessionEmitter.on('sync:sent', (event) => {
-			const byteSize = estimateByteSize(event.operations)
-			this.metrics.recordSent(sessionId, event.batchSize, byteSize)
-			this.logger.log({
-				timestamp: Date.now(),
-				level: 'info',
-				event: 'operations.sent',
-				sessionId,
-				count: event.batchSize,
-				bytes: byteSize,
-			})
-		})
-
-		sessionEmitter.on('sync:disconnected', (event) => {
-			this.logger.log({
-				timestamp: Date.now(),
-				level: 'info',
-				event: 'session.disconnected',
-				sessionId,
-				details: { reason: event.reason },
-			})
-		})
-
-		sessionEmitter.on('sync:schema-mismatch', (event) => {
-			this.logger.log({
-				timestamp: Date.now(),
-				level: 'warn',
-				event: 'session.schema_mismatch',
-				sessionId,
-				details: {
-					clientSchemaVersion: event.clientSchemaVersion,
-					serverSchemaVersion: event.serverSchemaVersion,
-					supportedMin: event.supportedMin,
-					supportedMax: event.supportedMax,
-					reason: event.reason,
-				},
-			})
 		})
 	}
 

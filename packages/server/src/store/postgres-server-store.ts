@@ -65,7 +65,6 @@ import {
 	MAX_DELIVERY_SOURCES,
 	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
-	mergeSequences,
 	parseDeliveryPartitionOverrides,
 	serializeDeliveryPartitionOverrides,
 	tombstonePartitionKeysOf,
@@ -89,7 +88,6 @@ import {
 	type LiveViewWrite,
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
-	MAX_TOMBSTONE_LOOKBACK,
 	NEW_RECORD_LIVE_VIEW_WRITE,
 	NO_LIVE_VIEW_WRITE,
 	type RecordLiveViews,
@@ -108,7 +106,6 @@ import {
 	parseLiveViewFields,
 	parseLiveViews,
 	serializeLiveViews,
-	tombstoneStartOf,
 	yieldToEventLoop,
 } from './live-views'
 import {
@@ -119,12 +116,7 @@ import {
 	checkServerOperationRow,
 	quarantineRowJson,
 } from './log-integrity'
-import {
-	deserializeFieldValue,
-	generateAllCollectionDDL,
-	serializeFieldValue,
-	validateFieldName,
-} from './materialization'
+import { generateAllCollectionDDL, validateFieldName } from './materialization'
 import {
 	EMPTY_PLAN_STAMPS,
 	FOLD_PLAN_FINGERPRINTS_KEY,
@@ -166,7 +158,6 @@ import {
 	refoldRecord,
 	serializeServerFoldState,
 	serverFoldOptions,
-	serverFoldPlanFingerprint,
 } from './record-fold'
 import {
 	RecordHistoryReplayer,

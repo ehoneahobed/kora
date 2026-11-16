@@ -9,11 +9,7 @@ import {
 	scopeBranches,
 	scopeFieldNames,
 } from '@korajs/core/internal'
-import {
-	buildScopeSnapshot,
-	matchesScopePredicate,
-	recordMatchesScopePredicates,
-} from '@korajs/sync/internal'
+import { buildScopeSnapshot, recordMatchesScopePredicates } from '@korajs/sync/internal'
 import { ScopePredicateLimitError, assertScopeValuesDefined } from './scope-predicate-errors'
 
 /**
@@ -187,18 +183,6 @@ export function snapshotExitsScopes(
 		recordMatchesScopes(op.collection, { ...pre, id: op.recordId }, scopes) &&
 		!recordMatchesScopes(op.collection, { ...post, id: op.recordId }, scopes)
 	)
-}
-
-/**
- * True when a field value satisfies one scope predicate (exact value or `$in`).
- * Shared by the sync path and the route context so both honour the same operators.
- *
- * @param actual - The record's field value
- * @param expected - The scope predicate for that field
- * @returns Whether the value is inside the predicate
- */
-export function matchesPredicate(actual: unknown, expected: unknown): boolean {
-	return matchesScopePredicate(actual, expected)
 }
 
 /**

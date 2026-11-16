@@ -28,11 +28,6 @@ export interface Logger {
 	child?(context: Partial<LogEntry>): Logger
 }
 
-/**
- * Serializes LogEntry to a single log line.
- */
-export type LogSerializer = (entry: LogEntry) => string
-
 function defaultJsonSerializer(entry: LogEntry): string {
 	return JSON.stringify(entry)
 }

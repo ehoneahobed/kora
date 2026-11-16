@@ -42,7 +42,6 @@
  */
 
 import {
-	STORED_TEXT_ESCAPE,
 	decodeStoredJsonValue,
 	decodeStoredText,
 	encodeStoredJsonValue,
@@ -54,9 +53,6 @@ import { deserializeFieldValue, serializeFieldValue } from './materialization'
 
 // The codec itself is core's (`@korajs/core` stored-text), shared with the client
 // stores, so a value escapes identically on every device and server.
-
-/** The escape introducer: U+FFFF, a noncharacter. */
-export const PG_TEXT_ESCAPE = STORED_TEXT_ESCAPE
 
 /** `kora_server_meta` key prefix marking a table whose legacy U+FFFF rows were re-encoded. */
 export const PG_TEXT_CODEC_MIGRATION_KEY = 'pg_text_codec_v1:'
