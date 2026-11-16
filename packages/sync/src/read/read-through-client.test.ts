@@ -137,6 +137,18 @@ describe('ReadThroughClient', () => {
 		expect(h.calls.map((c) => c.queries.length)).toEqual([MAX_READ_QUERIES, 2])
 	})
 
+	it('retries a retriable status whose error body does not say whether it is retriable', async () => {
+		// A proxy or an older server may answer 503 with `{ error: { code, message } }` only.
+		const h = harness([
+			{ status: 503, body: { error: { code: 'UPSTREAM_DOWN', message: 'try later' } } },
+			ok(['a']),
+		])
+		const pending = h.client.read(query('a'))
+		h.flush()
+		await expect(pending).resolves.toMatchObject({ result: { key: 'a' } })
+		expect(h.calls).toHaveLength(2)
+	})
+
 	it('retries a retriable failure, honoring retryAfterMs, then succeeds', async () => {
 		const h = harness([fail(429, 'RATE_LIMITED', true, { retryAfterMs: 1_200 }), ok(['a'])])
 		const p = h.client.read(query('a'))
