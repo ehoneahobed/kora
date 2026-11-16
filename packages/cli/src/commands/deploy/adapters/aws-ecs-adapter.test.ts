@@ -154,6 +154,60 @@ describe('AwsEcsAdapter', () => {
 		expect(result.deploymentId).toBeTruthy()
 	})
 
+	test('deploy pipes the ECR token to docker login on stdin', async () => {
+		const runner = createRunnerMock([
+			{
+				matcher: ['ecr', 'get-login-password'],
+				result: { exitCode: 0, stdout: 'token123\n', stderr: '' },
+			},
+		])
+		const adapter = new AwsEcsAdapter({
+			runner,
+			context: { projectRoot: '/tmp/test', appName: 'my-app', region: 'us-east-1' },
+		})
+		await adapter.deploy({
+			clientDirectory: null,
+			serverBundlePath: null,
+			deployDirectory: '/tmp/test/.kora/deploy',
+		})
+		expect(runner.run).toHaveBeenCalledWith(
+			'docker',
+			expect.arrayContaining(['login', '--password-stdin']),
+			'/tmp/test/.kora/deploy',
+			'token123',
+		)
+	})
+
+	test('deploy stops when docker login fails', async () => {
+		const runner = createRunnerMock([
+			{
+				matcher: ['ecr', 'get-login-password'],
+				result: { exitCode: 0, stdout: 'token123', stderr: '' },
+			},
+			{
+				commandMatcher: 'docker',
+				matcher: ['login'],
+				result: { exitCode: 1, stdout: '', stderr: 'denied' },
+			},
+		])
+		const adapter = new AwsEcsAdapter({
+			runner,
+			context: { projectRoot: '/tmp/test', appName: 'my-app', region: 'us-east-1' },
+		})
+		await expect(
+			adapter.deploy({
+				clientDirectory: null,
+				serverBundlePath: null,
+				deployDirectory: '/tmp/test/.kora/deploy',
+			}),
+		).rejects.toThrow('Docker login to ECR failed')
+		expect(runner.run).not.toHaveBeenCalledWith(
+			'docker',
+			expect.arrayContaining(['push']),
+			expect.anything(),
+		)
+	})
+
 	test('status returns healthy for running service', async () => {
 		const runner = createRunnerMock([
 			{

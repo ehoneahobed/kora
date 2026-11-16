@@ -46,7 +46,6 @@ export class FlyAdapter implements ContextAwareDeployAdapter {
 	private readonly commandCandidates: readonly string[]
 	private flyCommand: string | null = null
 	private currentContext: FlyAdapterContext | null
-	private lastDeploymentId: string | null = null
 
 	public constructor(options: FlyAdapterOptions = {}) {
 		this.runner = options.runner ?? new NodeFlyCommandRunner()
@@ -187,7 +186,6 @@ export class FlyAdapter implements ContextAwareDeployAdapter {
 		)
 		const hostname = parseFlyHostname(info.stdout) ?? `${context.appName}.fly.dev`
 		const deploymentId = parseFlyDeploymentId(info.stdout) ?? new Date().toISOString()
-		this.lastDeploymentId = deploymentId
 
 		return {
 			deploymentId,
@@ -216,10 +214,8 @@ export class FlyAdapter implements ContextAwareDeployAdapter {
 	 */
 	public async *logs(options: LogOptions): AsyncIterable<LogLine> {
 		const context = this.requireContext()
+		// flyctl logs has no time-window flag, so `options.since` cannot be honored here.
 		const args = ['logs', '--app', context.appName, '--no-tail']
-		if (typeof options.since === 'string' && options.since.length > 0) {
-			args.push('--region', options.since)
-		}
 		const result = await this.runFlyCommand(args, context.projectRoot, false)
 		if (result.exitCode !== 0) {
 			throw new Error(`Fly logs failed: ${normalizeError(result.stderr, result.stdout)}`)
