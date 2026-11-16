@@ -105,16 +105,20 @@ export class SequenceManager {
 		const scope = config?.scope ?? ''
 		const to = config?.to ?? 0
 
-		await this.adapter.execute(
-			'DELETE FROM _kora_sequences WHERE name = ? AND scope = ? AND node_id = ?',
-			[name, scope, this.nodeId],
-		)
-
-		if (to > 0) {
-			await this.adapter.execute(
-				'INSERT INTO _kora_sequences (name, scope, node_id, counter) VALUES (?, ?, ?, ?)',
-				[name, scope, this.nodeId, to],
+		// One transaction: a next() issued meanwhile must not run between the delete and
+		// the insert (it would recreate the row and the insert would fail), and a crash
+		// between them must not leave the counter half reset.
+		await this.adapter.transaction(async (tx) => {
+			await tx.execute(
+				'DELETE FROM _kora_sequences WHERE name = ? AND scope = ? AND node_id = ?',
+				[name, scope, this.nodeId],
 			)
-		}
+			if (to > 0) {
+				await tx.execute(
+					'INSERT INTO _kora_sequences (name, scope, node_id, counter) VALUES (?, ?, ?, ?)',
+					[name, scope, this.nodeId, to],
+				)
+			}
+		})
 	}
 }
