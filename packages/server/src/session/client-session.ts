@@ -2887,6 +2887,9 @@ export class ClientSession {
 					return
 				}
 			}
+			// The connection may have closed during the awaits above: a closed session must
+			// not be brought back to 'authenticated', re-arm timers or reach onReady.
+			if (this.isClosed()) return
 			// A revocation that landed while this handshake was authenticating applies now.
 			if (this.pendingRevocations.some((filter) => revocationMatches(context, filter))) {
 				this.pendingRevocations.length = 0
@@ -2954,6 +2957,7 @@ export class ClientSession {
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
 			this.grantedIntervals = await this.readGrantedIntervals()
 			this.grantsReadAtSeq = this.accessRefreshedAtSeq
+			if (this.isClosed()) return
 			this.armGrantExpiry()
 			this.accessIntervals = [...stored, ...this.grantedIntervals]
 			await this.observeIndexStateAfterRead(indexState)
@@ -3309,6 +3313,9 @@ export class ClientSession {
 			...(operationProbe ? { operationProbe } : {}),
 		}
 		this.issuedNodeToken = null
+		// Closed during the reads above: nothing is sent, and the session stays closed
+		// (no streaming state, heartbeat or onReady, which would re-register it in relays).
+		if (this.isClosed()) return
 		// Rules installed during the reads above (the grant was never compiled): refused
 		// before the client is told it is in sync or sent anything.
 		if (this.refuseIfAccessUnenforceable()) return
