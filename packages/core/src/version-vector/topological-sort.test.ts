@@ -25,6 +25,14 @@ function makeOp(id: string, deps: string[] = [], timestamp?: Partial<HLCTimestam
 }
 
 describe('topologicalSort', () => {
+	test('a repeated operation (same id) appears once and is never read as a cycle', () => {
+		const a = makeOp('a', [], { wallTime: 1000 })
+		const b = makeOp('b', ['a'], { wallTime: 1001 })
+		expect(topologicalSort([a, b, b]).map((op) => op.id)).toEqual(['a', 'b'])
+		expect(topologicalSort([b, a, a, b]).map((op) => op.id)).toEqual(['a', 'b'])
+		expect(topologicalSort([a, a]).map((op) => op.id)).toEqual(['a'])
+	})
+
 	test('returns empty array for empty input', () => {
 		expect(topologicalSort([])).toEqual([])
 	})
