@@ -46,7 +46,7 @@ Root layout component that sets Kora context and renders children at once, befor
 | `app` | `KoraAppLike` | Yes | App instance from `createApp()`. |
 | `fallback` | `Snippet` | No | Shown while initializing, only with `waitForStorage`. |
 | `waitForStorage` | `boolean` | No | Hold the children back until the store is open. |
-| `children` | `Snippet` | No | App content after ready. |
+| `children` | `Snippet` | No | App content (rendered at once unless `waitForStorage`). |
 
 ### Example
 
@@ -93,8 +93,10 @@ A query that fails (for example a `where` or `orderBy` on an unknown field) is r
 <script lang="ts">
   import { derived, writable } from 'svelte/store'
   import { getApp, createQueryStore } from '@korajs/svelte'
+  import type { app as koraApp } from '../kora'
 
-  const app = getApp()
+  // The type argument types the collections (`getApp()` alone returns `KoraAppLike`).
+  const app = getApp<typeof koraApp>()
   const showDone = writable(false)
   const todos = createQueryStore(
     derived(showDone, (done) => app.todos.where({ completed: done })),

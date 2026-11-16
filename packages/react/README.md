@@ -29,7 +29,7 @@ const { useCollection, useMutation, useQuery, useSyncStatus } = createKoraHooks<
 
 export function Root() {
   return (
-    <KoraProvider app={app} fallback={<p>Loading...</p>}>
+    <KoraProvider app={app}>
       <TodoList />
     </KoraProvider>
   )
@@ -58,10 +58,11 @@ function TodoList() {
 }
 ```
 
-- `KoraProvider` renders `fallback` until the local database is open.
+- `KoraProvider` renders its children at once; hooks return empty values until the local
+  database opens. Pass `waitForStorage` (with `fallback`) to hold the children back instead.
 - `useQuery` renders `[]` first and the rows right after mount, then re-renders only when the
-  result changes. `useQueryState` returns `{ data, error, ready }`.
-- `useMutation` returns `{ mutate, mutateAsync, isLoading, error, reset }`; writes land locally at
+  result changes. `useQueryState` returns `{ data, error, ready, source, complete }`.
+- `useMutation` returns `{ mutate, mutateAsync, isLoading, error, rejected, reset }`; writes land locally at
   once and upload in the background.
 - `useSyncStatus()` returns the full status (`status`, `pendingOperations`, `lastSyncedAt`, ...)
   and re-renders only when it changes.

@@ -60,8 +60,9 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
 ```svelte
 <script lang="ts">
   import { getApp, createQueryStore } from '@korajs/svelte'
+  import type { app as koraApp } from './kora'
 
-  const app = getApp()
+  const app = getApp<typeof koraApp>()
   const todos = createQueryStore(app.todos.where({ completed: false }))
 </script>
 
@@ -76,8 +77,9 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
 <script lang="ts">
   import KoraQuery from '@korajs/svelte/KoraQuery.svelte'
   import { getApp } from '@korajs/svelte'
+  import type { app as koraApp } from './kora'
 
-  const app = getApp()
+  const app = getApp<typeof koraApp>()
   let showDone = $state(false)
 </script>
 

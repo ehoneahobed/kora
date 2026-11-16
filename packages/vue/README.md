@@ -57,7 +57,7 @@ Or use SFC wrappers:
 | `useQuery(query)` | Reactive local query results |
 | `useMutation(fn)` | Optimistic mutations with rollback |
 | `useSyncStatus()` | Connection / sync state |
-| `useApp()` | Typed `createApp()` instance |
+| `useApp<typeof app>()` | The `createApp()` instance (the type argument types its collections) |
 | `useCollection(name)` | Collection accessor |
 | `useRichText(name, id, field)` | Yjs richtext editor binding |
 | `usePresence(user)` | Publish collaborative presence |
@@ -66,8 +66,9 @@ Or use SFC wrappers:
 ```vue
 <script setup lang="ts">
 import { useApp, useQuery, useMutation } from '@korajs/vue'
+import type { app as koraApp } from './kora'
 
-const app = useApp()
+const app = useApp<typeof koraApp>()
 const todos = useQuery(app.todos.where({ completed: false }))
 const { mutate: addTodo } = useMutation(app.todos.insert)
 </script>
