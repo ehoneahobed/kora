@@ -126,7 +126,7 @@ interface SyncTransport {
 | Class | Options |
 |-------|---------|
 | `WebSocketTransport` (the default for `ws://`/`wss://`) | `serializer`, `WebSocketImpl` (Node: pass `ws`), `connectTimeout`, `tokenInUrl` (default `false`: the token travels in the handshake), `heartbeat` (default on, every 25 s), `heartbeatTimeoutFactor` |
-| `HttpLongPollingTransport` (`transport: 'http'` or `http(s)://` URLs) | `serializer`, `fetchImpl`, `retryDelayMs`, `preferWebSocket`, `webSocketFactory`. Sessions are identified by the `HTTP_SYNC_SESSION_HEADER` header and authenticated on every request. |
+| `HttpLongPollingTransport` (`transport: 'http'`, with an `http(s)://` URL) | `serializer`, `fetchImpl`, `retryDelayMs`, `preferWebSocket`, `webSocketFactory`. Sessions are identified by the `HTTP_SYNC_SESSION_HEADER` header and authenticated on every request. |
 | `ChaosTransport(inner, config)` | Test wrapper: `dropRate`, `duplicateRate`, `reorderRate`, `maxLatency`, `randomSource`, `dropPredicate`. |
 
 `ConnectionMonitor` (connection quality from RTT and errors) and `ReconnectionManager` (exponential
@@ -157,8 +157,8 @@ type guard (`isSyncMessage`, `isHandshakeMessage`, ...). Their fields are listed
 `MessageSerializer` has `encode`, `decode`, `encodeOperation`, `decodeOperation` and optional
 `setWireFormat`/`getWireFormat`. `JsonMessageSerializer` is what Kora uses: protocol v2 is JSON
 (`WireFormat` `'json'`). `ProtobufMessageSerializer` and `NegotiatedMessageSerializer` encode the
-protobuf envelope, but no Kora server or client negotiates protobuf today (the server advertises
-`supportedWireFormats: ['json']`). `versionVectorToWire` and `wireToVersionVector` convert vectors.
+protobuf envelope, but no Kora server or client negotiates protobuf today (the client offers
+`supportedWireFormats: ['json']` in its handshake and the server answers with `selectedWireFormat`). `versionVectorToWire` and `wireToVersionVector` convert vectors.
 
 ### Delta cursors
 

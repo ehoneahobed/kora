@@ -92,9 +92,11 @@ In templates, refs auto-unwrap: use `todos` directly, not `todos.value`.
 ```vue
 <script setup lang="ts">
 import { useApp, useQuery } from '@korajs/vue'
+import type { app as koraApp } from '../kora'
 
 const props = defineProps<{ done: boolean }>()
-const app = useApp()
+// The type argument types the collections (`useApp()` alone returns `KoraAppLike`).
+const app = useApp<typeof koraApp>()
 
 // Follows the prop: switching `done` re-runs the query.
 const todos = useQuery(() => app.todos.where({ completed: props.done }).orderBy('createdAt', 'desc'))

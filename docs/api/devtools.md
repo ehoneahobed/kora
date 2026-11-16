@@ -53,14 +53,14 @@ off()
 | `sync:suspended` | `reason` (`auth-loading`, `auth-required`, `auth-rejected`, `device-revoked`, `encryption-locked`, ...) | sync is paused on purpose | yes |
 | `sync:auth-failed` | `reason` | the server refused the credentials | yes |
 | `sync:schema-mismatch` | `clientSchemaVersion`, `serverSchemaVersion`, `supportedMin`, `supportedMax`, `reason` | the server does not accept this schema version | yes |
-| `sync:clock-skew` | `skewMs`, `severity` (`info`, `slow-warning`, `fast-blocked`), `source` | clock skew measured at the handshake or reported by the server | no |
-| `sync:clock-rebase` | `rebasedCount`, `maxSkewMs` | unsynced future-dated operations were re-stamped | no |
-| `sync:node-id-rotated` | `previousNodeId`, `nodeId`, `reenqueuedCount`, `heldCount?` | the server refused this device's node id; writes moved to a new node | no |
-| `sync:local-node` | `nodeId`, `action`, `localSequence?`, `serverSequence?`, `operationCount?` | bookkeeping of this database's nodes: `history-behind`, `server-behind`, `adoption-*`, `held`, `clone-detected`, `principal-switched`, `held-assigned`, `held-discarded`, `retired-repaired` (`storedCount?`, `reauthoredUnder?`: a retired node's writes the server holds, and where the rest were re-authored), `queue-settled` (`storedCount?`: operations of a node known only from queue entries that the server holds, settled; the rest stay held) | no |
+| `sync:clock-skew` | `skewMs`, `severity` (`info`, `slow-warning`, `fast-blocked`), `source` | clock skew measured at the handshake or reported by the server | yes |
+| `sync:clock-rebase` | `rebasedCount`, `maxSkewMs` | unsynced future-dated operations were re-stamped | yes |
+| `sync:node-id-rotated` | `previousNodeId`, `nodeId`, `reenqueuedCount`, `heldCount?` | the server refused this device's node id; writes moved to a new node | yes |
+| `sync:local-node` | `nodeId`, `action`, `localSequence?`, `serverSequence?`, `operationCount?` | bookkeeping of this database's nodes: `history-behind`, `server-behind`, `adoption-*`, `held`, `clone-detected`, `principal-switched`, `held-assigned`, `held-discarded`, `retired-repaired` (`storedCount?`, `reauthoredUnder?`: a retired node's writes the server holds, and where the rest were re-authored), `queue-settled` (`storedCount?`: operations of a node known only from queue entries that the server holds, settled; the rest stay held) | yes |
 | `connection:quality` | `quality` | the measured quality changed | yes |
 | `sync:diagnostics` | `diagnostics` | periodic metrics snapshot | yes |
 | `sync:bandwidth` | `bytesPerSecond`, `direction` | bandwidth sample | yes |
-| `encryption:status` | `status` (`state`, `keyring`, `keyVersion`, `code?`, `message?`) | the encryption keyring locked, unlocked or failed | no |
+| `encryption:status` | `status` (`state`, `keyring`, `keyVersion`, `code?`, `message?`) | the encryption keyring locked, unlocked or failed | yes |
 
 ### Sync data flow
 
@@ -70,13 +70,16 @@ off()
 | `sync:received` | `operations`, `batchSize` (server: also `uniqueOperations`, `duplicateOperations`, `rejectedOperations`) | a batch arrived | yes |
 | `sync:acknowledged` | `sequenceNumber` | the server acknowledged an upload | yes |
 | `sync:operations-acknowledged` | `operationIds` | the server stored these operations of this device (they can no longer be refused) | yes |
-| `sync:operations-rewritten` | `reason` (`clock-rebase`, `node-rotation`, `resequence`), `idMapping` | unsent operations were re-authored under new ids before upload; later events name the new ids | no |
+| `sync:operations-rewritten` | `reason` (`clock-rebase`, `node-rotation`, `resequence`), `idMapping` | unsent operations were re-authored under new ids before upload; later events name the new ids | yes |
 | `sync:initial-sync-progress` | `progress`, `totalBatches`, `receivedBatches` | during the first sync | yes |
-| `sync:operation-rejected` | `operationId`, `collection`, `recordId`, `code`, `message`, `retriable` | the server refused one of this device's operations; it is kept in `app.sync.getRejectedOperations()`, not retried | no |
+| `sync:operation-rejected` | `operationId`, `collection`, `recordId`, `code`, `message`, `retriable` | the server refused one of this device's operations; it is kept in `app.sync.getRejectedOperations()`, not retried | yes |
 | `sync:apply-failed` | `operationId`, `collection`, `recordId`, `code`, `message`, `retriable` | a received operation could not be applied (it is retried or quarantined, never skipped) | yes |
 | `sync:apply-blocked` / `sync:apply-retrying` / `sync:apply-recovered` | `failure` | a failed apply blocks delivery, is retried, or succeeded | yes |
-| `sync:delivery-gap` | `expectedBase`, `receivedBase`, `currentWatermark`, `messageId`, `repeatCount` | a batch did not continue the delivery watermark; it is re-requested | no |
-| `sync:scope-retracted` | `collection`, `recordId`, `quarantinedOperationIds` | a record left this device's sync scope | no |
+| `sync:staging-started` | `signature`, `serverFrontier` | a large first download is being applied into a scratch replica | yes |
+| `sync:staging-merged` | `operations`, `records`, `contestedRecords`, `replayedOperations`, `quarantined`, `durationMs`, `sequenceConflicts?`, `eventsDropped?`, `eventCounts?`, `listenerErrors?`, `heldEvents?` | the scratch replica was merged into the live database in one pass | yes |
+| `sync:staging-discarded` | `reason` | the scratch replica was dropped; nothing of it reached the live database | yes |
+| `sync:delivery-gap` | `expectedBase`, `receivedBase`, `currentWatermark`, `messageId`, `repeatCount` | a batch did not continue the delivery watermark; it is re-requested | yes |
+| `sync:scope-retracted` | `collection`, `recordId`, `quarantinedOperationIds` | a record left this device's sync scope | yes |
 | `sync:durability-degraded` / `sync:durability-restored` | `message`, `failedAttempts` / none | the local database could not be made durable before uploads (the server holds the durable copy), and recovery | yes |
 
 ### Server only
@@ -105,7 +108,6 @@ off()
 | `store:opfs-unavailable` | `dbName`, `reason`, `message` | OPFS could not be used and the store is not durable (emitted with `store:durability-lost`) | yes |
 | `store:storage-fallback` | `dbName`, `from`, `to`, `reason`, `message` | OPFS was unavailable and the app opened on durable IndexedDB instead | yes |
 | `store:storage-migrated` | `dbName`, `from`, `to`, `message` | data moved between storage locations (one copy remains) | yes |
-| `store:write-durability` | `dbName`, `state`, `reason?`, `operationId?`, `message?` | local writes stopped or resumed being durable when their promise resolves (IndexedDB fallback) | yes |
 | `store:write-pending` | `writeId`, `collection`, `collections?`, `recordIds`, `kind` (`insert`, `update`, `delete`, `transaction`), `predicted`, `reason?` | a local write was registered with the instant-updates overlay before its transaction (`predicted: false` with a `reason` when it is not shown early); a transaction (`app.transaction`, `app.mutation`) is one event with `kind: 'transaction'` and every collection in `collections`; instant updates only | yes |
 | `store:write-settled` | `writeId`, `collection`, `collections?`, `outcome` (`committed`, `rolled-back`, `unknown`), `operationIds?`, `pendingMs` | a shown write reached its outcome; a transaction settles once, as a whole, under the `writeId` of its `store:write-pending`; never means "saved" (the write's promise is the only saved signal); instant updates only | yes |
 | `store:overlay-diverged` | `writeId`, `collection`, `fields` | a prediction differed from the database (field names only; `$membership` for a row wrongly in or out of a result); throws in test builds | yes |
@@ -140,7 +142,7 @@ off()
 |-------|---------|---------|----------|
 | `query:error` | `queryId`, `collection`, `phase`, `code`, `message` | a subscription failed (it keeps its last results) | yes |
 | `query:patched` | `queryId`, `collection`, `resultCount`, `durationMs` | a subscription delivered rows built from a pending write before its commit (instant updates only; `query:executed` is not emitted for these) | yes |
-| `awareness:updated` | `states` | presence states changed | no |
+| `awareness:updated` | `states` | presence states changed | yes |
 
 ### Declared but not emitted
 

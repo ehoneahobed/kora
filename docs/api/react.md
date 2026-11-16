@@ -75,7 +75,7 @@ Context provider that makes the Kora app instance available to all hooks in the 
 
 | Prop | Type | Required | Description |
 |------|------|----------|-------------|
-| `app` | `KoraApp` | One of `app` / `store` | The app instance returned by `createApp()`. Children render once `app.ready` resolves. |
+| `app` | `KoraApp` | One of `app` / `store` | The app instance returned by `createApp()`. Children render at once (hooks return empty values until the store opens) unless `waitForStorage` is set. |
 | `store` | `Store` | One of `app` / `store` | Advanced: an opened store instead of an app. Children render immediately. |
 | `syncEngine` | `SyncEngine \| null` | No | With `store`: the sync engine for `useSyncStatus` and presence. |
 | `fallback` | `ReactNode` | No | Rendered in place of the children only with `waitForStorage` (until `app.ready` resolves, and during a server render, where the app is inert). |
@@ -205,7 +205,13 @@ Like `useQuery`, but returns the query's error instead of throwing it, and wheth
 function useQueryState<T = CollectionRecord>(
   query: QueryBuilder<T>,
   options?: { enabled?: boolean },
-): { data: readonly T[]; error: Error | null; ready: boolean }
+): {
+  data: readonly T[]
+  error: Error | null
+  ready: boolean
+  source: 'local' | 'server' | 'pending'
+  complete: boolean
+}
 ```
 
 The returned object keeps its identity until `data`, `error` or `ready` changes. `error` clears when results flow again; `data` keeps the last good rows meanwhile. `ready` is `false` until the first result of the current query (always `false` on the server).
@@ -441,7 +447,7 @@ function useSyncStatus(): SyncStatusInfo
 |----------|------|-------------|
 | `status` | `SyncStatus` | High-level state; see the table below. |
 | `reconnecting` | `boolean` | True while the engine is re-establishing a session. |
-| `phase` | `SyncPhase` | Detailed suspended/offline/connecting/handshaking/uploading/receiving/applying/streaming/blocked phase. |
+| `phase` | `SyncPhase` | Detailed suspended/offline/connecting/authenticating/handshaking/uploading/receiving/applying/streaming/blocked phase. |
 | `pendingOperations` | `number` | Number of local operations waiting to be sent to the server. |
 | `inFlightUploadOperations` | `number` | Operations sent but not yet acknowledged. |
 | `activeViewComplete` | `boolean` | Whether the active downlink view is applied through the accepted frontier. |

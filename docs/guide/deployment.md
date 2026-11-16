@@ -156,7 +156,8 @@ Kora will ask:
 
 ```
 ? Where do you want to deploy?
-  > Fly.io (recommended for sync apps)
+    Kora Cloud (managed: database, files, backups and previews included)
+  > Fly.io
 ```
 
 Select **Fly.io**. Kora then:
@@ -188,7 +189,7 @@ Then open the URL in two browsers signed in as the same user (or on your phone).
 one appears in the other within a second.
 
 ::: tip A quick demo without accounts
-For a throwaway demo, change `createKoraAuthSync({ authClient, schema })` in `src/main.tsx` to
+For a throwaway demo, change `createKoraAuthSync({ authClient, schema })` in `src/auth.ts` to
 `createKoraAuthSync({ authClient, schema, anonymous: 'allow' })` and leave `KORA_AUTH_SECRET`
 unset. Every visitor then syncs anonymously into **one shared data space**, so never ship it.
 :::
@@ -556,9 +557,8 @@ The following platforms appear in the `kora deploy` interactive prompt but are n
 
 - **Render**: Web service deployment with automatic HTTPS
 - **Docker (self-hosted)**: Generate a production Docker image for any hosting environment
-- **Kora Cloud**: Managed hosting optimized for Kora apps
 
-Selecting these will show a "not implemented yet" message. For now, use Fly.io, Railway, or one of the AWS options. If you need to deploy to an unsupported platform, see [Manual Server Setup](#advanced-manual-server-setup) below.
+Selecting these will show a "not implemented yet" message. For now, use Kora Cloud, Fly.io, Railway, or one of the AWS options. If you need to deploy to an unsupported platform, see [Manual Server Setup](#advanced-manual-server-setup) below.
 
 ---
 

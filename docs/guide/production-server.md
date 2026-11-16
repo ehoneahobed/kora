@@ -130,7 +130,7 @@ production and for more than one instance:
   (an exclusive table rewrite, once: schedule it), new tables (`operation_resolutions`,
   `sequence_pairs`, the fold state, `kora_server_meta`, `kora_encryption_keys`, `blob_owners`,
   `node_claims`) are created, operation scope snapshots are computed, every record is re-folded
-  once in 500-record transactions (safe during a rolling deploy), and the log-integrity scan runs.
+  once in transactions of at most 2,000 operations (safe during a rolling deploy), and the log-integrity scan runs.
   Later starts re-fold only records whose fold state is missing or stale (a warm restart at 20k
   operations re-materializes nothing).
 - **Changing transforms or merge rules in a rolling deploy** is safe: each fold state records
@@ -395,7 +395,7 @@ await request.kora.apply({ collection: 'todos', type: 'update', recordId, data }
 
 This is deliberate: one meaning of `undefined` everywhere (device API, route writes,
 beta.12 clients), so a write means the same thing on every path. Route writes are also
-held to the [value domain](./schema-design.md#value-domain): a value outside it (a
+held to the [value domain](./schema-design.md#the-value-domain): a value outside it (a
 `Date` in a `t.timestamp()` field, a fractional timestamp, a value of an undeclared enum
 member) is refused with `SCHEMA_VALIDATION_ERROR` and nothing is written.
 
@@ -912,7 +912,7 @@ the upgrade.
   clients when you upgrade the server.
 - A beta.12 client cannot change its node id: it keeps reconnecting and its unsynced
   writes stay on the device until an administrator calls
-  `server.releaseNodeClaim(nodeId)` for that node (the next principal to connect with
+  `store.releaseNodeClaim(nodeId)` for that node (the next principal to connect with
   it claims it). To keep beta.12 clients syncing through the upgrade, release their
   node ids (`SELECT DISTINCT node_id FROM operations` lists them) before they
   reconnect, accepting that the first principal to present a released node id gets it.

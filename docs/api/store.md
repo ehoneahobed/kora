@@ -94,10 +94,10 @@ the rows to that transaction (validated first, in input order), committed with i
 
 ### Reserved collection names {#reserved-names}
 
-These names belong to the app object: `ready`, `events`, `on`, `collections`, `sync`,
-`encryption`, `sequences`, `blobs`, `storage`, `getStore`, `getSyncEngine`, `getQueryStoreCache`,
-`storeInfo`, `close`, `transaction`, `mutation`, `exportBackup`, `importBackup`, `replayTo`,
-`exportAudit` (exported as `RESERVED_APP_PROPERTIES`). A collection with one of these names works,
+These names belong to the app object: `ready`, `events`, `on`, `collections`, `schema`, `sync`,
+`encryption`, `sequences`, `blobs`, `storage`, `offline`, `getStore`, `getSyncEngine`,
+`getQueryStoreCache`, `storeInfo`, `setReadOnly`, `readOnlyReason`, `close`, `transaction`,
+`mutation`, `reloadForNewBuild`, `exportBackup`, `importBackup`, `replayTo`, `exportAudit` (exported as `RESERVED_APP_PROPERTIES`). A collection with one of these names works,
 but only as `app.collections.<name>` (and `tx.<name>` in transactions). `createApp()` warns in
 development, and with a typed schema `app.<name>.insert(...)` is a type error.
 
@@ -181,7 +181,7 @@ unsubscribe()
 ## Transactions
 
 `app.transaction(fn)` writes several records atomically: every write is validated when called
-(errors surface at the call site, and `insert` returns its id at once), then all of them commit in
+(errors surface at the call site, and `insert` resolves with the new record, id included, before the commit), then all of them commit in
 one storage transaction with one `transactionId` and a contiguous block of sequence numbers. If
 `fn` throws, nothing is written. Subscribers are notified once, after the commit.
 
@@ -196,7 +196,7 @@ await app.mutation('create-order', async (tx) => {
 })
 ```
 
-`tx.<collection>` has `insert`, `update`, `delete` and `findById` (which sees the transaction's own
+`tx.<collection>` has `insert`, `insertMany`, `update`, `delete` and `findById` (which sees the transaction's own
 uncommitted writes); there are no queries inside a transaction. `app.mutation(name, fn)` is a
 transaction whose operations carry `mutationName` for DevTools. Both resolve to the created
 operations.

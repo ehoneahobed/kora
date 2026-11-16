@@ -245,9 +245,10 @@ server's value when you change it there. Store large content in a blob (`t.blob(
   declared or not: they map to the record's own creation and last-update times. A schema field of
   the same name (`createdAt: t.timestamp().auto()`) takes precedence.
 - **App properties.** `app.<collection>` works for every collection except names the app object
-  already uses: `ready`, `events`, `on`, `collections`, `sync`, `encryption`, `sequences`,
-  `blobs`, `storage`, `getStore`, `getSyncEngine`, `getQueryStoreCache`, `storeInfo`, `close`,
-  `transaction`, `mutation`, `exportBackup`, `importBackup`, `replayTo` and `exportAudit`
+  already uses: `ready`, `events`, `on`, `collections`, `schema`, `sync`, `encryption`,
+  `sequences`, `blobs`, `storage`, `offline`, `getStore`, `getSyncEngine`, `getQueryStoreCache`,
+  `storeInfo`, `setReadOnly`, `readOnlyReason`, `close`, `transaction`, `mutation`,
+  `reloadForNewBuild`, `exportBackup`, `importBackup`, `replayTo` and `exportAudit`
   (exported as `RESERVED_APP_PROPERTIES`). Reach such a collection through
   `app.collections.<name>` (and `tx.<name>` in a transaction, which has no reserved names). In
   development, `createApp` warns once about every shadowed name.

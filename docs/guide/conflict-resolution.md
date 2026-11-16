@@ -298,7 +298,7 @@ Each restated field keeps exactly its own version.
 
 Every fold decision that was a conflict is a `MergeTrace` (`merge:conflict` events, with
 `merge:started` and `merge:completed` around them): the operations, the field (`*` for a
-delete-vs-write decision), the strategy from the tables above, the inputs, the base, the output,
+delete-vs-write decision), the strategy (the trace strategies in the tables above; `.merge(...)` rules report `schema-counter`, `schema-max`, `schema-min`, `schema-append-only` or `schema-server-authoritative`), the inputs, the base, the output,
 the tier (1 for built-in rules, 3 for resolvers, 2 for constraint checks) and the duration.
 Secret fields are redacted. Traces are shown in the [DevTools](/guide/devtools) Conflict
 Inspector and in `kora studio`, and persisted to the local audit trail (`app.exportAudit()`).

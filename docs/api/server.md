@@ -50,7 +50,7 @@ const url = await server.start()
 | `httpRoutes` | `[]`: `{ path, handle(request) }`, mounted before static files |
 | `operationalAuth` | `{ adminToken?, metricsToken?, backupToken?, allowPublic? }`; endpoints without a token are disabled under `NODE_ENV=production` (403) unless `allowPublic`, public otherwise |
 | `crossOriginEmbedderPolicy` | `'credentialless'` |
-| `trustProxy` | `false`: `request.ip` is the socket address unless the proxy is trusted |
+| `trustProxy` | `KORA_TRUST_PROXY`, else off: `request.ip` is the socket address unless the proxy is trusted |
 | `maxRequestBodyBytes` | 1 MiB for `httpRoutes` bodies (larger requests get 413) |
 | `maxBackupBytes` | 256 MiB for `/__kora/backup/import` |
 

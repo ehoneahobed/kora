@@ -21,7 +21,7 @@ server syncs plaintext only, without operation verification or encryption: never
 - **Back up the server.** `kora backup create --url https://sync.example.com --token "$KORA_BACKUP_TOKEN"`
   (see [Backup and Restore](/guide/backup-restore)). Keep a copy of the database files too.
 - **Schedule the server's first start.** On Postgres it converts sequence columns to `BIGINT`, an
-  exclusive table rewrite done once, then folds every record once (in 500-record transactions,
+  exclusive table rewrite done once, then folds every record once (in transactions of at most 2,000 operations,
   safe during a rolling deploy). Plan a window proportional to your operation log.
 - **Read the custom code you own.** Custom `AuthProvider`s, `ServerStore`s, `TokenRevocationStore`s,
   `OrgStore`s, HTTP sync endpoints, custom merge resolvers and schema transforms all have contract
@@ -231,7 +231,7 @@ Automatic, idempotent, and logged:
     store is not repeated.
   - **Token apps (`sync.auth`):** a beta.13 client moves to a fresh node automatically and
     re-uploads what the old server never acknowledged. A beta.12 client cannot; upgrade the client
-    with the server, or release its node with `server.releaseNodeClaim(nodeId)` (the next
+    with the server, or release its node with `store.releaseNodeClaim(nodeId)` on the server store (the next
     principal to present a released node gets it).
 
   Procedure and script: [Upgrading a beta.12 server database](/guide/production-server#upgrading-a-beta-12-server-database-with-authentication).

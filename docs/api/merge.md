@@ -54,9 +54,11 @@ interface ConstraintViolation {
 
 `checkConstraints` evaluates a candidate record against every constraint of its collection
 (`unique`, `capacity`, `referential`; `where` is plain equality). `resolveConstraintViolation`
-picks the winner: `last-write-wins` keeps the newer write, `priority-field` the higher
-`priorityField` value, and every other `onConflict` value keeps the older write. A constraint's
-`resolve` function is not called. How the server enforces constraints (ingest refusal, then
+picks the winner for the violated fields: `last-write-wins` keeps the newer write,
+`first-write-wins` the older one, `priority-field` the higher `priorityField` value (the newer
+write when no `priorityField` is set), `custom` calls the constraint's `resolve(local, remote,
+base)` per field (the newer write when there is no `resolve`), and `server-decides` keeps the
+merged record flagged with `_pendingServerResolution: true`. How the server enforces constraints (ingest refusal, then
 deterministic corrections) is described in
 [Conflict Resolution](/guide/conflict-resolution#constraints).
 

@@ -7,7 +7,7 @@ const version = process.argv[2]
 if (!version) throw new Error('Usage: node scripts/release/verify-registry.mjs <exact-version>')
 
 const root = resolve(import.meta.dirname, '../..')
-const packageDirs = ['kora', 'create-kora-app']
+const packageDirs = ['kora']
 for (const entry of readdirSync(join(root, 'packages'))) packageDirs.push(join('packages', entry))
 const packageNames = packageDirs
 	.map((dir) => join(root, dir, 'package.json'))

@@ -26,7 +26,7 @@ import { join } from 'node:path'
 const dryRun = process.argv.includes('--dry-run')
 
 /** Workspace package directories. */
-const dirs = ['kora', 'create-kora-app']
+const dirs = ['kora']
 for (const entry of readdirSync('packages')) {
 	dirs.push(join('packages', entry))
 }
