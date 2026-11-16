@@ -12,7 +12,7 @@ export default mergeConfig(
 			name: '@korajs/auth',
 			root: __dirname,
 			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
-			// Password hashing and webhook retry tests exceed 5s under parallel turbo load
+			// Password hashing tests exceed 5s under parallel turbo load
 			testTimeout: 30_000,
 		},
 	}),
