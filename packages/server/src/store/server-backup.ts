@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { Operation } from '@korajs/core'
 import { KoraError } from '@korajs/core'
 import type { WrappedKeyRecord } from '@korajs/sync'
@@ -45,17 +46,36 @@ interface Section {
 	content: Uint8Array
 }
 
+/**
+ * Thrown when a backup is truncated, carries trailing bytes, or does not match its
+ * checksum. A restore refuses it before anything changes: a replace-mode restore of a
+ * cut-off upload would otherwise clear the store and restore whatever sections survived.
+ */
+export class BackupIntegrityError extends KoraError {
+	constructor(reason: string) {
+		super(
+			`Backup checksum mismatch: data may be corrupted (${reason}). Re-export the backup, or check that the upload completed.`,
+			'BACKUP_CHECKSUM_MISMATCH',
+			{ reason },
+		)
+		this.name = 'BackupIntegrityError'
+	}
+}
+
 function parseSections(data: Uint8Array): Section[] {
 	const sections: Section[] = []
 	const dv = new DataView(data.buffer, data.byteOffset, data.byteLength)
 	let offset = 0
 
-	while (offset + 8 <= data.byteLength) {
+	while (offset < data.byteLength) {
+		if (offset + 8 > data.byteLength) throw new BackupIntegrityError('truncated section header')
 		const nameLen = dv.getUint32(offset, true)
 		const contentLen = dv.getUint32(offset + 4, true)
 		offset += 8
 
-		if (offset + nameLen + contentLen > data.byteLength) break
+		if (offset + nameLen + contentLen > data.byteLength) {
+			throw new BackupIntegrityError('truncated section')
+		}
 
 		const name = new TextDecoder().decode(data.slice(offset, offset + nameLen))
 		offset += nameLen
@@ -166,6 +186,7 @@ export function parseServerBackup(data: Uint8Array): {
 	keyRecords: EncryptionKeyRecordRow[]
 } {
 	const sections = parseSections(data)
+	verifyChecksum(sections)
 
 	// Parse operations
 	const opsContent = findSection(sections, 'operations')
@@ -194,6 +215,31 @@ export function parseServerBackup(data: Uint8Array): {
 	const keyRecords = parseKeyRecords(parseJsonSection<unknown>(sections, 'encryption_keys'))
 
 	return { operations, versionVector, keyRecords }
+}
+
+/**
+ * Check the manifest's checksum, and the trailing `checksum` section, against a SHA-256
+ * of every content section in file order (as {@link buildServerBackup} computes it).
+ */
+function verifyChecksum(sections: Section[]): void {
+	let manifest: { checksum?: unknown } | null
+	try {
+		manifest = parseJsonSection<{ checksum?: unknown }>(sections, 'manifest')
+	} catch {
+		throw new BackupIntegrityError('unreadable manifest')
+	}
+	const expected = manifest?.checksum
+	if (typeof expected !== 'string') throw new BackupIntegrityError('no manifest checksum')
+	const trailer = findSection(sections, 'checksum')
+	if (trailer && new TextDecoder().decode(trailer) !== expected) {
+		throw new BackupIntegrityError('manifest and checksum section disagree')
+	}
+	const hash = createHash('sha256')
+	for (const section of sections) {
+		if (section.name === 'manifest' || section.name === 'checksum') continue
+		hash.update(encodeSection(section.name, section.content))
+	}
+	if (hash.digest('hex') !== expected) throw new BackupIntegrityError('content does not match')
 }
 
 /** Validate the `encryption_keys` section: a malformed entry refuses the whole backup. */

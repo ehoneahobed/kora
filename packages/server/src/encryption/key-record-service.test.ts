@@ -5,6 +5,7 @@ import type { Operation } from '@korajs/core'
 import type { EncryptionKeyPutMessage, WrappedKeyRecord } from '@korajs/sync'
 import { afterEach, describe, expect, test } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
+import { buildServerBackup } from '../store/server-backup'
 import type { ServerStore } from '../store/server-store'
 import { createSqliteServerStore } from '../store/sqlite-server-store'
 import { ANONYMOUS_KEY_OWNER, EncryptionKeyService, userKeyOwner } from './key-record-service'
@@ -264,13 +265,13 @@ describe.each(stores)('EncryptionKeyService on the %s store (ENC-1)', (_name, ma
 test('a backup with a malformed key record is refused whole (RT-104)', async () => {
 	const store = new MemoryServerStore()
 	await new EncryptionKeyService(store).handle(userKeyOwner('alice'), put(record(1), 0))
-	const backup = await store.exportBackup()
-	// Byte-level, same length, so the section framing stays intact: the format becomes 9.
-	const needle = new TextEncoder().encode('\\"format\\":2')
-	const tampered = new Uint8Array(backup)
-	const at = tampered.findIndex((_, i) => needle.every((byte, j) => tampered[i + j] === byte))
-	expect(at).toBeGreaterThanOrEqual(0)
-	tampered[at + needle.length - 1] = '9'.charCodeAt(0)
+	// A well-formed backup (its checksum matches) whose key record has format 9.
+	const rows = (await store.listEncryptionKeyRecords()).map((row) => ({
+		...row,
+		record: row.record.replace('"format":2', '"format":9'),
+	}))
+	expect(rows[0]?.record).toContain('"format":9')
+	const tampered = await buildServerBackup('server', [], new Map(), rows)
 	const target = new MemoryServerStore()
 	await expect(target.importBackup(tampered)).rejects.toMatchObject({
 		code: 'BACKUP_INVALID_KEY_RECORD',

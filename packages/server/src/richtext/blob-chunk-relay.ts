@@ -137,12 +137,6 @@ interface PendingRequest {
 	createdAtMs: number
 }
 
-/**
- * A request id some session has in flight in {@link BlobChunkRelay.handleRequest}.
- * `answers` counts how often a request from that session under that id was answered
- * (bytes, "not held" or "throttled"; see {@link BlobChunkRelay.answer}), so an attempt can tell that another one answered it while it
- * awaited the store or the policy, and must not answer (or re-open) it again.
- */
 /** What the relay tells a requester: the bytes, "not held", or "throttled" (retry later). */
 type RelayReply = { bytes: string } | 'not-held' | 'throttled'
 
@@ -152,6 +146,12 @@ type AnswerCounter = Exclude<
 	'requesterGone' | 'throttledNotReceivable' | 'storeReadErrors' | 'badPeerAnswers'
 >
 
+/**
+ * A request id some session has in flight in {@link BlobChunkRelay.handleRequest}.
+ * `answers` counts how often a request from that session under that id was answered
+ * (bytes, "not held" or "throttled"; see {@link BlobChunkRelay.answer}), so an attempt can tell that another one answered it while it
+ * awaited the store or the policy, and must not answer (or re-open) it again.
+ */
 interface InFlightRequest {
 	handlers: number
 	answers: number
@@ -762,15 +762,15 @@ export class BlobChunkRelay {
 	}
 }
 
+function inFlightKey(sessionId: string, requestId: string): string {
+	return JSON.stringify([sessionId, requestId])
+}
+
 /**
  * Derive a deterministic wire messageId for a routed response. The correlation
  * that matters is `requestId`; `messageId` only needs to be a non-empty string,
  * so deriving it avoids a clock/random dependency in the relay.
  */
-function inFlightKey(sessionId: string, requestId: string): string {
-	return JSON.stringify([sessionId, requestId])
-}
-
 function generateResponseId(requestId: string): string {
 	return `blob-resp-${requestId}`
 }

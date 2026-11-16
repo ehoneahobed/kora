@@ -50,19 +50,6 @@ export interface ClientMetrics {
  * Tracks connected clients, throughput, error counts, and per-session
  * metadata. Designed to be hooked into KoraSyncServer lifecycle events.
  */
-/**
- * Estimate the byte size of a batch of operations.
- * Used for bandwidth tracking in sync events.
- * Each operation is approximated by JSON-serializing and measuring length.
- */
-export function estimateByteSize(operations: Array<unknown>): number {
-	let total = 0
-	for (const op of operations) {
-		total += JSON.stringify(op).length
-	}
-	return total
-}
-
 export class ServerMetricsCollector {
 	private startedAt = Date.now()
 

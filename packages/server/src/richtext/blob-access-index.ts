@@ -140,13 +140,6 @@ export class BlobAccessIndex {
 	}
 
 	/**
-	 * Decide whether a writer may reference `hash` in a blob field (RT-11). Allowed
-	 * when the record already referenced it, when a live record inside the writer's
-	 * download scope references it, when the writer owns it (pushed the bytes, or
-	 * claimed it first), or when nobody references, owns or stores it yet: then the
-	 * writer claims it, atomically, so a later forger cannot.
-	 */
-	/**
 	 * This index reading and recording through `store` (a store bound to a transaction,
 	 * whose connection the original store's reads would wait for), with the same caches.
 	 */
@@ -169,6 +162,14 @@ export class BlobAccessIndex {
 		return view
 	}
 
+	/**
+	 * Decide whether a writer may reference `hash` in a blob field (RT-11). Allowed
+	 * when the record already referenced it, when a live record inside the writer's
+	 * download scope references it, or when the writer owns it (pushed the bytes, or
+	 * claimed it first). A hash nobody references or owns yet is claimed by the writer,
+	 * atomically, so a later forger cannot; with a central blob store it is refused
+	 * instead (RT-25): the writer must push the bytes first.
+	 */
 	async authorizeReference(request: BlobReferenceRequest): Promise<boolean> {
 		const { hash, scopes, owner } = request
 		if (!HEX_HASH.test(hash)) return false

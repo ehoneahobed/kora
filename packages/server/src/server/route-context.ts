@@ -10,11 +10,9 @@ import {
 	toAtomicOp,
 } from '@korajs/core'
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
-import type { SideEffectOp } from '@korajs/merge'
 import { effectiveGroupRole } from '../access/access-authorizer'
 import { readMembershipIntervals } from '../access/access-guard'
 import {
-	RESTRICTED_REJECTION_CODE,
 	completeTransactionOperations,
 	judgeTransactionOperation,
 } from '../apply/apply-server-operation'

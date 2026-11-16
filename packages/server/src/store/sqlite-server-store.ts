@@ -91,7 +91,6 @@ import {
 	type LiveViewWrite,
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
-	MAX_TOMBSTONE_LOOKBACK,
 	NO_LIVE_VIEW_WRITE,
 	type RecordLiveViews,
 	type RecordLiveViewsState,
@@ -108,7 +107,6 @@ import {
 	parseLiveViewFields,
 	parseLiveViews,
 	serializeLiveViews,
-	tombstoneStartOf,
 	yieldToEventLoop,
 } from './live-views'
 import {
@@ -119,12 +117,7 @@ import {
 	checkServerOperationRow,
 	quarantineRowJson,
 } from './log-integrity'
-import {
-	deserializeFieldValue,
-	generateAllCollectionDDL,
-	serializeFieldValue,
-	validateFieldName,
-} from './materialization'
+import { generateAllCollectionDDL, validateFieldName } from './materialization'
 import {
 	EMPTY_PLAN_STAMPS,
 	FOLD_PLAN_FINGERPRINTS_KEY,
@@ -166,7 +159,6 @@ import {
 	refoldRecord,
 	serializeServerFoldState,
 	serverFoldOptions,
-	serverFoldPlanFingerprint,
 } from './record-fold'
 import {
 	RecordHistoryReplayer,
@@ -485,10 +477,6 @@ export class SqliteServerStore implements ServerStore {
 		this.explicitAuthorities = identity.history.explicitAuthorities
 		this.authorityHistory = identity.history
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
-		for (const row of this.db.all<{ node_id: string }>(
-			sql`SELECT node_id FROM sync_state WHERE node_id LIKE ${`${SERVER_NODE_PREFIX}%`}`,
-		)) {
-		}
 	}
 
 	/**
@@ -622,9 +610,9 @@ export class SqliteServerStore implements ServerStore {
 		return this.nodeId
 	}
 
-	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
 	/** Capability grants are checked inside the write's transaction (`liveGroupsOf`). */
 	readonly reportsLiveGroups = true
+	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
 	private readonly accessIndex = new AccessIndexReadiness(
 		(keys) => this.renewMarkerLeases(keys),
 		SQLITE_MARKER_LEASE_MS / 3,
@@ -3343,11 +3331,6 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * The record as currently stored, including a soft-deleted one (whose last field
-	 * values are kept), or null when it was never written. Without a materialized
-	 * table, the last known values are replayed from the operation log.
-	 */
-	/**
 	 * The stored row a write is authorized against: the row on disk, unless the record's
 	 * fold state was folded with another plan (a process still on the old plan during a
 	 * rolling deploy). Then the row on disk is that plan's, and the write is judged
@@ -5027,11 +5010,6 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Reserve the next delivery sequence inside the append transaction. SQLite locks
-	 * the database for the write transaction, and this counter row keeps sequence
-	 * allocation shared by every SqliteServerStore instance using the same file.
-	 */
-	/**
 	 * Reads the index generation and the rebuild markers inside `tx` (under the write
 	 * lock) into this instance's view, so a write is judged, and what it triggers relayed,
 	 * against the index state another process sharing the file committed.
@@ -5050,6 +5028,11 @@ export class SqliteServerStore implements ServerStore {
 		)
 	}
 
+	/**
+	 * Reserve the next delivery sequence inside the append transaction. SQLite locks
+	 * the database for the write transaction, and this counter row keeps sequence
+	 * allocation shared by every SqliteServerStore instance using the same file.
+	 */
 	private nextDeliverySeq(tx: BetterSQLite3Database): number {
 		this.refreshAccessIndexView(tx)
 		const rows = tx

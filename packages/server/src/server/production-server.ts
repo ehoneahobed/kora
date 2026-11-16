@@ -12,6 +12,7 @@ import { BackupValidationError } from '../apply/ingest-validation'
 import { addressBucket } from '../read/address-bucket'
 import { readBodyDeadlineMs } from '../read/read-body-deadline'
 import type { BlobChunkRelayStats } from '../richtext/blob-chunk-relay'
+import { BackupIntegrityError } from '../store/server-backup'
 import type { FullResyncTarget, ServerStore } from '../store/server-store'
 import type { StoreInsights } from '../store/store-insights'
 import type { WsWebSocket } from '../transport/ws-server-transport'
@@ -373,6 +374,9 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 	const routeContext = syncServer.getKoraContext()
 
 	let httpServer: import('node:http').Server | null = null
+	// Open dashboard feeds (/__kora/events): never-ending responses that `stop()` must
+	// end, or `httpServer.close()` would wait for them forever.
+	const eventStreams = new Set<import('node:http').ServerResponse>()
 
 	let cachedInsights: {
 		readonly at: number
@@ -557,7 +561,9 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 	/**
 	 * Read a request body of at most `limit` bytes. Resolves null when the body (or its
 	 * declared Content-Length) is larger: the caller answers 413, and nothing past the
-	 * limit is buffered (SRV-6).
+	 * limit is buffered (SRV-6). Also resolves null when the client goes away before the
+	 * body ends: a partial body is never handed on (a cut-off backup upload restored in
+	 * replace mode would otherwise clear the store), and the 413 goes to a closed socket.
 	 */
 	function readBodyBuffer(
 		req: import('node:http').IncomingMessage,
@@ -599,8 +605,14 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 				req.resume()
 			}
 			// If the client disconnects mid-upload, `end` never fires; resolve
-			// with whatever arrived instead of leaving the request hung forever.
-			req.on('error', () => finish(Buffer.concat(chunks)))
+			// instead of leaving the request hung forever, but never with the
+			// partial body. `close` after a normal `end` is a no-op (settled).
+			const abandon = (): void => {
+				chunks.length = 0
+				finish(null)
+			}
+			req.on('error', abandon)
+			req.on('close', abandon)
 		})
 	}
 
@@ -948,8 +960,14 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 						'X-Accel-Buffering': 'no',
 					})
 
+					eventStreams.add(res)
+					res.on('close', () => eventStreams.delete(res))
+
 					// Send initial status event
 					const status = await syncServer.getStatus()
+					// A client gone during the await has already closed: starting the poll
+					// below would leave it running for the life of the process.
+					if (res.destroyed || res.writableEnded) return
 					res.write(`event: status\ndata: ${JSON.stringify(status)}\n\n`)
 
 					// Poll metrics periodically and push as SSE events
@@ -961,11 +979,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 							// Connection may have closed
 						}
 					}, 2000)
-
-					// Clean up on connection close
-					req.on('close', () => {
-						clearInterval(interval)
-					})
+					res.on('close', () => clearInterval(interval))
 
 					return
 				}
@@ -1025,10 +1039,12 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 						res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json' })
 						res.end(JSON.stringify(result))
 					} catch (error) {
-						// A backup whose operations fail ingest validation (far-future
-						// timestamps, malformed sequence numbers) is the caller's input, not a
-						// server fault: 400 with the details (SYNC-7).
-						const invalid = error instanceof BackupValidationError
+						// A backup that is truncated or fails its checksum, or whose operations
+						// fail ingest validation (far-future timestamps, malformed sequence
+						// numbers), is the caller's input, not a server fault: 400 with the
+						// details (SYNC-7).
+						const invalid =
+							error instanceof BackupValidationError || error instanceof BackupIntegrityError
 						res.writeHead(invalid ? 400 : 500, { 'Content-Type': 'application/json' })
 						res.end(
 							JSON.stringify({
@@ -1209,8 +1225,16 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 			})
 
 			httpServer.on('upgrade', (req, socket, head) => {
-				const url = new URL(req.url || '/', `http://${req.headers.host}`)
-				if (url.pathname === syncPath) {
+				// An upgrade listener runs outside the request handler's try/catch, so a
+				// malformed Host header (`new URL` throws) would crash the process.
+				let pathname: string
+				try {
+					pathname = new URL(req.url || '/', `http://${req.headers.host}`).pathname
+				} catch {
+					socket.destroy()
+					return
+				}
+				if (pathname === syncPath) {
 					wss.handleUpgrade(req, socket, head, (ws) => {
 						// The sync server builds the transport, so this path gets the same
 						// liveness probing, send-buffer ceiling and serializer as standalone.
@@ -1251,6 +1275,8 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 			blobSweepStart = null
 			blobSweep = null
 			await syncServer.stop()
+			for (const stream of eventStreams) stream.end()
+			eventStreams.clear()
 			if (httpServer) {
 				await new Promise<void>((resolve) => {
 					httpServer?.close(() => resolve())

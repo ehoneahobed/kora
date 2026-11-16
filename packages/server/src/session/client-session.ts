@@ -15,7 +15,7 @@ import {
 	isServerNodeId,
 	operationSchemaView,
 } from '@korajs/core'
-import { HybridLogicalClock, SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
+import { generateUUIDv7, hashBlob } from '@korajs/core'
 import {
 	groupKey,
 	isScopeDisjunction,
@@ -308,14 +308,6 @@ function generateNodeToken(): string {
 	let binary = ''
 	for (const byte of bytes) binary += String.fromCharCode(byte)
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-
-/**
- * The node-claim owner of an anonymous device holding `nodeToken`. Only the hash is
- * stored, so the claims table never holds a usable secret.
- */
-async function anonymousNodeOwner(nodeToken: string): Promise<string> {
-	return `${ANONYMOUS_NODE_OWNER_PREFIX}${await nodeTokenHash(nodeToken)}`
 }
 
 async function nodeTokenHash(nodeToken: string): Promise<string> {
@@ -1058,8 +1050,6 @@ export class ClientSession {
 	/** Operations accepted with an unverified legacy (beta.12) id (RT-71). */
 	private forgedDuplicates = 0
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
-	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
-	private invalidOperationIds = 0
 	private readonly validateOperation: OperationValidator | null
 	private readonly koraContext: ProductionHttpRouteContext | null
 	private readonly blobAccess: BlobAccessIndex | null
@@ -1157,6 +1147,10 @@ export class ClientSession {
 			// Transport errors during active session cause close
 			if (this.state !== 'closed') {
 				this.handleTransportClose()
+				// A frame that fails to decode leaves the connection open: close it, or the
+				// socket outlives its session (no longer counted by maxConnections, and its
+				// handshake deadline cleared) for as long as the peer answers pings.
+				if (this.transport.isConnected()) this.transport.close(1002, 'invalid message')
 			}
 		})
 	}
@@ -2269,19 +2263,23 @@ export class ClientSession {
 			case 'operation-batch':
 				await this.handleOperationBatch(message)
 				break
-			case 'acknowledgment':
+			case 'acknowledgment': {
 				this.pendingRelays.delete(message.acknowledgedMessageId)
 				// A retraction held behind an acknowledged relay may go out now.
 				if (!this.isClosed()) this.releaseHeldRelays()
 				if (typeof message.nodeToken === 'string') {
 					await this.confirmNodeClaim(message.nodeToken)
 				}
-				if (message.deliverySequence !== undefined) {
+				const ackedDelivery = deliveryWatermarkField(message.deliverySequence)
+				if (ackedDelivery !== null) {
 					// Advance the confirmed watermark (a retransmission rewinds to it). It never
-					// passes the send cursor: a client cannot acknowledge what was not sent.
-					this.noteDeliveryAcked(message.deliverySequence)
+					// passes the send cursor: a client cannot acknowledge what was not sent. A
+					// value that is not a count is ignored (a string would make it NaN and
+					// clear every unacknowledged batch).
+					this.noteDeliveryAcked(ackedDelivery)
 				}
 				break
+			}
 			case 'error':
 			case 'heartbeat':
 				// A client liveness probe needs no answer: receiving it is the point.
@@ -2891,6 +2889,9 @@ export class ClientSession {
 					return
 				}
 			}
+			// The connection may have closed during the awaits above: a closed session must
+			// not be brought back to 'authenticated', re-arm timers or reach onReady.
+			if (this.isClosed()) return
 			// A revocation that landed while this handshake was authenticating applies now.
 			if (this.pendingRevocations.some((filter) => revocationMatches(context, filter))) {
 				this.pendingRevocations.length = 0
@@ -2935,8 +2936,10 @@ export class ClientSession {
 			const userId =
 				this.authContext && this.authContext.anonymous !== true ? this.authContext.userId : null
 			this.accessPrincipal = { userId }
-			if (msg.lastDeliverySequence === undefined) {
+			if (deliveryWatermarkField(msg.lastDeliverySequence) === null) {
 				// Re-scoping rides on the gap-free delivery stream (watermark clients only).
+				// A `null` (or any non-count) must not pass: it would fall back to the
+				// version-vector delta, which never applies the access history gate.
 				this.sendError(
 					'CLIENT_TOO_OLD',
 					'This server enforces access rules, which need the delivery watermark. Upgrade the app to Kora 1.0.0-beta.15 or later.',
@@ -2956,6 +2959,7 @@ export class ClientSession {
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
 			this.grantedIntervals = await this.readGrantedIntervals()
 			this.grantsReadAtSeq = this.accessRefreshedAtSeq
+			if (this.isClosed()) return
 			this.armGrantExpiry()
 			this.accessIntervals = [...stored, ...this.grantedIntervals]
 			await this.observeIndexStateAfterRead(indexState)
@@ -3045,7 +3049,7 @@ export class ClientSession {
 		}
 
 		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
-		this.clientDeliveryWatermark = msg.lastDeliverySequence ?? null
+		this.clientDeliveryWatermark = deliveryWatermarkField(msg.lastDeliverySequence)
 		// The anchor that goes with whichever watermark this session resumes from.
 		let clientDeliveryAnchor = deliveryAnchorField(msg.lastDeliveryAnchor)
 		this.clientAccessRulesKey = typeof msg.accessRulesKey === 'string' ? msg.accessRulesKey : null
@@ -3311,6 +3315,9 @@ export class ClientSession {
 			...(operationProbe ? { operationProbe } : {}),
 		}
 		this.issuedNodeToken = null
+		// Closed during the reads above: nothing is sent, and the session stays closed
+		// (no streaming state, heartbeat or onReady, which would re-register it in relays).
+		if (this.isClosed()) return
 		// Rules installed during the reads above (the grant was never compiled): refused
 		// before the client is told it is in sync or sent anything.
 		if (this.refuseIfAccessUnenforceable()) return
@@ -4219,7 +4226,6 @@ export class ClientSession {
 			// after decryption), and a version-1 id never covered every field.
 			const integrity = await this.checkUploadIntegrity(op)
 			if (integrity !== null) {
-				if (integrity.code === INVALID_OPERATION_ID) this.invalidOperationIds += 1
 				await this.refuseTerminally(op, integrity.code, integrity.message)
 				rejectedOperations += 1
 				acknowledgedThrough = op.sequenceNumber
@@ -7617,4 +7623,12 @@ function endUnit(unit: DeliverableOperation[]): void {
 /** A reported delivery anchor, or null when absent or not an operation id. */
 function deliveryAnchorField(value: unknown): string | null {
 	return typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : null
+}
+
+/**
+ * A reported delivery watermark, or null when absent or not a non-negative safe integer
+ * (the decoder does not check the field: a `null` or a string must not count as one).
+ */
+function deliveryWatermarkField(value: unknown): number | null {
+	return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
 }

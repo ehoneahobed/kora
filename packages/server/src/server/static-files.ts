@@ -3,6 +3,7 @@ import { type Stats, createReadStream } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, extname, join, resolve, sep } from 'node:path'
+import { pipeline } from 'node:stream'
 import {
 	brotliCompress,
 	brotliDecompress,
@@ -28,8 +29,8 @@ import {
  * - Brotli or gzip for compressible types: a pre-compressed `file.br` / `file.gz` sibling
  *   when the build emitted one and it decompresses to the file's current bytes, otherwise
  *   compressed once per content hash and cached in memory.
- * - A 404 for a missing file. The SPA fallback (`index.html`) answers navigations only
- *   (`Accept: text/html` or `Sec-Fetch-Mode: navigate`) and never a path under
+ * - A 404 for a missing file. The SPA fallback (`index.html`) answers page requests
+ *   only (see {@link StaticFileHandlerOptions.spaFallback}) and never a path under
  *   `/assets/`, so a stale tab asking for an old hashed chunk gets a 404, not HTML
  *   parsed as JavaScript.
  * - Correct media types, including `.webmanifest`, `.wasm` and `.mjs`.
@@ -174,12 +175,6 @@ export type StaticFileHandler = (
 	pathname: string,
 ) => Promise<void>
 
-/**
- * Create the static file handler for a build directory (`dist/`).
- *
- * @param staticDir - Directory holding the built app
- * @returns A handler answering GET and HEAD for files under `staticDir`
- */
 /** Options for {@link createStaticFileHandler}. */
 export interface StaticFileHandlerOptions {
 	/**
@@ -204,6 +199,13 @@ export interface StaticFileHandlerOptions {
 	transformShell?: (req: IncomingMessage, pathname: string, html: string) => Promise<string | null>
 }
 
+/**
+ * Create the static file handler for a build directory (`dist/`).
+ *
+ * @param staticDir - Directory holding the built app
+ * @param options - SPA fallback and app-shell rewriting
+ * @returns A handler answering GET and HEAD for files under `staticDir`
+ */
 export function createStaticFileHandler(
 	staticDir: string,
 	options: StaticFileHandlerOptions = {},
@@ -412,7 +414,15 @@ export function createStaticFileHandler(
 			res.end()
 			return
 		}
-		createReadStream(path).pipe(res)
+		// `pipe` forwards no errors: a read failure after the stat (EIO, or the file
+		// removed by a redeploy) would be an unhandled 'error' event and crash the
+		// process. `pipeline` destroys both streams instead (the response is cut short).
+		pipeline(createReadStream(path), res, (error) => {
+			// A client that leaves mid-file is routine; anything else is worth a line.
+			if (error && (error as NodeJS.ErrnoException).code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+				console.error(`[kora] Failed to serve ${name}:`, error)
+			}
+		})
 	}
 
 	/**

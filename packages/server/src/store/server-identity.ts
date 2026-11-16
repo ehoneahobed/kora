@@ -247,11 +247,6 @@ export function serverNodeIdFor(deploymentId: string, instanceId: string): strin
 	return `${SERVER_NODE_PREFIX}${deploymentId}:${instanceId}`
 }
 
-/** Prefix shared by every instance node id of one deployment. */
-export function deploymentNodePrefix(deploymentId: string): string {
-	return `${SERVER_NODE_PREFIX}${deploymentId}:`
-}
-
 /** True for a node id the server authors under (current or any instance of any deployment). */
 export function isServerNodeId(nodeId: string): boolean {
 	return nodeId.startsWith(SERVER_NODE_PREFIX)
@@ -259,11 +254,6 @@ export function isServerNodeId(nodeId: string): boolean {
 
 /** A new deployment id (UUID v7, so deployments sort by creation). */
 export function generateDeploymentId(): string {
-	return generateUUIDv7()
-}
-
-/** A new random instance id (memory stores, which persist nothing). */
-export function generateInstanceId(): string {
 	return generateUUIDv7()
 }
 

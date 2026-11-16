@@ -65,7 +65,6 @@ import {
 	MAX_DELIVERY_SOURCES,
 	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
-	mergeSequences,
 	parseDeliveryPartitionOverrides,
 	serializeDeliveryPartitionOverrides,
 	tombstonePartitionKeysOf,
@@ -89,7 +88,6 @@ import {
 	type LiveViewWrite,
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
-	MAX_TOMBSTONE_LOOKBACK,
 	NEW_RECORD_LIVE_VIEW_WRITE,
 	NO_LIVE_VIEW_WRITE,
 	type RecordLiveViews,
@@ -108,7 +106,6 @@ import {
 	parseLiveViewFields,
 	parseLiveViews,
 	serializeLiveViews,
-	tombstoneStartOf,
 	yieldToEventLoop,
 } from './live-views'
 import {
@@ -119,12 +116,7 @@ import {
 	checkServerOperationRow,
 	quarantineRowJson,
 } from './log-integrity'
-import {
-	deserializeFieldValue,
-	generateAllCollectionDDL,
-	serializeFieldValue,
-	validateFieldName,
-} from './materialization'
+import { generateAllCollectionDDL, validateFieldName } from './materialization'
 import {
 	EMPTY_PLAN_STAMPS,
 	FOLD_PLAN_FINGERPRINTS_KEY,
@@ -166,7 +158,6 @@ import {
 	refoldRecord,
 	serializeServerFoldState,
 	serverFoldOptions,
-	serverFoldPlanFingerprint,
 } from './record-fold'
 import {
 	RecordHistoryReplayer,
@@ -290,6 +281,13 @@ const PRUNE_RESOLUTIONS_PAST_LOG_SQL = `DELETE FROM operation_resolutions r
 
 /** Postgres unique_violation. */
 const PG_UNIQUE_VIOLATION = '23505'
+
+/**
+ * Clients a store opened itself ({@link createPostgresServerStore}), ended by its
+ * `close()`. Module-private, so no caller can hand a store a client to end; a store built
+ * on a caller's drizzle instance is absent and leaves its client to the caller.
+ */
+const OWNED_CLIENTS = new WeakMap<PostgresServerStore, unknown>()
 
 /** True when `error` (or its drizzle-wrapped cause) is a Postgres unique violation. */
 function isUniqueViolation(error: unknown): boolean {
@@ -666,9 +664,9 @@ export class PostgresServerStore implements ServerStore {
 		return this.nodeId
 	}
 
-	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
 	/** Capability grants are checked inside the write's transaction (`liveGroupsOf`). */
 	readonly reportsLiveGroups = true
+	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
 	private readonly accessIndex = new AccessIndexReadiness(
 		(keys) => this.renewMarkerLeases(keys),
 		ACCESS_INDEX_MARKER_LEASE_MS / 3,
@@ -3486,6 +3484,13 @@ export class PostgresServerStore implements ServerStore {
 		await this.liveViewBackfill
 		await this.deliveryIndexBuild
 		await this.deliveryBackfill
+		// A client this store opened goes with it: its pooled sockets would otherwise stay
+		// open (postgres.js keeps idle connections by default) and hold the process alive.
+		// Background recovery finishes first; `end()` lets queries already sent complete.
+		await this.accessIndex.pendingRecovery()
+		const client = OWNED_CLIENTS.get(this)
+		OWNED_CLIENTS.delete(this)
+		if (client !== undefined) await endPostgresClient(client, null)
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
@@ -3962,11 +3967,6 @@ export class PostgresServerStore implements ServerStore {
 		return live
 	}
 
-	/**
-	 * The record as currently stored, including a soft-deleted one (whose last field
-	 * values are kept), or null when it was never written. Without a materialized
-	 * table, the last known values are replayed from the operation log.
-	 */
 	/**
 	 * When the record's fold state was folded with another plan (an instance still on the
 	 * old plan during a rolling deploy), the row on disk is that plan's: this is the
@@ -5791,11 +5791,6 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
-	 * Reserve the next delivery sequence inside an open append transaction. The
-	 * `UPDATE ... RETURNING` locks the counter row until this transaction commits,
-	 * serializing assignment into commit order (see the counter table comment).
-	 */
-	/**
 	 * Take the delivery-counter row lock without advancing it: every append waits for
 	 * this transaction, so work done under it (an index rebuild) sees no interleaved write.
 	 */
@@ -5805,6 +5800,11 @@ export class PostgresServerStore implements ServerStore {
 		await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
 	}
 
+	/**
+	 * Reserve the next delivery sequence inside an open append transaction. The
+	 * `UPDATE ... RETURNING` locks the counter row until this transaction commits,
+	 * serializing assignment into commit order (see the counter table comment).
+	 */
 	private async nextDeliverySeq(tx: {
 		execute: (query: SQL) => Promise<unknown>
 	}): Promise<number> {
@@ -5961,6 +5961,7 @@ export async function createPostgresServerStore(
 		await endPostgresClient(client)
 		throw new ServerStoreUnavailableError(options.connectionString, error)
 	}
+	OWNED_CLIENTS.set(store, client)
 	return store
 }
 
@@ -5991,13 +5992,19 @@ function redactConnectionString(connectionString: string): string {
 	}
 }
 
-async function endPostgresClient(client: unknown): Promise<void> {
+/**
+ * End a postgres.js client, best effort. `timeout` 0 (a failed startup) closes at once;
+ * null waits for queries already sent.
+ */
+async function endPostgresClient(client: unknown, timeout: number | null = 0): Promise<void> {
 	const end = (client as { end?: (options?: { timeout?: number }) => Promise<void> }).end
 	if (typeof end !== 'function') return
 	try {
-		await end.call(client, { timeout: 0 })
-	} catch {
-		// Best effort: the startup error above is the one that matters.
+		await end.call(client, timeout === null ? {} : { timeout })
+	} catch (error) {
+		// Best effort: at startup the startup error is the one that matters, and at close
+		// nothing is left to do with a client that failed to end.
+		console.warn('[kora] Ending the PostgreSQL client failed:', error)
 	}
 }
 
