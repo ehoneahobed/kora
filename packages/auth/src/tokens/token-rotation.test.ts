@@ -186,3 +186,47 @@ describe('rotation re-checks revocation after consuming the parent (RT-9)', () =
 		expect(result.ok).toBe(true)
 	})
 })
+
+describe('a family revocation outlives every member of the family', () => {
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
+	it('a reused parent revokes a successor that expires after the parent, through cleanup', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		vi.setSystemTime(new Date('2026-10-01T08:00:00Z'))
+		const { tm, store } = manager(new InMemoryTokenRevocationStore(), 0)
+		const issued = tm.issueTokens('u1', 'd1')
+		// Rotate late in the parent's life, so the successor expires long after it.
+		vi.setSystemTime(Date.now() + 80 * 24 * 60 * 60 * 1000)
+		const next = await tm.rotateRefreshToken(issued.refreshToken)
+		if (!next.ok) throw new Error('rotation should succeed')
+		const reused = await tm.rotateRefreshToken(issued.refreshToken)
+		expect(reused).toEqual({ ok: false, reason: 'reused' })
+
+		// Past the parent's expiry, a cleanup must not resurrect the family.
+		vi.setSystemTime(Date.now() + 20 * 24 * 60 * 60 * 1000)
+		store.cleanup()
+		expect(await tm.validateTokenWithRevocation(next.tokens.refreshToken)).toBeNull()
+		expect(await tm.rotateRefreshToken(next.tokens.refreshToken)).toEqual({
+			ok: false,
+			reason: 'revoked',
+		})
+	})
+
+	it('revoking a family by an access token expiry still covers its refresh token after cleanup', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		vi.setSystemTime(new Date('2026-10-01T08:00:00Z'))
+		const { tm, store } = manager()
+		const issued = tm.issueTokens('u1', 'd1')
+		const access = decodeJwt(issued.accessToken)
+		if (typeof access?.fam !== 'string' || typeof access.exp !== 'number') {
+			throw new Error('access token should carry fam and exp')
+		}
+		// Sign-out without a refresh token knows only the access token's expiry.
+		await tm.revokeFamily(access.fam, access.exp)
+		vi.setSystemTime(Date.now() + 24 * 60 * 60 * 1000)
+		store.cleanup()
+		expect(await tm.validateTokenWithRevocation(issued.refreshToken)).toBeNull()
+	})
+})
