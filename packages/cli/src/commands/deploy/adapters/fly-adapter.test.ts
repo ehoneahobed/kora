@@ -121,9 +121,12 @@ describe('FlyAdapter', () => {
 				confirm: false,
 			})
 			const lines = []
-			for await (const line of adapter.logs({ tail: 10 })) {
+			for await (const line of adapter.logs({ tail: 10, since: '1h' })) {
 				lines.push(line)
 			}
+			// `since` must never be passed as a region filter.
+			const logsCall = runner.run.mock.calls.find((call) => (call[1] as string[]).includes('logs'))
+			expect(logsCall?.[1]).not.toContain('--region')
 			expect(lines).toHaveLength(3)
 			expect(lines[0]?.level).toBe('info')
 			expect(lines[1]?.level).toBe('warn')

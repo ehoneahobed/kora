@@ -25,6 +25,46 @@ describe('bundled template manifests', () => {
 		expect(pkg.devDependencies?.tsx ?? pkg.dependencies?.tsx).toBeDefined()
 	})
 
+	test.each(templates)(
+		'%s: pnpm may run the build scripts korajs installs (esbuild, protobufjs)',
+		(template) => {
+			// pnpm 11 fails the install on an unapproved build script; protobufjs (via
+			// @korajs/sync) has a postinstall in every app that depends on korajs.
+			const raw = JSON.parse(
+				readFileSync(join(templatesDir, template, 'package.json.hbs'), 'utf-8').replace(
+					/\{\{\w+\}\}/g,
+					'0.0.0',
+				),
+			) as { pnpm?: { onlyBuiltDependencies?: string[] } }
+			const allowed = raw.pnpm?.onlyBuiltDependencies ?? []
+			expect(allowed).toContain('esbuild')
+			expect(allowed).toContain('protobufjs')
+		},
+	)
+
+	test.each(templates.filter((t) => t !== 'tauri-react'))(
+		'%s: the build copies the sqlite OPFS async proxy into dist/assets',
+		(template) => {
+			const config = readFileSync(join(templatesDir, template, 'vite.config.ts'), 'utf-8')
+			expect(config).toContain("'sqlite3-opfs-async-proxy.js'")
+		},
+	)
+
+	test.each(templates)('%s: ships a .env.example (kora doctor reads it)', (template) => {
+		expect(existsSync(join(templatesDir, template, '.env.example'))).toBe(true)
+	})
+
+	test.each(templates)(
+		'%s: the .env.example sync URL points at the server sync path',
+		(template) => {
+			const env = readFileSync(join(templatesDir, template, '.env.example'), 'utf-8')
+			// server.ts and createProductionServer accept WebSocket upgrades only at /kora-sync.
+			for (const [, url] of env.matchAll(/VITE_SYNC_URL=(\S+)/g)) {
+				expect(new URL(url as string).pathname).toBe('/kora-sync')
+			}
+		},
+	)
+
 	test.each(templates)('%s: @lucide/svelte is pinned to a published range', (template) => {
 		const range = manifest(template).dependencies?.['@lucide/svelte']
 		// @lucide/svelte's first stable release is 0.479.0; ^0.468.0 matches nothing.

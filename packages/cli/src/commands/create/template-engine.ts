@@ -1,13 +1,7 @@
 import { composeTemplateLayers, createCompatibilityLayerPlan } from '../../templates/composer'
 import type { TemplateContext, TemplateName } from '../../types'
 
-/**
- * Replaces {{variable}} placeholders in a template string with context values.
- *
- * @param template - The template string containing {{variable}} placeholders
- * @param context - Key-value pairs to substitute
- * @returns The template with all placeholders replaced
- */
+// The template helpers live in templates/composer; re-exported for the create command's callers.
 export { substituteVariables, getTemplatePath } from '../../templates/composer'
 
 /**

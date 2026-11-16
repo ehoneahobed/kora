@@ -45,7 +45,6 @@ export class RailwayAdapter implements ContextAwareDeployAdapter {
 	private readonly commandCandidates: readonly string[]
 	private railwayCommand: string | null = null
 	private currentContext: RailwayAdapterContext | null
-	private lastDeploymentId: string | null = null
 
 	public constructor(options: RailwayAdapterOptions = {}) {
 		this.runner = options.runner ?? new NodeRailwayCommandRunner()
@@ -170,7 +169,6 @@ export class RailwayAdapter implements ContextAwareDeployAdapter {
 		const status = await this.runRailwayCommand(['status', '--json'], context.projectRoot, false)
 		const deploymentId = parseRailwayDeploymentId(status.stdout) ?? new Date().toISOString()
 		const liveUrl = parseRailwayUrl(status.stdout) ?? `https://${context.appName}.up.railway.app`
-		this.lastDeploymentId = deploymentId
 
 		return {
 			deploymentId,

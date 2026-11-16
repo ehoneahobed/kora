@@ -1,6 +1,5 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
-import type { SchemaDefinition } from '@korajs/core'
 import { defineCommand } from 'citty'
 import { InvalidProjectError, SchemaNotFoundError } from '../../errors'
 import { findProjectRoot, findSchemaFile } from '../../utils/fs-helpers'
@@ -63,15 +62,9 @@ export const generateCommand = defineCommand({
 
 				logger.step(`Reading schema from ${schemaPath}...`)
 
-				// Dynamic import the schema file
-				const schemaModule: unknown = await import(schemaPath)
-				const schema = extractSchema(schemaModule)
-
-				if (!schema) {
-					logger.error('Schema file must export a SchemaDefinition as the default export.')
-					process.exitCode = 1
-					return
-				}
+				// The same loader as `generate hooks` and `kora migrate`: a TypeScript schema (every
+				// template's) loads through the project's tsx, and the schema is finalized.
+				const schema = await loadSchemaDefinition(schemaPath, projectRoot)
 
 				// Generate types
 				const output = generateTypes(schema)
@@ -151,24 +144,3 @@ export const generateCommand = defineCommand({
 		}),
 	},
 })
-
-function extractSchema(mod: unknown): SchemaDefinition | null {
-	if (typeof mod !== 'object' || mod === null) return null
-	const record = mod as Record<string, unknown>
-
-	// Check for default export
-	const candidate = record.default ?? record
-	if (isSchemaDefinition(candidate)) return candidate
-
-	return null
-}
-
-function isSchemaDefinition(value: unknown): value is SchemaDefinition {
-	if (typeof value !== 'object' || value === null) return false
-	const obj = value as Record<string, unknown>
-	return (
-		typeof obj.version === 'number' &&
-		typeof obj.collections === 'object' &&
-		obj.collections !== null
-	)
-}

@@ -185,8 +185,10 @@ export const devCommand = defineCommand({
 			logger.step(`  Managed sync server on port ${syncPort} (${managedSyncStore.type})`)
 		} else if (syncAllowed && syncServerFile === null) {
 			logger.step('  Sync server configured but no server.ts/server.js or managed store found')
-		} else if (!syncAllowed) {
+		} else if (args['no-sync'] === true) {
 			logger.step('  Sync server disabled via --no-sync')
+		} else if (!syncAllowed) {
+			logger.step('  Sync server disabled in kora.config.ts')
 		}
 
 		if (watchEnabled && schemaPath) {

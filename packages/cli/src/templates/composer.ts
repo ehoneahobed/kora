@@ -50,9 +50,9 @@ export function getTemplatePath(templateName: TemplateName): string {
 }
 
 /**
- * Returns a v1 compatibility layer plan that composes to one of the existing
- * four concrete templates. This establishes the layer architecture while
- * preserving byte-for-byte output compatibility for current templates.
+ * Returns the layer plan that composes a bundled template. React web templates are
+ * built from `react-basic` plus their style and sync overlays (later layers overwrite
+ * earlier files); every other template is a single self-contained layer.
  */
 export function createCompatibilityLayerPlan(templateName: TemplateName): TemplateLayerPlan {
 	const baseLayer: TemplateLayer = { category: 'base', name: 'base', sourceTemplate: 'react-basic' }

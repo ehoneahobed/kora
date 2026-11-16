@@ -293,8 +293,9 @@ export const deployCommand = defineCommand({
 		if (!cloud)
 			await writeDockerfileArtifact(deployDirectory, {
 				clientDirectory: deployTarget === 'sync-server' ? null : undefined,
+				// The bundled server keeps these external; match @korajs/server's own ranges.
 				nativeDependencies: {
-					'better-sqlite3': '^11.0.0',
+					'better-sqlite3': '^12.8.0',
 					'drizzle-orm': '^0.45.2',
 					postgres: '^3.4.0',
 				},

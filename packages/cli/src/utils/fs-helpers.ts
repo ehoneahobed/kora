@@ -13,7 +13,7 @@ export async function directoryExists(path: string): Promise<boolean> {
 
 /**
  * Walks up the directory tree from startDir looking for a package.json
- * that contains a kora or @korajs/* dependency.
+ * that contains a korajs, kora or @korajs/* dependency.
  *
  * @param startDir - Directory to start searching from (defaults to cwd)
  * @returns Absolute path to the project root, or null if not found
@@ -64,36 +64,6 @@ export async function findSchemaFile(projectRoot: string): Promise<string | null
 		}
 	}
 
-	return null
-}
-
-/**
- * Resolves a binary from a project's local node_modules/.bin directory.
- * On Windows, npm creates .cmd shims instead of extensionless files.
- *
- * @param projectRoot - The project root directory
- * @param binaryName - Binary filename (for example: vite, tsx, kora)
- * @returns Absolute path to the binary, or null if not found
- */
-export async function resolveProjectBinary(
-	projectRoot: string,
-	binaryName: string,
-): Promise<string | null> {
-	const binDir = join(projectRoot, 'node_modules', '.bin')
-	// On Windows, try .cmd first (npm/pnpm create .cmd shims)
-	const candidates =
-		process.platform === 'win32'
-			? [join(binDir, `${binaryName}.cmd`), join(binDir, binaryName)]
-			: [join(binDir, binaryName)]
-
-	for (const candidate of candidates) {
-		try {
-			await access(candidate)
-			return candidate
-		} catch {
-			// continue
-		}
-	}
 	return null
 }
 
@@ -149,5 +119,7 @@ function isKoraProject(pkg: unknown): boolean {
 
 function hasKoraDep(deps: unknown): boolean {
 	if (typeof deps !== 'object' || deps === null) return false
-	return Object.keys(deps).some((key) => key === 'kora' || key.startsWith('@korajs/'))
+	return Object.keys(deps).some(
+		(key) => key === 'korajs' || key === 'kora' || key.startsWith('@korajs/'),
+	)
 }

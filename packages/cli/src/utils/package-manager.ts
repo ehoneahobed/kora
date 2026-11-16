@@ -1,4 +1,3 @@
-import { execSync } from 'node:child_process'
 import type { PackageManager } from '../types'
 
 /**
@@ -25,14 +24,4 @@ export function getInstallCommand(pm: PackageManager): string {
 export function getRunDevCommand(pm: PackageManager): string {
 	if (pm === 'npm') return 'npm run dev'
 	return `${pm} dev`
-}
-
-/** Checks if a package manager is available on PATH */
-export function isPackageManagerAvailable(pm: PackageManager): boolean {
-	try {
-		execSync(`${pm} --version`, { stdio: 'ignore' })
-		return true
-	} catch {
-		return false
-	}
 }

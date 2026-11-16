@@ -40,6 +40,19 @@ function sqliteWasmHotfix(): Plugin {
 					break
 				}
 			}
+
+			// sqlite3 loads its OPFS async proxy dynamically, so Vite never emits it.
+			const proxyFile = resolve(
+				'node_modules',
+				'@sqlite.org',
+				'sqlite-wasm',
+				'sqlite-wasm',
+				'jswasm',
+				'sqlite3-opfs-async-proxy.js',
+			)
+			if (existsSync(proxyFile)) {
+				copyFileSync(proxyFile, join(assetsDir, 'sqlite3-opfs-async-proxy.js'))
+			}
 		},
 	}
 }

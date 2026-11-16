@@ -18,7 +18,11 @@ import type {
  * Execution abstraction for AWS CLI interactions.
  */
 export interface AwsCommandRunner {
-	run(command: string, args: string[], cwd: string): Promise<AwsCommandResult>
+	/**
+	 * Runs a command. `input`, when given, is written to the child's stdin (for flags such
+	 * as `docker login --password-stdin`); otherwise stdin is closed.
+	 */
+	run(command: string, args: string[], cwd: string, input?: string): Promise<AwsCommandResult>
 }
 
 export interface AwsCommandResult {
@@ -216,13 +220,16 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const ecrUri = `${accountId}.dkr.ecr.${region}.amazonaws.com`
 		const imageUri = `${ecrUri}/${repoName}:latest`
 
-		// Docker login to ECR
+		// Docker login to ECR: the token goes in on stdin so it never appears in the process list.
 		const dockerLogin = await this.runner.run(
 			'docker',
 			['login', '--username', 'AWS', '--password-stdin', ecrUri],
 			artifacts.deployDirectory,
+			loginPassword.stdout.trim(),
 		)
-		// Note: password is piped via stdin in real usage; for the adapter we use the password result
+		if (dockerLogin.exitCode !== 0) {
+			throw new Error(`Docker login to ECR failed: ${dockerLogin.stderr}`)
+		}
 
 		// Build Docker image
 		this.logger.step('Building Docker image...')
@@ -459,13 +466,24 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
  * Default subprocess-backed runner for AWS CLI commands.
  */
 export class NodeAwsCommandRunner implements AwsCommandRunner {
-	public async run(command: string, args: string[], cwd: string): Promise<AwsCommandResult> {
+	public async run(
+		command: string,
+		args: string[],
+		cwd: string,
+		input?: string,
+	): Promise<AwsCommandResult> {
 		return new Promise<AwsCommandResult>((resolve) => {
 			const child = spawn(command, args, {
 				cwd,
 				env: process.env,
-				stdio: ['ignore', 'pipe', 'pipe'],
+				stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
 			})
+			if (input !== undefined) {
+				child.stdin?.on('error', () => {
+					// The child exiting before reading stdin surfaces through its exit code.
+				})
+				child.stdin?.end(input)
+			}
 
 			let stdout = ''
 			let stderr = ''
