@@ -3,6 +3,7 @@ import { type Stats, createReadStream } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, extname, join, resolve, sep } from 'node:path'
+import { pipeline } from 'node:stream'
 import {
 	brotliCompress,
 	brotliDecompress,
@@ -412,7 +413,15 @@ export function createStaticFileHandler(
 			res.end()
 			return
 		}
-		createReadStream(path).pipe(res)
+		// `pipe` forwards no errors: a read failure after the stat (EIO, or the file
+		// removed by a redeploy) would be an unhandled 'error' event and crash the
+		// process. `pipeline` destroys both streams instead (the response is cut short).
+		pipeline(createReadStream(path), res, (error) => {
+			// A client that leaves mid-file is routine; anything else is worth a line.
+			if (error && (error as NodeJS.ErrnoException).code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+				console.error(`[kora] Failed to serve ${name}:`, error)
+			}
+		})
 	}
 
 	/**
