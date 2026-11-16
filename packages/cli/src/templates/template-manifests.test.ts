@@ -25,6 +25,23 @@ describe('bundled template manifests', () => {
 		expect(pkg.devDependencies?.tsx ?? pkg.dependencies?.tsx).toBeDefined()
 	})
 
+	test.each(templates)(
+		'%s: pnpm may run the build scripts korajs installs (esbuild, protobufjs)',
+		(template) => {
+			// pnpm 11 fails the install on an unapproved build script; protobufjs (via
+			// @korajs/sync) has a postinstall in every app that depends on korajs.
+			const raw = JSON.parse(
+				readFileSync(join(templatesDir, template, 'package.json.hbs'), 'utf-8').replace(
+					/\{\{\w+\}\}/g,
+					'0.0.0',
+				),
+			) as { pnpm?: { onlyBuiltDependencies?: string[] } }
+			const allowed = raw.pnpm?.onlyBuiltDependencies ?? []
+			expect(allowed).toContain('esbuild')
+			expect(allowed).toContain('protobufjs')
+		},
+	)
+
 	test.each(templates)('%s: @lucide/svelte is pinned to a published range', (template) => {
 		const range = manifest(template).dependencies?.['@lucide/svelte']
 		// @lucide/svelte's first stable release is 0.479.0; ^0.468.0 matches nothing.
