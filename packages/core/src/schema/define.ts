@@ -1,6 +1,5 @@
 import { AccessNotLoadedError, declaresAccess } from '../access/access-slot'
 import type { AccessConfigInput, CollectionAccessInput } from '../access/define-access'
-import { SchemaValidationError } from '../errors/errors'
 import type { MigrationDefinition } from '../migrations/migration-builder'
 import type {
 	CollectionDefinition,

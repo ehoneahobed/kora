@@ -8,8 +8,9 @@ import type { Operation } from '../types'
  * Deterministic tie-breaking via HLC timestamp ensures identical output
  * regardless of input order.
  *
- * @param operations - The operations to sort
- * @returns Operations in causal order (dependencies before dependents)
+ * @param operations - The operations to sort. Operations are content-addressed, so a repeated
+ *   id is the same operation: it appears once in the result.
+ * @returns Operations in causal order (dependencies before dependents), each id once
  * @throws {OperationError} If a cycle is detected in the dependency graph
  */
 export function topologicalSort(operations: Operation[]): Operation[] {
@@ -18,14 +19,15 @@ export function topologicalSort(operations: Operation[]): Operation[] {
 	// Build adjacency list and in-degree map
 	const opMap = new Map<string, Operation>()
 	for (const op of operations) {
-		opMap.set(op.id, op)
+		if (!opMap.has(op.id)) opMap.set(op.id, op)
 	}
+	const unique = [...opMap.values()]
 
 	// Only count edges where both ends are in the operation set
 	const inDegree = new Map<string, number>()
 	const dependents = new Map<string, string[]>()
 
-	for (const op of operations) {
+	for (const op of unique) {
 		if (!inDegree.has(op.id)) {
 			inDegree.set(op.id, 0)
 		}
@@ -49,7 +51,7 @@ export function topologicalSort(operations: Operation[]): Operation[] {
 
 	// Initialize min-heap with nodes that have no in-set dependencies
 	const heap = new MinHeap(compareByTimestamp)
-	for (const op of operations) {
+	for (const op of unique) {
 		if ((inDegree.get(op.id) ?? 0) === 0) {
 			heap.push(op)
 		}
@@ -74,9 +76,9 @@ export function topologicalSort(operations: Operation[]): Operation[] {
 		}
 	}
 
-	if (result.length !== operations.length) {
+	if (result.length !== unique.length) {
 		throw new OperationError(
-			`Cycle detected in operation dependency graph. Sorted ${result.length} of ${operations.length} operations.`,
+			`Cycle detected in operation dependency graph. Sorted ${result.length} of ${unique.length} operations.`,
 			{
 				sortedCount: result.length,
 				totalCount: operations.length,

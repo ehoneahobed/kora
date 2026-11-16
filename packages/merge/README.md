@@ -19,7 +19,8 @@ per-field CRDT (the fold in `@korajs/core`), so the result depends only on the s
 not their order or duplicates:
 
 - strings, numbers, booleans, enums, timestamps: the later write wins (hybrid logical clock)
-- arrays: an element set (concurrent additions and removals both apply)
+- arrays: an element multiset merged per occurrence (duplicates are kept; a removal beats a
+  device that merely kept the element)
 - objects: per top-level key
 - rich text: Yjs, character by character
 - `.merge('counter' | 'max' | 'min' | 'append-only' | 'server-authoritative')` and custom

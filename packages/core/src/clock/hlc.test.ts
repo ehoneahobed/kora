@@ -253,7 +253,7 @@ describe('HybridLogicalClock', () => {
 		})
 
 		test('throws on invalid format', () => {
-			expect(() => HybridLogicalClock.deserialize('invalid')).toThrow()
+			expect(() => HybridLogicalClock.deserialize('invalid')).toThrow(InvalidTimestampError)
 		})
 	})
 

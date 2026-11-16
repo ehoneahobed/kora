@@ -1,5 +1,4 @@
 import { KoraError } from '../errors/errors'
-import type { FieldDescriptor } from '../types'
 import type { MigrationStep } from './migration-builder'
 
 /**

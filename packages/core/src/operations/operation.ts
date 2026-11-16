@@ -1,6 +1,6 @@
 import { HybridLogicalClock } from '../clock/hlc'
 import { OperationError } from '../errors/errors'
-import type { HLCTimestamp, Operation, OperationInput } from '../types'
+import type { Operation, OperationInput } from '../types'
 import { canonicalizeOperationBody } from './canonical-body'
 import {
 	DEFAULT_OPERATION_HASH_VERSION,
