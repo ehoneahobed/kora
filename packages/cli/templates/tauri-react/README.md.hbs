@@ -83,7 +83,9 @@ If you want to pre-configure the URL (e.g., for a specific org):
 VITE_SYNC_URL=wss://acme-corp.example.com/kora-sync pnpm build
 ```
 
-### 3. Set up auto-updates
+### 3. Updates for installed apps
+
+Built apps check the update address when they start. When a newer signed version is there, a banner offers it (`src/UpdateBanner.tsx`) and it installs only when the person clicks **Install**. Until you set this up the check finds nothing and the app carries on as it is.
 
 1. Generate signing keys:
    ```bash
@@ -97,14 +99,16 @@ VITE_SYNC_URL=wss://acme-corp.example.com/kora-sync pnpm build
    "endpoints": ["https://github.com/YOUR_ORG/YOUR_REPO/releases/latest/download/latest.json"]
    ```
 
-4. Add `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to your GitHub repo secrets.
+   Apps download `latest.json` and the installers without signing in, so the release must be public. For a private repo, publish them somewhere public and point the endpoint there (or at a route on your server that redirects to it).
+
+4. Add `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to your GitHub repo secrets. The release workflow signs the update files with them (`createUpdaterArtifacts` is turned on only there, so local builds work without the key).
 
 5. Push a version tag to trigger a release:
    ```bash
    git tag v1.0.0 && git push origin v1.0.0
    ```
 
-The GitHub Actions workflow builds for macOS, Windows, and Linux, creating a draft release with all installers.
+The GitHub Actions workflow builds for macOS, Windows, and Linux, creating a draft release with all installers, their signatures and `latest.json`. Publish the release to offer it to installed apps.
 
 ### 4. Distribute installers
 
@@ -116,7 +120,7 @@ Built installers are in `src-tauri/target/release/bundle/`:
 | Windows | `.msi` and `.exe` installer |
 | Linux | `.deb`, `.rpm`, `.AppImage` |
 
-Share these with your users. Installed apps auto-update when you push new releases.
+Share these with your users. Once updates are set up (step 3), installed apps offer each published release and install it when the person agrees.
 
 ## First-Launch Experience
 

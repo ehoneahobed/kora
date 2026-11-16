@@ -13,7 +13,7 @@ import {
 	markSetupComplete,
 	setSyncUrl,
 } from './sync-config'
-import { checkForUpdates } from './updater'
+import { UpdateBanner } from './UpdateBanner'
 
 // The sign-in client is not on the first paint's path: the list renders from the local database.
 const AuthBridge = lazy(() => retryImport(() => import('./AuthBridge')))
@@ -108,16 +108,17 @@ function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppP
 		}),
 	)
 
-	// Start connecting now (the socket opens while the local database does), and check for updates
+	// Start connecting now (the socket opens while the local database does)
 	useEffect(() => {
 		if (syncUrl) {
 			void app.sync?.connect()
 		}
-		checkForUpdates()
 	}, [app, syncUrl])
 
 	return (
 		<KoraProvider app={app}>
+			{/* A newer signed version is offered here, and installed only when the person agrees. */}
+			<UpdateBanner />
 			<App syncUrl={syncUrl} onChangeServer={onChangeServer} onFactoryReset={onFactoryReset} />
 			<AuthBoundary>
 				<Suspense fallback={null}>

@@ -104,4 +104,6 @@ jobs:
           releaseBody: 'See the assets below to download and install.'
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          # Signed update files and latest.json are made only here, where the signing key is.
+          includeUpdaterJson: true
+          args: ${{ matrix.args }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
