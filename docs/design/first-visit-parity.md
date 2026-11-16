@@ -94,6 +94,7 @@ known way to remove it. Freezing the limit keeps it from growing while that work
 |---|---|
 | `P9_ALLOWANCE_KIB` | The bytes before first data are spread over about a dozen small modules. Nothing that keeps a synchronous public contract closes the remaining gap. |
 | `cpuAllowanceMs`, `k2LimitMs` (4x only) | At 4x CPU the staged first sync leaves a burst of 55 to 105 ms main-thread tasks: worker round trips of the fold, message clone and decode. Closed by fewer worker calls per batch, or by moving the fold off the main thread (blocked while app resolvers and transforms run in the page). |
+| `WARM_FIRST_DATA_ALLOWANCE_MS` (warm P2, P3) | A returning device renders from its own database and never reads through, because a server answer would miss its unsent writes, so its first data waits for SQLite WASM to load and the local database to open. Closed by first data that does not wait for the store, such as a local snapshot of the first screen's answers. |
 | `WARM_NAVIGATION_BOOT_ALLOWANCE_MS` | On a warm `4g` visit the runtime boots at about the time first data arrives, so the first navigation measures part of start-up. |
 | `K1_TARGET_MS`, `k1TargetMs` | Staged replication spends several seconds of JavaScript applying the stream and a few more merging it. |
 | `K3_BUDGET_BYTES` (parity app; the template's budget and margin are in `scripts/bench/bundle-budget.mjs`) | The floor is what the first screen needs: schema builders, the `korajs` shell, the deferred query and write queue, and the store and React lite entries. There is no lower target. |
@@ -365,6 +366,8 @@ record an earlier merge made live replays through the deduplicating apply path.
 - Browser: the parity benchmark and the offline e2e suite.
 
 ## 13. Known limits
+
+- **Warm first data waits for the local store.** A returning device shows its first screen only after SQLite WASM loads and the database opens, about 150 to 250 ms after the baseline's first fetch on a shared runner. `WARM_FIRST_DATA_ALLOWANCE_MS` holds the measured level until a local snapshot of first-screen answers (or an equivalent) removes the wait.
 
 - **Client read-through is opt-in and pre-ready only.** After the store opens, a query on data not
   yet replicated renders from the store and waits for replication. Post-open read-through,
