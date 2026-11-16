@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { defineCommand } from 'citty'
 import { ProjectExistsError } from '../../errors'
 import { PreferenceStore } from '../../prompts/preferences'
