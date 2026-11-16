@@ -68,36 +68,6 @@ export async function findSchemaFile(projectRoot: string): Promise<string | null
 }
 
 /**
- * Resolves a binary from a project's local node_modules/.bin directory.
- * On Windows, npm creates .cmd shims instead of extensionless files.
- *
- * @param projectRoot - The project root directory
- * @param binaryName - Binary filename (for example: vite, tsx, kora)
- * @returns Absolute path to the binary, or null if not found
- */
-export async function resolveProjectBinary(
-	projectRoot: string,
-	binaryName: string,
-): Promise<string | null> {
-	const binDir = join(projectRoot, 'node_modules', '.bin')
-	// On Windows, try .cmd first (npm/pnpm create .cmd shims)
-	const candidates =
-		process.platform === 'win32'
-			? [join(binDir, `${binaryName}.cmd`), join(binDir, binaryName)]
-			: [join(binDir, binaryName)]
-
-	for (const candidate of candidates) {
-		try {
-			await access(candidate)
-			return candidate
-		} catch {
-			// continue
-		}
-	}
-	return null
-}
-
-/**
  * Checks whether the `tsx` package is installed in the project's node_modules.
  * Used to determine if we can use `--import tsx` with process.execPath.
  */

@@ -1,10 +1,5 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import {
-	detectPackageManager,
-	getInstallCommand,
-	getRunDevCommand,
-	isPackageManagerAvailable,
-} from './package-manager'
+import { detectPackageManager, getInstallCommand, getRunDevCommand } from './package-manager'
 
 describe('detectPackageManager', () => {
 	const originalEnv = process.env.npm_config_user_agent
@@ -76,12 +71,5 @@ describe('getRunDevCommand', () => {
 
 	test('returns bun dev for bun', () => {
 		expect(getRunDevCommand('bun')).toBe('bun dev')
-	})
-})
-
-describe('isPackageManagerAvailable', () => {
-	test('returns true for an available package manager', () => {
-		// node is always available in test environment, npm should be too
-		expect(isPackageManagerAvailable('npm')).toBe(true)
 	})
 })
