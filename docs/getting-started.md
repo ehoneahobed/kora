@@ -44,7 +44,7 @@ still on the device: nothing here needs a network.
 (`react-tailwind-sync`), with the package manager that ran the command. The CLI installs the
 dependencies for you; pass `--skip-install` to do it yourself. Every web template also ships an
 offline app shell: production builds register a service worker, so the deployed app opens with no
-network (see [Offline Patterns](/guide/offline-patterns#the-app-shell)).
+network (see [Offline Patterns](/guide/offline-patterns#opening-the-app-offline-the-app-shell)).
 
 ## 2. What you got
 

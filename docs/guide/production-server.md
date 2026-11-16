@@ -395,7 +395,7 @@ await request.kora.apply({ collection: 'todos', type: 'update', recordId, data }
 
 This is deliberate: one meaning of `undefined` everywhere (device API, route writes,
 beta.12 clients), so a write means the same thing on every path. Route writes are also
-held to the [value domain](./schema-design.md#value-domain): a value outside it (a
+held to the [value domain](./schema-design.md#the-value-domain): a value outside it (a
 `Date` in a `t.timestamp()` field, a fractional timestamp, a value of an undeclared enum
 member) is refused with `SCHEMA_VALIDATION_ERROR` and nothing is written.
 
