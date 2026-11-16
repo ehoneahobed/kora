@@ -85,6 +85,28 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      # The tag is the version: installed apps only offer a release newer than their own, so it
+      # goes into package.json, tauri.conf.json and Cargo.toml before building. (A manual run uses
+      # the tag typed in; github.ref_name is then the branch.)
+      - name: Set version from tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          node -e '
+            const fs = require("fs")
+            const version = process.env.RELEASE_TAG.replace(/^v/, "")
+            if (!/^\d+\.\d+\.\d+(-\d+)?$/.test(version)) throw new Error(`"${process.env.RELEASE_TAG}" is not a release version (use v1.2.3)`)
+            for (const file of ["package.json", "src-tauri/tauri.conf.json"]) {
+              const json = JSON.parse(fs.readFileSync(file, "utf8"))
+              json.version = version
+              fs.writeFileSync(file, JSON.stringify(json, null, 2) + "\n")
+            }
+            const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8")
+            fs.writeFileSync("src-tauri/Cargo.toml", cargo.replace(/(\[package\][^[]*?\nversion\s*=\s*")[^"]*(")/, `$1${version}$2`))
+            console.log(`Version set to ${version}`)
+          '
+
       - name: Build and release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -99,8 +121,8 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          tagName: ${{ github.ref_name || github.event.inputs.tag }}
-          releaseName: '${{ github.ref_name || github.event.inputs.tag }}'
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: '${{ github.event.inputs.tag || github.ref_name }}'
           releaseBody: 'See the assets below to download and install.'
           releaseDraft: true
           prerelease: false
