@@ -1,5 +1,5 @@
 import { HybridLogicalClock, decodeStoredText, encodeStoredText } from '@korajs/core'
-import type { CollectionDefinition, FieldDescriptor, HLCTimestamp, Operation } from '@korajs/core'
+import type { FieldDescriptor, HLCTimestamp, Operation } from '@korajs/core'
 import type { CollectionRecord, OperationRow, RawCollectionRow } from '../types'
 import { decodeRichtext, encodeRichtext } from './richtext-serializer'
 

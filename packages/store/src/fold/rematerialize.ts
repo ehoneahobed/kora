@@ -8,14 +8,8 @@ import {
 	quoteIdent,
 } from '@korajs/core'
 import { deserializeRecord } from '../serialization/serializer'
-import type { RawCollectionRow, StorageAdapter, Transaction } from '../types'
-import {
-	FOLD_BASE_TABLE,
-	FOLD_SNAPSHOT_TABLE,
-	FOLD_STATE_TABLE,
-	PROVISIONAL_OPS_TABLE,
-	type RecordFolder,
-} from './record-folder'
+import type { RawCollectionRow, StorageAdapter } from '../types'
+import { FOLD_STATE_TABLE, type RecordFolder } from './record-folder'
 
 /**
  * How a database is re-materialized on its first open with the W7 fold:
@@ -218,12 +212,4 @@ function rowVersion(row: RawCollectionRow): HLCTimestamp {
 	}
 	const wall = typeof row._updated_at === 'number' ? row._updated_at : 0
 	return { wallTime: wall, logical: 0, nodeId: '' }
-}
-
-/** Remove every fold state, base, row snapshot and provisional effect (mode switch). */
-export async function clearFoldTables(tx: Transaction): Promise<void> {
-	await tx.execute(`DELETE FROM ${FOLD_STATE_TABLE}`)
-	await tx.execute(`DELETE FROM ${FOLD_BASE_TABLE}`)
-	await tx.execute(`DELETE FROM ${FOLD_SNAPSHOT_TABLE}`)
-	await tx.execute(`DELETE FROM ${PROVISIONAL_OPS_TABLE}`)
 }

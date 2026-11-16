@@ -20,7 +20,6 @@ import {
 	mergeOp,
 	mismatchedFoldFields,
 	quoteIdent,
-	serializeFoldState,
 	toMergeTrace,
 } from '@korajs/core'
 import * as Y from 'yjs'

@@ -107,7 +107,6 @@ import {
 	buildFieldFastForwardUpdateQuery,
 	buildInsertQuery,
 	buildLwwSoftDeleteQuery,
-	buildSoftDeleteQuery,
 } from '../query/sql-builder'
 import { RelationEnforcer } from '../relations/relation-enforcer'
 import { buildReplaySnapshot } from '../replay/replay-to'
