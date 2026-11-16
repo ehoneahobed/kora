@@ -42,8 +42,7 @@ export function UpdateBanner() {
 	}
 
 	return (
-		<div
-			role="status"
+		<output
 			style={{
 				display: 'flex',
 				alignItems: 'center',
@@ -71,6 +70,6 @@ export function UpdateBanner() {
 					</button>
 				</>
 			) : null}
-		</div>
+		</output>
 	)
 }
