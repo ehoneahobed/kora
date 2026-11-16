@@ -140,3 +140,51 @@ describe.each(factories)('passwords on the %s user store', (_name, create) => {
 		}
 	})
 })
+
+describe.each(factories)('email changes on the %s user store', (_name, create) => {
+	test('an update written from an edited copy moves the address', async () => {
+		const { store, close } = await create()
+		try {
+			const { id } = await store.createUser({
+				email: 'old@example.com',
+				passwordHash: 'h1',
+				salt: 's1',
+				name: 'A',
+			})
+			// The admin API edits the record it found, then writes it back.
+			const found = await store.findById(id)
+			if (!found) throw new Error('user should exist')
+			found.email = 'new@example.com'
+			await store.update(found)
+			expect(await store.findByEmail('old@example.com')).toBeNull()
+			expect((await store.findByEmail('new@example.com'))?.id).toBe(id)
+		} finally {
+			await close()
+		}
+	})
+
+	test('an address held by another account is refused', async () => {
+		const { store, close } = await create()
+		try {
+			const a = await store.createUser({
+				email: 'a@example.com',
+				passwordHash: 'h',
+				salt: 's',
+				name: 'A',
+			})
+			const b = await store.createUser({
+				email: 'b@example.com',
+				passwordHash: 'h',
+				salt: 's',
+				name: 'B',
+			})
+			const found = await store.findById(b.id)
+			if (!found) throw new Error('user should exist')
+			await expect(store.update({ ...found, email: 'a@example.com' })).rejects.toThrow()
+			expect((await store.findByEmail('a@example.com'))?.id).toBe(a.id)
+			expect((await store.findByEmail('b@example.com'))?.id).toBe(b.id)
+		} finally {
+			await close()
+		}
+	})
+})
