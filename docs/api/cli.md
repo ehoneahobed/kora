@@ -410,7 +410,7 @@ These commands talk to a running production server's operational endpoints. Toke
 | Command | Description |
 |---------|-------------|
 | `kora status [--url] [--watch] [--token]` | Server status: connections, operations, schema version. `--watch` refreshes live. |
-| `kora logs [--url] [--follow] [--level info\|warn\|error] [--token]` | Streams server events. |
+| `kora logs [--url] [--no-follow] [--level info\|warn\|error] [--token]` | Streams server events (follows by default; `--no-follow` stops after the current ones). |
 | `kora backup create [--url] [--out file.kora] [--token]` | Downloads a backup. |
 | `kora backup restore --file <path> [--url] [--merge] [--token]` | Restores one (replaces data unless `--merge`). |
 | `kora backup info --file <path>` | Shows a backup's manifest. |
@@ -433,7 +433,7 @@ Compacts a local SQLite database's operation log once the server has acknowledge
 ## deploy
 
 ```bash
-kora deploy [--platform fly|railway|aws-ecs|aws-lightsail] [--app <name>] [--region iad] [--prod] [--confirm] [--reset]
+kora deploy [--platform kora-cloud|fly|railway|aws-ecs|aws-lightsail] [--app <name>] [--region iad] [--prod] [--confirm] [--reset]
 kora deploy status
 kora deploy logs
 kora deploy restart
@@ -442,8 +442,8 @@ kora deploy rollback [id]
 
 Generates a Dockerfile, bundles `server.ts`, builds the client with Vite, provisions the app and
 deploys it. `--confirm` is non-interactive (for CI) and fails on missing data. State is kept in
-`.kora/deploy/` (add it to `.gitignore`); `--reset` deletes it. `render`, `docker` and `kora-cloud`
-are listed but not implemented. The project needs a `server.ts` (or `src/server.ts`) and Vite. The
+`.kora/deploy/` (add it to `.gitignore`); `--reset` deletes it. `render` and `docker`
+are listed but not implemented (refused with `DEPLOY_PLATFORM_UNAVAILABLE`). The project needs a `server.ts` (or `src/server.ts`) and Vite. The
 [Deployment guide](/guide/deployment) walks through a first deploy.
 
 | Platform | Requirement |
