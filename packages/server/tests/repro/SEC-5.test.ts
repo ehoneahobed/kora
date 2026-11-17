@@ -109,7 +109,9 @@ describe('SEC-5: side-channel relays bypass auth and scope', () => {
 		const { server, connect, login } = await setup()
 		const bob = await login('bob-token', 'bob-node')
 		const attacker = connect()
-		for (let i = 0; i < 1000; i++) {
+		// The server closes a session that floods messages before its handshake is accepted
+		// (INBOUND_QUEUE_FULL), so the attacker may be cut off before it sends them all.
+		for (let i = 0; i < 1000 && attacker.client.isConnected(); i++) {
 			attacker.client.send({
 				type: 'blob-chunk-request',
 				messageId: `r${i}`,
