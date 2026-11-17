@@ -698,6 +698,8 @@ async function committedPrefix(target: Device, total: number): Promise<number> {
 interface CellResult {
 	problems: string[]
 	hops: number
+	/** Whether the dropper fired (false for the baseline, and for a hop the run never reached). */
+	fired: boolean
 	label: string
 	labels: string[]
 }
@@ -947,6 +949,14 @@ async function runCell(
 	}
 	await localPromise
 	const hops = hopper.count
+	// A run's hop count varies by a few between runs on a busy runner, so the target hop of a
+	// dropper aimed near the end may not exist in this run: the dropper never fired, and the run
+	// is judged as the undisturbed run it was. A dropper that did not fire at a hop the run
+	// reached is an injector fault.
+	const firedDropper: Dropper | null = hopper.fired ? dropper : null
+	if (dropper !== null && !hopper.fired && hops >= targetHop) {
+		problems.push(`the dropper did not fire at hop ${targetHop} although the run reached ${hops}`)
+	}
 	if (observed.staleNarrowing.length > 0) {
 		problems.push(
 			`I8 stale access-narrowing applied after the dropper fired at ${observed.staleNarrowing[0]}`,
@@ -996,10 +1006,10 @@ async function runCell(
 		}
 	}
 	const positionDropping =
-		dropper === 'updateScope' ||
-		dropper === 'registerSubset' ||
-		dropper === 'unsubscribe' ||
-		dropper === 'transportClose'
+		firedDropper === 'updateScope' ||
+		firedDropper === 'registerSubset' ||
+		firedDropper === 'unsubscribe' ||
+		firedDropper === 'transportClose'
 	for (const ack of observed.acks) {
 		if (positionDropping && ack.afterDrop) {
 			problems.push(
@@ -1023,7 +1033,9 @@ async function runCell(
 		engine.staging === null &&
 		engine.state !== 'disconnected' &&
 		engine.state !== 'error' &&
-		(dropper === 'updateScope' || dropper === 'registerSubset' || dropper === 'unsubscribe')
+		(firedDropper === 'updateScope' ||
+			firedDropper === 'registerSubset' ||
+			firedDropper === 'unsubscribe')
 	) {
 		const cached = engine.deliverySignatureWatermarks.get(engine.deliverySignature()) ?? 0
 		if (engine.deliveryWatermark !== cached) {
@@ -1052,7 +1064,7 @@ async function runCell(
 			// may leave the view's watermark below its mark: a durable write of the previous view
 			// queued behind the batch's transaction lands after it, the data is all there, and a
 			// lower watermark only costs a redelivery of rows that are duplicates.
-			if (dropper === 'fullResync' && mark.watermark > persisted) {
+			if (firedDropper === 'fullResync' && mark.watermark > persisted) {
 				problems.push(
 					`I18 offline mark at ${mark.watermark} but the view's watermark is ${persisted} (${JSON.stringify(mark.signature).slice(0, 24)})`,
 				)
@@ -1063,9 +1075,9 @@ async function runCell(
 		}
 	}
 
-	if (dropper === 'destroy') {
+	if (firedDropper === 'destroy') {
 		// A destroyed engine has nothing to redeliver to; its persisted state was checked above.
-		return { problems, hops, label: hopper.firedLabel, labels: hopper.labels }
+		return { problems, hops, fired: hopper.fired, label: hopper.firedLabel, labels: hopper.labels }
 	}
 
 	// ---- the next handshake
@@ -1075,7 +1087,7 @@ async function runCell(
 	await revive()
 	const asked = target.handshakes[target.handshakes.length - 1]
 	const recorded = await target.store.loadDeliveryWatermark(engine.deliverySignature())
-	if (dropper === 'fullResync' && asked !== undefined && asked !== 0) {
+	if (firedDropper === 'fullResync' && asked !== undefined && asked !== 0) {
 		problems.push(`I7 full resync lost: handshake asks ${asked}, not 0`)
 	}
 	if (asked !== undefined && asked > prefix) {
@@ -1087,7 +1099,7 @@ async function runCell(
 
 	// ---- redelivery from the asked position
 	const from = asked ?? 0
-	if (dropper === 'principal' || dropper === 'refreshPrincipal') {
+	if (firedDropper === 'principal' || firedDropper === 'refreshPrincipal') {
 		// Observed at the adapter: a transaction that wrote lesson rows after the user changed and
 		// committed. (The hide of a retraction counts too: it is a write of the old view's rows.)
 		if (observed.committedAfterEffective.length > 0) {
@@ -1219,10 +1231,10 @@ async function runCell(
 			// (position 0 instead of 66 in quarantinedStaged at adapter.transaction:ret).
 			const rebased =
 				field === 'quarantine' &&
-				(dropper === 'fullResync' ||
-					dropper === 'unsubscribe' ||
-					dropper === 'updateScope' ||
-					dropper === 'registerSubset')
+				(firedDropper === 'fullResync' ||
+					firedDropper === 'unsubscribe' ||
+					firedDropper === 'updateScope' ||
+					firedDropper === 'registerSubset')
 			const view = (device: DeviceState): string =>
 				JSON.stringify(device[field], (key, value: unknown) => {
 					if (!rebased || key !== 'position') return value
@@ -1259,7 +1271,7 @@ async function runCell(
 			}),
 		)
 	}
-	return { problems, hops, label: hopper.firedLabel, labels: hopper.labels }
+	return { problems, hops, fired: hopper.fired, label: hopper.firedLabel, labels: hopper.labels }
 }
 
 /** `position` against each retraction marker (by record): -1 before, 0 at, 1 after, null unknown. */
@@ -1464,7 +1476,7 @@ async function runReplayCell(
 				)
 			}
 		}
-		return { problems, hops, label: hopper.firedLabel, labels: hopper.labels }
+		return { problems, hops, fired: hopper.fired, label: hopper.firedLabel, labels: hopper.labels }
 	} finally {
 		clock.mockRestore()
 	}
@@ -1544,6 +1556,7 @@ describe('the delivery position survives every dropper at every await (hop-level
 							result = {
 								problems: [`THROW ${String(error).slice(0, 150)}`],
 								hops: 0,
+								fired: false,
 								label: '?',
 								labels: [],
 							}
@@ -1609,6 +1622,7 @@ describe('a quarantine replay survives every dropper at every await (replay as t
 							result = {
 								problems: [`THROW ${String(error).slice(0, 150)}`],
 								hops: 0,
+								fired: false,
 								label: '?',
 								labels: [],
 							}
