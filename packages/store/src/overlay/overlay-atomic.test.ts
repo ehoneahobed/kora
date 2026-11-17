@@ -159,7 +159,7 @@ const stepArb: fc.Arbitrary<Step> = fc.oneof(
 			.map(([target, intents]): Step => ({ kind: 'remote', target, intents })),
 	},
 	{ weight: 4, arbitrary: fc.constant<Step>({ kind: 'release' }) },
-	{ weight: 1, arbitrary: fc.constant<Step>({ kind: 'fail' }) },
+	{ weight: 3, arbitrary: fc.constant<Step>({ kind: 'fail' }) },
 	{ weight: 2, arbitrary: fc.constant<Step>({ kind: 'turn' }) },
 )
 
@@ -491,9 +491,9 @@ describe('atomic operations, merge strategies and arrays are predicted (S6b)', (
 		// half of the generated remote array writes no longer count; this still fails a run in
 		// which the generator stopped producing them.
 		expect(counters.remoteArrays - before.remoteArrays).toBeGreaterThan(ran / 40)
-		expect(counters.groupsPredicted - before.groupsPredicted).toBeGreaterThan(0)
-		expect(counters.withRemote - before.withRemote).toBeGreaterThan(0)
-		expect(counters.withFails - before.withFails).toBeGreaterThan(0)
+		expect(counters.groupsPredicted - before.groupsPredicted, 'groupsPredicted').toBeGreaterThan(0)
+		expect(counters.withRemote - before.withRemote, 'withRemote').toBeGreaterThan(0)
+		expect(counters.withFails - before.withFails, 'withFails').toBeGreaterThan(0)
 		expect(counters.soundnessChecked - before.soundnessChecked).toBeGreaterThan(ran / 4)
 	}, 600_000)
 })
