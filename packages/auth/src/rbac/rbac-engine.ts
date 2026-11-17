@@ -5,13 +5,13 @@ import type {
 	RbacConfig,
 	RoleDefinition,
 	ScopeContext,
-	ScopeFilter,
-	SyncScopes,
+	SyncGrant,
 } from './rbac-types'
 import {
 	BUILT_IN_ROLES,
 	CircularInheritanceError,
 	RoleNotFoundError,
+	buildSyncGrant,
 	permissionCovers,
 } from './rbac-types'
 
@@ -127,68 +127,45 @@ export class RbacEngine {
 	}
 
 	/**
-	 * Resolve sync scopes for a user in an organization.
+	 * Resolve the directional sync grant of a user in an organization: per collection, what the
+	 * user may download (`<collection>:read`) and upload (`<collection>:write`), wildcards
+	 * included. With the built-in roles:
+	 * - Owner/Admin/Member: download and upload every collection
+	 * - Viewer: download every collection, upload none
+	 * - Billing: neither
 	 *
-	 * The scopes determine what data the user can see and modify during sync.
-	 * - Owner/Admin: all org data
-	 * - Member: all org data (read + write)
-	 * - Viewer: all org data (read-only)
-	 * - Billing: no data scopes (billing-only access)
+	 * A registered collection resolver replaces the default `{ orgId }` filter for that
+	 * collection in both directions; it never widens what the permissions allow.
 	 *
-	 * Custom collection resolvers can override the defaults.
+	 * @param collections - Collection names to resolve. If not provided, only collections with
+	 *   a registered resolver are included.
+	 * @returns The grant, or null when the user is not a member of the organization
 	 *
-	 * @param collections - List of collection names to resolve scopes for.
-	 *                      If not provided, only custom-registered collections are included.
+	 * @example
+	 * ```typescript
+	 * const auth = createKoraAuthServer({
+	 *   jwtSecret,
+	 *   resolveScopes: async ({ userId }) =>
+	 *     (await rbac.resolveScopes(userId, orgOf(userId), ['todos', 'projects'])) ?? {},
+	 * })
+	 * ```
 	 */
 	async resolveScopes(
 		userId: string,
 		orgId: string,
 		collections?: string[],
-	): Promise<SyncScopes | null> {
+	): Promise<SyncGrant | null> {
 		const membership = await this.orgStore.getMembership(orgId, userId)
 		if (!membership) return null
-
-		const permissions = this.getRolePermissions(membership.role)
 		const ctx: ScopeContext = {
 			userId,
 			orgId,
 			role: membership.role,
-			permissions,
+			permissions: this.getRolePermissions(membership.role),
 		}
-
-		const scopes: SyncScopes = {}
-
-		// Check if user has any data permissions at all
-		const hasAnyRead = permissions.some((p) => permissionCovers(p, '*:read' as Permission))
-		if (!hasAnyRead) {
-			// No data access (e.g., billing-only role)
-			return scopes
-		}
-
-		const isReadOnly = !permissions.some((p) => permissionCovers(p, '*:write' as Permission))
-
-		const collectionsToResolve = collections ?? [...this.collectionResolvers.keys()]
-
-		for (const collection of collectionsToResolve) {
-			// Check custom resolver first
-			const customResolver = this.collectionResolvers.get(collection)
-			if (customResolver) {
-				const customScope = customResolver(ctx)
-				if (customScope) {
-					scopes[collection] = customScope
-				}
-				continue
-			}
-
-			// Default scope: filter by orgId
-			const scope: ScopeFilter = { orgId }
-			if (isReadOnly) {
-				scope.__readonly = true
-			}
-			scopes[collection] = scope
-		}
-
-		return scopes
+		return buildSyncGrant(ctx, collections ?? [...this.collectionResolvers.keys()], (c) =>
+			this.collectionResolvers.get(c),
+		)
 	}
 
 	// --- Role Management ---

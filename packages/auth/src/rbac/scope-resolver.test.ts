@@ -21,16 +21,17 @@ describe('OrgScopeResolver', () => {
 
 			const scopes = await resolver.resolve('user-1', org.id, ['todos', 'projects'])
 			expect(scopes).not.toBeNull()
-			expect(scopes?.todos).toEqual({ orgId: org.id })
-			expect(scopes?.projects).toEqual({ orgId: org.id })
+			expect(scopes?.downlinkScopes.todos).toEqual({ orgId: org.id })
+			expect(scopes?.downlinkScopes.projects).toEqual({ orgId: org.id })
 		})
 
-		test('returns read-only scopes for viewer', async () => {
+		test('viewer downloads but cannot upload', async () => {
 			const org = await store.createOrg('user-1', { name: 'Acme', slug: 'acme' })
 			await store.addMember(org.id, 'user-2', 'viewer', 'user-1')
 
 			const scopes = await resolver.resolve('user-2', org.id, ['todos'])
-			expect(scopes?.todos).toEqual({ orgId: org.id, __readonly: true })
+			expect(scopes?.downlinkScopes.todos).toEqual({ orgId: org.id })
+			expect(scopes?.uplinkScopes).toEqual({})
 		})
 
 		test('returns writable scopes for member', async () => {
@@ -38,8 +39,8 @@ describe('OrgScopeResolver', () => {
 			await store.addMember(org.id, 'user-2', 'member', 'user-1')
 
 			const scopes = await resolver.resolve('user-2', org.id, ['todos'])
-			expect(scopes?.todos).toEqual({ orgId: org.id })
-			expect(scopes?.todos.__readonly).toBeUndefined()
+			expect(scopes?.downlinkScopes.todos).toEqual({ orgId: org.id })
+			expect(scopes?.downlinkScopes.todos.__readonly).toBeUndefined()
 		})
 
 		test('returns null for non-member', async () => {
@@ -52,7 +53,7 @@ describe('OrgScopeResolver', () => {
 			await store.addMember(org.id, 'user-2', 'billing', 'user-1')
 
 			const scopes = await resolver.resolve('user-2', org.id, ['todos'])
-			expect(scopes).toEqual({})
+			expect(scopes).toEqual({ downlinkScopes: {}, uplinkScopes: {} })
 		})
 	})
 
@@ -67,8 +68,8 @@ describe('OrgScopeResolver', () => {
 			}))
 
 			const scopes = await resolver.resolve('user-2', org.id, ['todos', 'projects'])
-			expect(scopes?.todos).toEqual({ orgId: org.id, assignee: 'user-2' })
-			expect(scopes?.projects).toEqual({ orgId: org.id }) // default
+			expect(scopes?.downlinkScopes.todos).toEqual({ orgId: org.id, assignee: 'user-2' })
+			expect(scopes?.downlinkScopes.projects).toEqual({ orgId: org.id }) // default
 		})
 
 		test('custom resolver can exclude collection by returning null', async () => {
@@ -78,7 +79,7 @@ describe('OrgScopeResolver', () => {
 			resolver.registerCollectionScope('audit-log', () => null)
 
 			const scopes = await resolver.resolve('user-2', org.id, ['todos', 'audit-log'])
-			expect(scopes?.todos).toBeDefined()
+			expect(scopes?.downlinkScopes.todos).toBeDefined()
 			expect(scopes?.['audit-log']).toBeUndefined()
 		})
 
@@ -113,10 +114,11 @@ describe('OrgScopeResolver', () => {
 			})
 
 			const memberScopes = await resolver.resolve('user-2', org.id, ['todos'])
-			expect(memberScopes?.todos).toEqual({ orgId: org.id, userId: 'user-2' })
+			expect(memberScopes?.downlinkScopes.todos).toEqual({ orgId: org.id, userId: 'user-2' })
+			expect(memberScopes?.uplinkScopes.todos).toEqual({ orgId: org.id, userId: 'user-2' })
 
 			const adminScopes = await resolver.resolve('user-3', org.id, ['todos'])
-			expect(adminScopes?.todos).toEqual({ orgId: org.id })
+			expect(adminScopes?.downlinkScopes.todos).toEqual({ orgId: org.id })
 		})
 	})
 

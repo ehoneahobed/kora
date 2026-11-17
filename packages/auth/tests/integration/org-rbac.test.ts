@@ -265,11 +265,11 @@ describe('Organization + RBAC integration', () => {
 
 		const scopes = await resolver.resolve(ownerId, org.id, ['todos', 'projects'])
 
-		// Owner should have scopes
-		expect(scopes).not.toBeNull()
-		// Scopes include orgId-based filtering
-		expect(scopes!.todos).toBeDefined()
-		expect(scopes!.projects).toBeDefined()
+		// The owner reads and writes both collections, filtered by its org
+		expect(scopes).toEqual({
+			downlinkScopes: { todos: { orgId: org.id }, projects: { orgId: org.id } },
+			uplinkScopes: { todos: { orgId: org.id }, projects: { orgId: org.id } },
+		})
 	})
 
 	test('OrgScopeResolver returns null for non-member', async () => {

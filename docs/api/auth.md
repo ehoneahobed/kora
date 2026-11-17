@@ -440,7 +440,7 @@ const server = createProductionServer({
 | `emailVerification` | `{ url, send, sendOnSignUp?, tokenTtlMs?, maxPerHour?, store? }`: serves `POST /auth/email/send-verification` and `POST /auth/email/verify` (see [Email Verification](/guide/authentication#email-verification)) | off |
 | `challengeStore` / `rateLimiter` | `ChallengeStore` / `RateLimiter` | in memory |
 | `scopeValues` | `(claims) => values` | none: scoped collections bind `{ userId }` only |
-| `resolveScopes` | `(claims) => ScopeMap` | none |
+| `resolveScopes` | `(claims) => ScopeMap \| SyncGrant` (a `SyncGrant` grants reading and writing separately) | none |
 
 `scopeValues` and `resolveScopes` decide what each sync session may read and write; see
 [Sync scopes](/guide/authentication#sync-scopes).
@@ -608,7 +608,8 @@ an explicit `identity`; invitee listings never include the token.
 
 `RbacEngine(orgStore, { roles? })`: `hasPermission(userId, orgId, permission)`,
 `getUserPermissions`, `getRolePermissions(role)`, `roleHasPermission`, `registerScopeResolver`,
-`resolveScopes(userId, orgId, collections?)`, `getRoleNames`, `getRoleDefinition`. Permissions are
+`resolveScopes(userId, orgId, collections?)` (returns a `SyncGrant`, or `null` for a non-member),
+`getRoleNames`, `getRoleDefinition`. Permissions are
 `resource:action` strings with `*` wildcards. Built-in roles: `viewer` (`*:read`), `billing`
 (`org:billing`), `member` (`*:write`, `*:delete`, inherits viewer), `admin` (member management,
 settings, invitations, inherits member), `owner` (`*:*`).
@@ -616,15 +617,21 @@ settings, invitations, inherits member), `owner` (`*:*`).
 ```typescript
 import { defineRoles } from '@korajs/auth/server'
 
+// Role names are the membership roles: owner, admin, member, viewer, billing
 const roles = defineRoles()
-  .role('viewer', ['*:read'])
-  .role('editor', ['*:write'], { inherits: ['viewer'] })
+  .role('viewer', ['todos:read'])
+  .role('member', ['todos:write'], { inherits: ['viewer'] })
+  .role('admin', ['org:manage-members'], { inherits: ['member'] })
+  .role('owner', ['*:*'])
+  .role('billing', ['org:billing'])
   .build()
 ```
 
-`OrgScopeResolver(orgStore, rbac)` builds per-collection scope filters from membership:
+`OrgScopeResolver(orgStore, rbac)` builds the same `SyncGrant` from membership:
 `registerCollectionScope(collection, (ctx) => filter)`, `resolve(userId, orgId, collections)`,
-`canRead`, `canWrite`. Return its result from `resolveScopes` to grant org-scoped sync.
+`canRead`, `canWrite`. Return its result from `resolveScopes` to grant org-scoped sync: a
+collection the role may read but not write is in `downlinkScopes` only, so the server refuses
+writes to it.
 
 ### OAuth
 
@@ -677,6 +684,7 @@ type OrgRole = 'owner' | 'admin' | 'member' | 'viewer' | 'billing'
 type InvitationStatus = 'pending' | 'accepted' | 'revoked' | 'expired'
 type Permission = `${string}:${string}`  // 'resource:action'
 type SyncScopes = Record<string, ScopeFilter>
+interface SyncGrant { downlinkScopes: SyncScopes; uplinkScopes: SyncScopes }
 interface ScopeContext { userId: string; orgId: string; role: string; permissions: Permission[] }
 type CollectionScopeResolver = (ctx: ScopeContext) => ScopeFilter | null
 ```

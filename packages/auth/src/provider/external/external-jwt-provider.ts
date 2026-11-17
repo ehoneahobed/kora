@@ -1,7 +1,9 @@
 import { KoraError, type ScopeMap, claimScopes } from '@korajs/core'
+import type { SyncGrant } from '../../rbac/rbac-types'
 import { isExpired, verifyJwt } from '../../tokens/jwt'
 import type { AuthTokens } from '../../types'
 import type { AuthProviderAdapter, SignInParams, SignUpParams } from '../adapter'
+import { sessionScopes } from '../built-in/sync-scopes'
 import type { AuthUser } from '../built-in/user-store'
 import type { AuthDevice } from '../built-in/user-store'
 
@@ -179,8 +181,14 @@ export interface ExternalJwtProviderConfig {
 	 */
 	scopeValues?: (claims: Record<string, unknown>) => Record<string, unknown>
 
-	/** Full explicit sync grant from the validated claims (replaces the default). */
-	resolveScopes?: (claims: Record<string, unknown>) => ScopeMap | Promise<ScopeMap>
+	/**
+	 * Full explicit sync grant from the validated claims (replaces the default). Return a
+	 * `SyncGrant` (`{ downlinkScopes, uplinkScopes }`, as `RbacEngine.resolveScopes` does) to
+	 * grant reading and writing separately.
+	 */
+	resolveScopes?: (
+		claims: Record<string, unknown>,
+	) => ScopeMap | SyncGrant | Promise<ScopeMap | SyncGrant>
 }
 
 // ============================================================================
@@ -393,6 +401,8 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 		authenticate(token: string): Promise<{
 			userId: string
 			scopes?: Record<string, Record<string, unknown>>
+			downlinkScopes?: Record<string, Record<string, unknown>>
+			uplinkScopes?: Record<string, Record<string, unknown>>
 			metadata?: Record<string, unknown>
 		} | null>
 	} {
@@ -415,13 +425,13 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 				}
 
 				// Server-derived grant (AUTH-1): never let the client handshake pick.
-				const scopes = this.resolveScopes
+				const grant = this.resolveScopes
 					? await this.resolveScopes(claims)
 					: claimScopes({ ...(this.scopeValues?.(claims) ?? {}), userId: userInfo.userId })
 
 				return {
 					userId: userInfo.userId,
-					scopes,
+					...sessionScopes(grant),
 					metadata: {
 						provider: this.providerName,
 						email: userInfo.email,

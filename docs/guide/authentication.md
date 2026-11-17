@@ -1318,12 +1318,13 @@ import { RbacEngine, defineRoles, OrgScopeResolver } from '@korajs/auth/server'
 // Use built-in roles
 const builtInRbac = new RbacEngine(orgStore)
 
-// Or define custom roles
+// Or redefine what each membership role may do (roles are owner, admin, member, viewer, billing)
 const customRoles = defineRoles()
-  .role('viewer', ['*:read'])
-  .role('editor', ['todos:write', 'projects:write'], { inherits: ['viewer'] })
-  .role('admin', ['org:manage-members', 'org:manage-settings'], { inherits: ['editor'] })
+  .role('viewer', ['todos:read', 'projects:read'])
+  .role('member', ['todos:write'], { inherits: ['viewer'] })
+  .role('admin', ['org:manage-members', 'org:manage-settings'], { inherits: ['member'] })
   .role('owner', ['*:*'])
+  .role('billing', ['org:billing'])
   .build()
 
 const customRbac = new RbacEngine(orgStore, { roles: customRoles })
@@ -1338,9 +1339,41 @@ const canWrite = await rbac.hasPermission(userId, orgId, 'todos:write')
 // Get all permissions for a user in an org
 const perms = await rbac.getUserPermissions(userId, orgId)
 
-// Resolve sync scopes (what data the user can see during sync)
-const scopes = await rbac.resolveScopes(userId, orgId, ['todos', 'projects'])
+// Resolve the sync grant: what the user may download and upload, per collection
+const grant = await rbac.resolveScopes(userId, orgId, ['todos', 'projects'])
+// A viewer: { downlinkScopes: { todos: { orgId }, projects: { orgId } }, uplinkScopes: {} }
 ```
+
+Pass the grant to the sync server through `resolveScopes`. A collection the user may read but
+not write is in `downlinkScopes` only, so the server sends its records and refuses the user's
+writes to it:
+
+<!-- docs-check: standalone -->
+```typescript
+import {
+  InMemoryOrgStore,
+  RbacEngine,
+  createKoraAuthServer,
+  createSqliteUserStore,
+} from '@korajs/auth/server'
+
+declare function orgOf(userId: string): Promise<string>
+
+const userStore = await createSqliteUserStore({ filename: './auth.db' })
+const rbac = new RbacEngine(new InMemoryOrgStore())
+
+export const authServer = createKoraAuthServer({
+  userStore,
+  jwtSecret: process.env.KORA_AUTH_SECRET,
+  resolveScopes: async ({ userId }) =>
+    (await rbac.resolveScopes(userId, await orgOf(userId), ['todos', 'projects'])) ?? {},
+})
+```
+
+A role needs `<collection>:read` to download a collection and `<collection>:write` to upload to
+it; wildcards (`todos:*`, `*:read`, `*:*`) count. A collection resolver registered with
+`rbac.registerScopeResolver(collection, ctx => filter)` replaces the default `{ orgId }` filter
+in both directions, and never widens what the role allows.
 
 Permissions follow the `resource:action` format with wildcard support:
 
