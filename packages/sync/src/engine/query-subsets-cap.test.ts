@@ -8,8 +8,8 @@ import type { SyncStore } from './sync-store'
  * A server refuses a handshake with more than `maxSyncQueries` query views (1,000 by default)
  * and does not retry it. A client that mounts many narrow reactive queries (a long list whose
  * rows each query their own records) must stay under that on its own: past
- * MAX_HANDSHAKE_QUERY_SUBSETS it collapses each collection to the whole collection, which
- * covers every view it had (it syncs more, never less).
+ * MAX_HANDSHAKE_QUERY_SUBSETS it stops restricting the collections with the most views; an
+ * unrestricted collection is synced whole, which covers every view it had (more, never less).
  */
 function store(): SyncStore {
 	return {
@@ -21,7 +21,7 @@ function store(): SyncStore {
 }
 
 describe('query views sent at handshake stay under the server cap', () => {
-	test('many narrow views collapse to collection-wide ones that cover them all', () => {
+	test('many narrow views give way to whole collections that cover them all', () => {
 		const engine = new SyncEngine({
 			transport: createMemoryTransportPair().client,
 			store: store(),
@@ -36,6 +36,41 @@ describe('query views sent at handshake stay under the server cap', () => {
 		const sent = engine.getActiveQuerySubsets()
 		expect(sent.length).toBeLessThanOrEqual(MAX_HANDSHAKE_QUERY_SUBSETS)
 		expect(querySubsetContains(sent, registered)).toBe(true)
+	})
+
+	test('one view in each of more collections than the cap still fits (review RT-116)', () => {
+		const engine = new SyncEngine({
+			transport: createMemoryTransportPair().client,
+			store: store(),
+			config: { url: 'ws://t' },
+		})
+		const registered: SyncQuerySubset[] = []
+		for (let i = 0; i < MAX_HANDSHAKE_QUERY_SUBSETS + 100; i++) {
+			const subset = { collection: `c${i}`, where: { ownerId: 'u1' } }
+			registered.push(subset)
+			engine.seedQuerySubset(subset)
+		}
+		const sent = engine.getActiveQuerySubsets()
+		expect(sent.length).toBeLessThanOrEqual(MAX_HANDSHAKE_QUERY_SUBSETS)
+		expect(querySubsetContains(sent, registered)).toBe(true)
+	})
+
+	test('a mix of crowded and single-view collections fits and covers every view', () => {
+		const engine = new SyncEngine({
+			transport: createMemoryTransportPair().client,
+			store: store(),
+			config: { url: 'ws://t' },
+		})
+		const registered: SyncQuerySubset[] = []
+		for (let i = 0; i < 450; i++) registered.push({ collection: `single${i}`, where: { a: i } })
+		for (let i = 0; i < 300; i++)
+			registered.push({ collection: 'busy', where: { postId: `p${i}` } })
+		for (const subset of registered) engine.seedQuerySubset(subset)
+		const sent = engine.getActiveQuerySubsets()
+		expect(sent.length).toBeLessThanOrEqual(MAX_HANDSHAKE_QUERY_SUBSETS)
+		expect(querySubsetContains(sent, registered)).toBe(true)
+		// The crowded collection gives way first; the single views stay narrow.
+		expect(sent.filter((subset) => subset.collection.startsWith('single'))).toHaveLength(450)
 	})
 
 	test('a list within the cap is sent as it is', () => {
