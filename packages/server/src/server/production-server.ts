@@ -323,6 +323,11 @@ export interface ProductionServer {
 	onOperationsCommitted(handler: OperationsCommittedHandler): () => void
 }
 
+/** How long an oversized body is drained after its 413 before the connection is cut. */
+const TOO_LARGE_DRAIN_MS = 5_000
+/** How much of an oversized body is drained (and discarded) after its 413. */
+const TOO_LARGE_DRAIN_BYTES = 64 * 1024 * 1024
+
 /**
  * Creates a production server that serves both static files and WebSocket sync
  * on a single port, plus built-in dashboard and observability endpoints.
@@ -617,14 +622,36 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 		})
 	}
 
-	/** Answer 413 and drop the connection once the response is written. */
+	/**
+	 * Answer 413, then discard what the client is still sending and close. Destroying the
+	 * socket right after the reply made a client that was still uploading see a reset
+	 * connection instead of the 413 (#150). The rest of the body is read and dropped, never
+	 * buffered, for at most TOO_LARGE_DRAIN_MS and TOO_LARGE_DRAIN_BYTES; past either the
+	 * connection is cut.
+	 */
 	function rejectTooLarge(
 		req: import('node:http').IncomingMessage,
 		res: import('node:http').ServerResponse,
 		limit: number,
 	): void {
-		res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' })
-		res.end(JSON.stringify({ error: 'Payload too large', maxBytes: limit }), () => req.destroy())
+		// No `Connection: close`: Node would close the socket as soon as the reply is
+		// written, with the upload still arriving, and TCP answers unread data with a reset.
+		res.writeHead(413, { 'Content-Type': 'application/json' })
+		res.end(JSON.stringify({ error: 'Payload too large', maxBytes: limit }))
+		let drained = 0
+		const cut = (): void => {
+			clearTimeout(timer)
+			req.destroy()
+		}
+		const timer = setTimeout(cut, TOO_LARGE_DRAIN_MS)
+		timer.unref?.()
+		req.on('data', (chunk: Buffer) => {
+			drained += chunk.byteLength
+			if (drained > TOO_LARGE_DRAIN_BYTES) cut()
+		})
+		req.on('end', () => clearTimeout(timer))
+		req.on('close', () => clearTimeout(timer))
+		req.resume()
 	}
 
 	async function readJsonBody(
