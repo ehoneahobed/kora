@@ -1,6 +1,6 @@
 import { fc, test as propTest } from '@fast-check/vitest'
 import { describe, expect, test } from 'vitest'
-import { type SyncQuerySubset, dedupeQuerySubsets } from './query-subset'
+import { type SyncQuerySubset, dedupeQuerySubsets, querySubsetContains } from './query-subset'
 
 /**
  * dedupeQuerySubsets runs on every handshake, over a list the client sends. It must stay
@@ -79,6 +79,26 @@ function referenceDedupe(subsets: SyncQuerySubset[]): SyncQuerySubset[] {
 	)
 }
 
+/** The original pairwise containment (the specification the fast version must match). */
+function referenceContains(broad: SyncQuerySubset[], narrow: SyncQuerySubset[]): boolean {
+	const collections = new Set([
+		...broad.map((s) => s.collection),
+		...narrow.map((s) => s.collection),
+	])
+	for (const collection of collections) {
+		const b = broad.filter((s) => s.collection === collection)
+		const n = narrow.filter((s) => s.collection === collection)
+		if (n.length === 0) {
+			if (b.length > 0) return false
+			continue
+		}
+		if (b.length === 0) continue
+		if (!n.every((candidate) => b.some((other) => whereContains(other.where, candidate.where))))
+			return false
+	}
+	return true
+}
+
 const valueArb = fc.oneof(
 	fc.constantFrom('a', 'b', 'c'),
 	fc.integer({ min: 0, max: 2 }),
@@ -98,6 +118,55 @@ describe('dedupeQuerySubsets', () => {
 			expect(dedupeQuerySubsets(subsets)).toEqual(referenceDedupe(subsets))
 		},
 	)
+
+	const manyFields = Array.from({ length: 14 }, (_, i) => `f${i}`)
+	const wideWhereArb = fc.dictionary(fc.constantFrom(...manyFields), fc.constantFrom('a', 'b'), {
+		minKeys: 9,
+		maxKeys: 13,
+	})
+	const wideSubsetArb = fc.record({ collection: fc.constant('todos'), where: wideWhereArb })
+	propTest.prop(
+		[
+			fc.array(fc.oneof(wideSubsetArb, subsetArb), { maxLength: 20 }),
+			fc.array(wideWhereArb, { maxLength: 5 }),
+		],
+		{ numRuns: 200 },
+	)('matches the definition for wide wheres too (the scan path)', (subsets, extra) => {
+		// Narrower copies of wide wheres, so containment actually happens.
+		const derived = extra.flatMap((where) => {
+			const keys = Object.keys(where)
+			return [
+				{ collection: 'todos', where },
+				{
+					collection: 'todos',
+					where: Object.fromEntries(keys.slice(0, 2).map((k) => [k, where[k]])),
+				},
+			]
+		})
+		const input = [...subsets, ...derived]
+		expect(dedupeQuerySubsets(input)).toEqual(referenceDedupe(input))
+	})
+
+	propTest.prop([fc.array(subsetArb, { maxLength: 15 }), fc.array(subsetArb, { maxLength: 15 })], {
+		numRuns: 500,
+	})('querySubsetContains gives exactly the result of the pairwise definition', (broad, narrow) => {
+		expect(querySubsetContains(broad, narrow)).toBe(referenceContains(broad, narrow))
+		// A list always contains itself and its own deduplication.
+		expect(querySubsetContains(broad, broad)).toBe(referenceContains(broad, broad))
+		expect(querySubsetContains(dedupeQuerySubsets(broad), broad)).toBe(
+			referenceContains(dedupeQuerySubsets(broad), broad),
+		)
+	})
+
+	test('5,000-entry containment checks are quick', () => {
+		const narrow: SyncQuerySubset[] = Array.from({ length: 5000 }, (_, i) => ({
+			collection: 'todos',
+			where: { owner: `u${i % 50}`, project: `p${i}` },
+		}))
+		const started = performance.now()
+		expect(querySubsetContains(narrow, narrow)).toBe(true)
+		expect(performance.now() - started).toBeLessThan(250)
+	})
 
 	test('5,000 legal entries dedupe quickly (no pairwise blow-up)', () => {
 		const subsets: SyncQuerySubset[] = Array.from({ length: 5000 }, (_, i) => ({
