@@ -5,7 +5,7 @@ import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery } from '../query/sql-builder'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
 import { allocateNextSequenceInTransaction } from '../store/sequence-allocator'
-import type { OperationRow, RawCollectionRow, StorageAdapter } from '../types'
+import type { OperationRow, RawCollectionRow, StorageAdapter, Transaction } from '../types'
 import { rehashOperation } from './rehash-operation'
 import { NODE_TOKEN_META_KEY } from './sync-state'
 
@@ -94,7 +94,16 @@ export async function rotateUnsyncedOperationsInLog(
 	unsyncedOpIds: string[],
 	oldNodeId: string,
 	newNodeId: string,
-	options: { moveDatabaseNode?: boolean; append?: boolean } = {},
+	options: {
+		moveDatabaseNode?: boolean
+		append?: boolean
+		/**
+		 * Runs last in the rewrite's transaction, with the rewritten operations: what must be
+		 * durable with the rewrite (registering the node, binding its user, re-folding the
+		 * records) commits with it.
+		 */
+		inTransaction?: (tx: Transaction, operations: readonly Operation[]) => Promise<void>
+	} = {},
 ): Promise<NodeRotationResult> {
 	const moveDatabaseNode = options.moveDatabaseNode !== false
 	const append = options.append === true
@@ -260,6 +269,7 @@ export async function rotateUnsyncedOperationsInLog(
 		// (another tab) must not reuse its number for different content. The numbers the
 		// rotated operations held become holes in the old node's log, which upload
 		// tracking treats as resolved.
+		await options.inTransaction?.(tx, rewritten)
 	})
 
 	return { nodeId: newNodeId, operations: rewritten, idMapping }

@@ -143,6 +143,7 @@ import {
 	assignLocalNodePrincipal,
 	confirmLocalNodePrincipal,
 	dropLocalNode,
+	ensureLocalSyncRecordTables,
 	findAuthoredHere,
 	findTerminalRejections,
 	forgetLocalNode,
@@ -2551,6 +2552,38 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * A log rewrite's in-transaction step (rebase, rotation, re-author): re-fold the records
+	 * of the rewritten operations in the transaction that rewrites them, so a crash can never
+	 * leave a fold state with the old stamps or ids. `more` runs first in the same
+	 * transaction. `touched` collects the records, for invalidating views after the commit.
+	 */
+	private refoldInRewrite(
+		touched: Map<string, Set<string>>,
+		more?: (tx: Transaction) => Promise<void>,
+	): (tx: Transaction, operations: readonly Operation[]) => Promise<void> {
+		return async (tx, operations) => {
+			await more?.(tx)
+			const fold = this.activeFold()
+			if (!fold) return
+			for (const operation of operations) {
+				const records = touched.get(operation.collection) ?? new Set<string>()
+				records.add(operation.recordId)
+				touched.set(operation.collection, records)
+			}
+			for (const [collection, records] of touched) {
+				for (const recordId of records) await fold.refoldInTx(tx, collection, recordId)
+			}
+		}
+	}
+
+	/** Views over records a rewrite re-folded in its transaction read them again. */
+	private invalidateRefolded(touched: Map<string, Set<string>>): void {
+		for (const [collection, records] of touched) {
+			this.subscriptionManager.invalidate(collection, [...records])
+		}
+	}
+
+	/**
 	 * Re-fold the records of these operations from base + log (W7 exclusion: an
 	 * operation with a terminal-rejection marker is left out).
 	 */
@@ -4020,24 +4053,32 @@ export class Store implements OperationLog {
 		const oldBinding = (await listLocalNodes(this.adapter)).find(
 			(node) => node.nodeId === oldNodeId,
 		)
+		const freshNodeId = generateUUIDv7()
+		const touched = new Map<string, Set<string>>()
+		await ensureLocalSyncRecordTables(this.adapter)
 		const result = await rotateUnsyncedOperationsInLog(
 			this.adapter,
 			this.schema,
 			unsyncedOpIds,
 			oldNodeId,
-			generateUUIDv7(),
+			freshNodeId,
+			{
+				// Registered, bound and re-folded in the rewrite's transaction: the re-authored
+				// operations have new ids that their records' fold states must name, and keep
+				// their author (RT-50), so they are never held as unassigned.
+				inTransaction: this.refoldInRewrite(touched, async (tx) => {
+					await registerLocalNode(tx, freshNodeId)
+					if (oldBinding?.principal) {
+						await setLocalNodePrincipal(
+							tx,
+							freshNodeId,
+							oldBinding.principal,
+							oldBinding.binding ?? 'app',
+						)
+					}
+				}),
+			},
 		)
-		await registerLocalNode(this.adapter, result.nodeId)
-		// The re-authored writes keep their author (RT-50): the fresh node carries the old
-		// node's binding, so they are never held as unassigned or given to another user.
-		if (oldBinding?.principal) {
-			await setLocalNodePrincipal(
-				this.adapter,
-				result.nodeId,
-				oldBinding.principal,
-				oldBinding.binding ?? 'app',
-			)
-		}
 		this.nodeId = result.nodeId
 		const clock = new HybridLogicalClock(this.nodeId)
 		if (oldClock) {
@@ -4055,9 +4096,7 @@ export class Store implements OperationLog {
 		for (const collection of this.collections.values()) {
 			collection.rebindNode(clock, this.nodeId, this.relationEnforcer, this.causalTracker)
 		}
-		// The re-authored operations have new ids: their records' fold states still name
-		// the old ones, so they are re-folded from the log.
-		await this.refoldRecordsOf(result.operations.map((op) => op.id))
+		this.invalidateRefolded(touched)
 		return result
 	}
 
@@ -4091,18 +4130,25 @@ export class Store implements OperationLog {
 				{ nodeId: fromNodeId, storeNodeId: this.nodeId },
 			)
 		}
+		const freshNodeId = generateUUIDv7()
+		const touched = new Map<string, Set<string>>()
+		await ensureLocalSyncRecordTables(this.adapter)
 		const result = await rotateUnsyncedOperationsInLog(
 			this.adapter,
 			this.schema,
 			unsyncedOpIds,
 			fromNodeId,
-			generateUUIDv7(),
-			{ moveDatabaseNode: false },
+			freshNodeId,
+			{
+				moveDatabaseNode: false,
+				inTransaction: this.refoldInRewrite(touched, async (tx) => {
+					await registerLocalNode(tx, freshNodeId)
+					await setLocalNodePrincipal(tx, freshNodeId, principal, 'fresh')
+				}),
+			},
 		)
-		await registerLocalNode(this.adapter, result.nodeId)
-		await setLocalNodePrincipal(this.adapter, result.nodeId, principal, 'fresh')
 		this.versionVector = await this.loadVersionVector()
-		await this.refoldRecordsOf(result.operations.map((op) => op.id))
+		this.invalidateRefolded(touched)
 		return result
 	}
 
@@ -4144,6 +4190,7 @@ export class Store implements OperationLog {
 		const ownPrincipal = nodes.find((node) => node.nodeId === this.nodeId)?.principal ?? null
 		const principal = from.principal ?? null
 		let result: NodeRotationResult
+		const touched = new Map<string, Set<string>>()
 		if (principal !== null && principal === ownPrincipal) {
 			try {
 				result = await rotateUnsyncedOperationsInLog(
@@ -4152,14 +4199,15 @@ export class Store implements OperationLog {
 					operationIds,
 					fromNodeId,
 					this.nodeId,
-					{ moveDatabaseNode: false, append: true },
+					{ moveDatabaseNode: false, append: true, inTransaction: this.refoldInRewrite(touched) },
 				)
 			} catch (error) {
 				if (!(error instanceof KoraError) || error.code !== 'TIMESTAMP_TAKEN') throw error
-				result = await this.reauthorUnderFreshNode(fromNodeId, operationIds, principal)
+				touched.clear()
+				result = await this.reauthorUnderFreshNode(fromNodeId, operationIds, principal, touched)
 			}
 		} else if (principal !== null) {
-			result = await this.reauthorUnderFreshNode(fromNodeId, operationIds, principal)
+			result = await this.reauthorUnderFreshNode(fromNodeId, operationIds, principal, touched)
 		} else {
 			throw new KoraError(
 				`Node id "${fromNodeId}" has no recorded user, so its writes cannot be re-authored for anyone.`,
@@ -4169,7 +4217,7 @@ export class Store implements OperationLog {
 		}
 		this.versionVector = await this.loadVersionVector()
 		this.sequenceNumber = this.versionVector.get(this.nodeId) ?? this.sequenceNumber
-		await this.refoldRecordsOf(result.operations.map((op) => op.id))
+		this.invalidateRefolded(touched)
 		return result
 	}
 
@@ -4177,18 +4225,24 @@ export class Store implements OperationLog {
 		fromNodeId: string,
 		operationIds: string[],
 		principal: string,
+		touched: Map<string, Set<string>>,
 	): Promise<NodeRotationResult> {
-		const result = await rotateUnsyncedOperationsInLog(
+		const freshNodeId = generateUUIDv7()
+		await ensureLocalSyncRecordTables(this.adapter)
+		return rotateUnsyncedOperationsInLog(
 			this.adapter,
 			this.schema,
 			operationIds,
 			fromNodeId,
-			generateUUIDv7(),
-			{ moveDatabaseNode: false },
+			freshNodeId,
+			{
+				moveDatabaseNode: false,
+				inTransaction: this.refoldInRewrite(touched, async (tx) => {
+					await registerLocalNode(tx, freshNodeId)
+					await setLocalNodePrincipal(tx, freshNodeId, principal, 'fresh')
+				}),
+			},
 		)
-		await registerLocalNode(this.adapter, result.nodeId)
-		await setLocalNodePrincipal(this.adapter, result.nodeId, principal, 'fresh')
-		return result
 	}
 
 	/**
@@ -4679,17 +4733,20 @@ export class Store implements OperationLog {
 		correctedNowMs: number,
 	): Promise<ClockRebaseResult> {
 		this.ensureOpen()
+		// Re-stamped operations order differently: their records are re-folded in the
+		// rewrite's transaction, so a crash never leaves the old stamps in a fold state.
+		const touched = new Map<string, Set<string>>()
 		const result = await rebaseUnsyncedOperationsInLog(
 			this.adapter,
 			this.schema,
 			unsyncedOpIds,
 			correctedNowMs,
+			{ inTransaction: this.refoldInRewrite(touched) },
 		)
 		if (result.newMaxTimestamp && this.clock) {
 			this.clock.advanceTo(result.newMaxTimestamp)
 		}
-		// Re-stamped operations order differently: re-fold their records.
-		await this.refoldRecordsOf(result.operations.map((op) => op.id))
+		this.invalidateRefolded(touched)
 		return result
 	}
 
