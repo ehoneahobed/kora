@@ -137,6 +137,7 @@ import {
 	quarantineKey,
 	rebuildFromSnapshot,
 } from './quarantine-base'
+import { orderByClause } from './query-contract'
 import {
 	EMPTY_FOLD_SCHEMA,
 	FOLD_MIGRATION_BATCH,
@@ -5196,10 +5197,19 @@ export class PostgresServerStore implements ServerStore {
 			: sql.raw('*')
 		const parts: SQL[] = [sql`SELECT ${selected} FROM ${source} WHERE ${whereClause}`]
 
-		if (options?.orderBy) {
-			const dir = options.orderDirection === 'desc' ? 'DESC' : 'ASC'
-			parts.push(sql.raw(` ORDER BY ${quoteIdent(options.orderBy)} ${dir}`))
-		}
+		// The query contract (query-contract.ts): nulls last, code point order, id breaks ties.
+		parts.push(
+			sql.raw(
+				orderByClause(
+					'postgres',
+					options?.orderBy,
+					options?.orderDirection,
+					options?.orderBy
+						? this.schema?.collections[collection]?.fields[options.orderBy]
+						: undefined,
+				),
+			),
+		)
 
 		if (options?.limit !== undefined) {
 			parts.push(sql` LIMIT ${options.limit}`)
@@ -5224,11 +5234,22 @@ export class PostgresServerStore implements ServerStore {
 		}
 
 		for (const [key, value] of Object.entries(where)) {
-			// Raw-string columns hold the lossless encoding (RT-65): filter on it too.
-			const kind = collectionDef?.fields[key]?.kind
+			const column = sql.raw(quoteIdent(key))
+			// The query contract (query-contract.ts): null matches a null field.
+			if (value === null || value === undefined) {
+				conditions.push(sql`${column} IS NULL`)
+				continue
+			}
+			// Filter on the value as the column stores it: a boolean as 0/1, raw strings in
+			// their lossless encoding (RT-65).
+			const descriptor = collectionDef?.fields[key]
 			const param =
-				kind && isPgRawTextKind(kind) && typeof value === 'string' ? encodePgText(value) : value
-			conditions.push(sql`${sql.raw(quoteIdent(key))} = ${param}`)
+				descriptor && !isPgJsonbKind(descriptor.kind)
+					? serializePgFieldValue(value, descriptor)
+					: descriptor && isPgRawTextKind(descriptor.kind) && typeof value === 'string'
+						? encodePgText(value)
+						: value
+			conditions.push(sql`${column} = ${param}`)
 		}
 
 		if (conditions.length === 0) {

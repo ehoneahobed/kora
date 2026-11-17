@@ -20,6 +20,11 @@ export type { ReplayOperation }
  */
 export type SqlDialect = 'sqlite' | 'postgres'
 
+/** Whether a field's column is TEXT in `dialect` (text ordering applies to it). */
+export function isTextColumn(descriptor: FieldDescriptor, dialect: SqlDialect): boolean {
+	return fieldTypeToSql(descriptor, dialect) === 'TEXT'
+}
+
 /**
  * Map a Kora field kind to its SQL column type for the given dialect.
  */

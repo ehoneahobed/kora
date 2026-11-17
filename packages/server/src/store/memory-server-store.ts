@@ -56,6 +56,7 @@ import {
 	normalizeFields,
 } from './live-views'
 import { validateFieldName } from './materialization'
+import { compareRecordsForQuery } from './query-contract'
 import {
 	EMPTY_FOLD_SCHEMA,
 	REFOLD_REQUIRED,
@@ -1514,26 +1515,16 @@ export class MemoryServerStore implements ServerStore {
 			return true
 		})
 
-		// Apply WHERE filters
+		// The query contract (query-contract.ts): null matches a null or absent field.
 		if (options?.where) {
 			for (const [key, value] of Object.entries(options.where)) {
-				records = records.filter((r) => r[key] === value)
+				const wanted = value ?? null
+				records = records.filter((r) => (r[key] ?? null) === wanted)
 			}
 		}
 
-		// Apply ORDER BY
-		if (options?.orderBy) {
-			const field = options.orderBy
-			const dir = options.orderDirection === 'desc' ? -1 : 1
-			records.sort((a, b) => {
-				const aVal = a[field]
-				const bVal = b[field]
-				if (aVal === bVal) return 0
-				if (aVal === null || aVal === undefined) return 1
-				if (bVal === null || bVal === undefined) return -1
-				return aVal < bVal ? -1 * dir : 1 * dir
-			})
-		}
+		// Nulls last, code point order, id breaks ties (and is the order when none is given).
+		records.sort((a, b) => compareRecordsForQuery(a, b, options?.orderBy, options?.orderDirection))
 
 		// Apply OFFSET
 		if (options?.offset !== undefined) {
@@ -1613,7 +1604,7 @@ export class MemoryServerStore implements ServerStore {
 			if (where) {
 				let matches = true
 				for (const [key, value] of Object.entries(where)) {
-					if (record[key] !== value) {
+					if ((record[key] ?? null) !== (value ?? null)) {
 						matches = false
 						break
 					}
