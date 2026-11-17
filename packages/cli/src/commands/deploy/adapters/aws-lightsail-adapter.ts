@@ -214,6 +214,15 @@ export class AwsLightsailAdapter implements ContextAwareDeployAdapter {
 				environment[key] = value
 			}
 		}
+		// The name these docs used before: the template servers read KORA_AUTH_SECRET, so a
+		// deploy that set only AUTH_SECRET ran with auth off.
+		const legacySecret = process.env.AUTH_SECRET
+		if (legacySecret && !environment.KORA_AUTH_SECRET) {
+			environment.KORA_AUTH_SECRET = legacySecret
+			this.logger.warn(
+				'AUTH_SECRET is deprecated: forwarded as KORA_AUTH_SECRET, the name the server reads. Set KORA_AUTH_SECRET instead.',
+			)
+		}
 		const containers = JSON.stringify({
 			[serviceName]: {
 				image: lightsailImage,
@@ -467,9 +476,25 @@ export class NodeAwsLightsailCommandRunner implements AwsLightsailCommandRunner 
 }
 
 /**
- * Environment variables automatically forwarded from the host to the Lightsail container.
+ * Environment variables forwarded from the host to the Lightsail container: everything the
+ * template servers read that is not set inside the container (PORT, and the database and
+ * sync paths, which have defaults). The test checks this list against the templates.
  */
-const PASSTHROUGH_ENV_VARS = ['DATABASE_URL', 'AUTH_SECRET', 'PUBLIC_URL', 'NODE_ENV'] as const
+const PASSTHROUGH_ENV_VARS = [
+	'DATABASE_URL',
+	'PUBLIC_URL',
+	'NODE_ENV',
+	'KORA_AUTH_SECRET',
+	'KORA_AUTH_SECRET_PREVIOUS',
+	'KORA_GOOGLE_CLIENT_ID',
+	'KORA_GOOGLE_CLIENT_SECRET',
+	'KORA_GOOGLE_REDIRECT_URI',
+	'KORA_OAUTH_PKCE',
+	'KORA_ADMIN_TOKEN',
+	'KORA_BACKUP_TOKEN',
+	'KORA_METRICS_TOKEN',
+	'KORA_TRUST_PROXY',
+] as const
 
 /**
  * Lightsail service names must be 2-255 chars, lowercase alphanumeric and hyphens only.

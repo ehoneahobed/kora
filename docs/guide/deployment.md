@@ -419,16 +419,23 @@ Kora automatically forwards these environment variables from your machine to the
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DATABASE_URL` | For PostgreSQL | Connection string (e.g., `postgres://user:pass@host/db?sslmode=require`) |
-| `AUTH_SECRET` | For auth | Secret key for signing JWT tokens. Generate with `openssl rand -base64 32` |
+| `KORA_AUTH_SECRET` | For sign-in | Secret that signs session tokens; without it the server runs with sign-in off. Generate with `openssl rand -base64 32` |
+| `KORA_AUTH_SECRET_PREVIOUS` | Optional | The previous secret while you rotate it, so existing sessions stay valid |
+| `KORA_GOOGLE_CLIENT_ID`, `KORA_GOOGLE_CLIENT_SECRET`, `KORA_GOOGLE_REDIRECT_URI`, `KORA_OAUTH_PKCE` | For Google sign-in | OAuth settings the template server reads |
+| `KORA_ADMIN_TOKEN`, `KORA_BACKUP_TOKEN`, `KORA_METRICS_TOKEN` | Optional | Tokens for the operational endpoints |
+| `KORA_TRUST_PROXY` | Optional | Trusted proxy hops in front of the container |
 | `PUBLIC_URL` | Optional | Public URL of your app (for OG meta tags, email links, etc.) |
+| `NODE_ENV` | Optional | Defaults to the image's value |
 
 Set them before deploying:
 
 ```bash
 export DATABASE_URL="postgres://user:pass@ep-xxx.us-east-2.aws.neon.tech/neondb?sslmode=require"
-export AUTH_SECRET="$(openssl rand -base64 32)"
+export KORA_AUTH_SECRET="$(openssl rand -base64 32)"
 kora deploy --platform=aws-lightsail --confirm
 ```
+
+An older `AUTH_SECRET` is still forwarded as `KORA_AUTH_SECRET`, with a warning; rename it.
 
 You can also update environment variables after deployment via the [Lightsail console](https://lightsail.aws.amazon.com/) under your container service's deployment settings.
 
