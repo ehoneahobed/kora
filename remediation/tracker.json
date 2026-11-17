@@ -3500,6 +3500,21 @@
    ],
    "pr": null,
    "notes": "review of PR #4 (core schema/infer.ts InferUpdateField). CONFIRMED: tsc probe kora/tests/repro/types/RT-113.ts had 10 unused @ts-expect-error directives (op.append/op.remove on number and timestamp fields, op.increment/op.max on arrays, wrong item types for string[], enum[] and number[] arrays, an object item missing a property, a pre-built numeric sentinel on an array, the same inside a transaction). FIX (type-only, no runtime change): AtomicOpSentinel<Type, Value> carries the helper's operation and operand (defaults keep the bare AtomicOpSentinel as 'any sentinel' for isAtomicOp/resolveAtomicOp); op.increment/decrement/max/min return AtomicOpSentinel<'increment'|'max'|'min', number>; op.append/op.remove are generic over the item (constraint lists the primitive types so literals stay literal, objects are not made readonly); new public types NumericAtomicOpSentinel and ArrayAtomicOpSentinel<Item>; InferAtomicOp<F> selects numeric helpers for number/timestamp fields and array helpers with the element type for array fields, none elsewhere. Positive cases in the probe (all helpers on their kinds, enum/number/object arrays, pre-built sentinels, transactions) compile; DX-1, DX-2, RT-100 probes, monorepo typecheck and docs:check-code stay green. Unit test: core infer.test.ts (expectTypeOf per helper, update input equality, negatives)."
+  },
+  {
+   "id": "RT-114",
+   "title": "RBAC sync scopes do not work: resolvers add a __readonly pseudo-field the server treats as a record filter (viewers sync nothing, read-only is never enforced on purpose) and '*:read'/'*:write' are checked literally (a todos:read role gets no scope)",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 4,
+   "status": "open",
+   "tests": [
+    {
+     "file": "RT-114.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Audit 2026-11-16, verified on main 40651084. Fix: RbacEngine.resolveScopes / OrgScopeResolver.resolve return a directional grant { downlinkScopes, uplinkScopes } decided per collection from read and write permissions; the auth sync providers pass it to the server as downlinkScopes/uplinkScopes."
   }
  ],
  "rejectedProposalPins": {
