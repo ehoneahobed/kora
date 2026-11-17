@@ -8,6 +8,7 @@ import {
 	type SyncScopeOptions,
 	type VerifiedSyncClaims,
 	resolveSyncGrant,
+	sessionScopes,
 } from './sync-scopes'
 import {
 	type AuthDevice,
@@ -1571,11 +1572,11 @@ export class BuiltInAuthRoutes {
 					email: user.email,
 					name: user.name,
 				}
-				const scopes = await resolveSyncGrant(claims, options)
+				const grant = await resolveSyncGrant(claims, options)
 
 				return {
 					userId: payload.sub,
-					scopes,
+					...sessionScopes(grant),
 					expiresAt: payload.exp * 1000,
 					metadata: {
 						deviceId: payload.dev,

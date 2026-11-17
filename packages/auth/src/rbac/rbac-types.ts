@@ -128,17 +128,14 @@ export interface RbacConfig {
 // ============================================================================
 
 /**
- * A sync scope filter for a single collection.
- * The keys are field names and values are the required values.
- * A special `__readonly` key can be set to restrict to read-only access.
+ * A sync scope filter for a single collection: every key is a record field and its value the
+ * value a record must hold. Read-only access is not a filter key: it is expressed by leaving
+ * the collection out of {@link SyncGrant.uplinkScopes}.
  *
  * @example
  * ```typescript
- * // Only sync todos belonging to the user within the org
+ * // Only todos belonging to the user within the org
  * const scope: ScopeFilter = { orgId: 'org-123', userId: 'user-456' }
- *
- * // Read-only scope for viewers
- * const readOnlyScope: ScopeFilter = { orgId: 'org-123', __readonly: true }
  * ```
  */
 export interface ScopeFilter {
@@ -157,6 +154,69 @@ export interface ScopeFilter {
  * ```
  */
 export type SyncScopes = Record<string, ScopeFilter>
+
+/**
+ * A directional sync grant: the records a member may download and the records it may upload,
+ * per collection. Pass it to the sync server as `downlinkScopes` / `uplinkScopes` (a
+ * `resolveScopes` option of `createKoraAuthServer` or `ExternalJwtProvider` may return it as
+ * is). A collection the member may read but not write is in `downlinkScopes` only.
+ *
+ * @example
+ * ```typescript
+ * // A viewer: reads todos and projects of its org, writes nothing
+ * const grant: SyncGrant = {
+ *   downlinkScopes: { todos: { orgId: 'org-1' }, projects: { orgId: 'org-1' } },
+ *   uplinkScopes: {},
+ * }
+ * ```
+ */
+export interface SyncGrant {
+	/** Records the member may download (it holds `<collection>:read`). */
+	downlinkScopes: SyncScopes
+	/** Records the member may upload (it holds `<collection>:write`). */
+	uplinkScopes: SyncScopes
+}
+
+/**
+ * Whether a set of permissions allows an action on a collection, wildcards included
+ * (`todos:read`, `todos:*`, `*:read` and `*:*` all allow reading todos).
+ */
+export function permissionsAllow(
+	permissions: readonly Permission[],
+	action: string,
+	collection: string,
+): boolean {
+	const required = `${collection}:${action}` as Permission
+	return permissions.some((granted) => permissionCovers(granted, required))
+}
+
+/**
+ * Build the directional grant for a member: each collection's scope (the custom resolver's,
+ * or the org filter) goes to the directions the member's permissions allow.
+ *
+ * @param ctx - The member's context
+ * @param collections - Collections to resolve
+ * @param customScope - The custom resolver for a collection, if any
+ * @returns The grant; a collection the member can neither read nor write is in neither map
+ */
+export function buildSyncGrant(
+	ctx: ScopeContext,
+	collections: readonly string[],
+	customScope: (collection: string) => CollectionScopeResolver | undefined,
+): SyncGrant {
+	const grant: SyncGrant = { downlinkScopes: {}, uplinkScopes: {} }
+	for (const collection of collections) {
+		const canRead = permissionsAllow(ctx.permissions, 'read', collection)
+		const canWrite = permissionsAllow(ctx.permissions, 'write', collection)
+		if (!canRead && !canWrite) continue
+		const resolver = customScope(collection)
+		const scope = resolver ? resolver(ctx) : { orgId: ctx.orgId }
+		if (!scope) continue
+		if (canRead) grant.downlinkScopes[collection] = { ...scope }
+		if (canWrite) grant.uplinkScopes[collection] = { ...scope }
+	}
+	return grant
+}
 
 /**
  * Custom scope resolver for a specific collection.

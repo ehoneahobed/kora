@@ -1,4 +1,5 @@
 import { type ScopeMap, claimScopes } from '@korajs/core'
+import type { SyncGrant } from '../../rbac/rbac-types'
 
 type MaybePromise<T> = T | Promise<T>
 
@@ -36,14 +37,22 @@ export interface SyncScopeOptions {
 	 * Full explicit grant. When provided it replaces the default derivation:
 	 * collections it omits are not visible. Use `claimScopes(values, explicit)`
 	 * from `@korajs/core` to combine claim binding with explicit predicates.
+	 *
+	 * Return a {@link SyncGrant} (`{ downlinkScopes, uplinkScopes }`, as
+	 * `RbacEngine.resolveScopes` does) to grant reading and writing separately: a
+	 * collection in `downlinkScopes` only is read-only for the session.
 	 */
-	resolveScopes?: (claims: VerifiedSyncClaims) => MaybePromise<ScopeMap>
+	resolveScopes?: (claims: VerifiedSyncClaims) => MaybePromise<ScopeMap | SyncGrant>
 }
 
 /** Auth context returned to `@korajs/server` by the sync auth provider. */
 export interface SyncAuthContext {
 	userId: string
 	scopes?: Record<string, Record<string, unknown>>
+	/** Records the session may receive, when reading and writing are granted separately. */
+	downlinkScopes?: Record<string, Record<string, unknown>>
+	/** Records the session may upload, when reading and writing are granted separately. */
+	uplinkScopes?: Record<string, Record<string, unknown>>
 	metadata?: Record<string, unknown>
 	/** Access-token expiry (ms since epoch); a session must not outlive it (AUTH-11). */
 	expiresAt?: number
@@ -74,7 +83,7 @@ export interface SyncAuthProvider {
 export async function resolveSyncGrant(
 	claims: VerifiedSyncClaims,
 	options: SyncScopeOptions,
-): Promise<ScopeMap> {
+): Promise<ScopeMap | SyncGrant> {
 	if (options.resolveScopes) {
 		return options.resolveScopes(claims)
 	}
@@ -82,4 +91,36 @@ export async function resolveSyncGrant(
 	// The verified subject always wins over anything a resolver returns for
 	// `userId`, so a buggy resolver cannot rebind a session to another user.
 	return claimScopes({ ...extra, userId: claims.userId })
+}
+
+/**
+ * Whether a resolved grant is directional (`{ downlinkScopes, uplinkScopes }`) rather than one
+ * scope map for both directions. Both keys must be present, and no others, so a scope map whose
+ * collections happen to be named alike is never mistaken for one.
+ */
+export function isSyncGrant(value: ScopeMap | SyncGrant): value is SyncGrant {
+	const keys = Object.keys(value)
+	return (
+		keys.length === 2 &&
+		'downlinkScopes' in value &&
+		'uplinkScopes' in value &&
+		isPlainObject(value.downlinkScopes) &&
+		isPlainObject(value.uplinkScopes)
+	)
+}
+
+/**
+ * The scope fields of a session's auth context for a resolved grant: `scopes` for one map,
+ * `downlinkScopes` and `uplinkScopes` for a directional grant.
+ */
+export function sessionScopes(
+	grant: ScopeMap | SyncGrant,
+): Pick<SyncAuthContext, 'scopes' | 'downlinkScopes' | 'uplinkScopes'> {
+	return isSyncGrant(grant)
+		? { downlinkScopes: grant.downlinkScopes, uplinkScopes: grant.uplinkScopes }
+		: { scopes: grant }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

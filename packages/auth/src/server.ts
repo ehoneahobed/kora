@@ -226,6 +226,7 @@ export type {
 	RoleDefinition,
 	RbacConfig,
 	SyncScopes,
+	SyncGrant,
 	ScopeFilter,
 	ScopeContext,
 	CollectionScopeResolver,

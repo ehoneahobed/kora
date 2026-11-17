@@ -3507,14 +3507,14 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [
     {
      "file": "RT-114.test.ts"
     }
    ],
    "pr": null,
-   "notes": "Audit 2026-11-16, verified on main 40651084. Fix: RbacEngine.resolveScopes / OrgScopeResolver.resolve return a directional grant { downlinkScopes, uplinkScopes } decided per collection from read and write permissions; the auth sync providers pass it to the server as downlinkScopes/uplinkScopes."
+   "notes": "Audit 2026-11-16, verified on main 40651084. Fix: RbacEngine.resolveScopes / OrgScopeResolver.resolve return a directional grant { downlinkScopes, uplinkScopes } decided per collection from read and write permissions; the auth sync providers pass it to the server as downlinkScopes/uplinkScopes. FIXED: buildSyncGrant (rbac-types.ts) decides each collection's directions from <collection>:read / <collection>:write (wildcards via permissionCovers); custom resolvers replace the { orgId } filter in both directions and never widen; sessionScopes (sync-scopes.ts) maps a SyncGrant to downlinkScopes/uplinkScopes for toSyncAuthProvider and ExternalJwtProvider. Repro: auth/tests/repro/RT-114.test.ts; unit + property: auth/src/rbac/rbac-grant.test.ts. Docs: the custom-role examples use membership role names (editor is not a membership role)."
   }
  ],
  "rejectedProposalPins": {

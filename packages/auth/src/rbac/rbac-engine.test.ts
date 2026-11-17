@@ -200,17 +200,18 @@ describe('RbacEngine', () => {
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos', 'projects'])
 			expect(scopes).not.toBeNull()
-			expect(scopes?.todos).toEqual({ orgId: org.id })
-			expect(scopes?.projects).toEqual({ orgId: org.id })
+			expect(scopes?.downlinkScopes.todos).toEqual({ orgId: org.id })
+			expect(scopes?.downlinkScopes.projects).toEqual({ orgId: org.id })
 		})
 
-		test('viewer gets read-only scopes', async () => {
+		test('viewer downloads but cannot upload', async () => {
 			const org = await store.createOrg('user-1', { name: 'Acme', slug: 'acme' })
 			await store.addMember(org.id, 'user-2', 'viewer', 'user-1')
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos'])
 			expect(scopes).not.toBeNull()
-			expect(scopes?.todos).toEqual({ orgId: org.id, __readonly: true })
+			expect(scopes?.downlinkScopes.todos).toEqual({ orgId: org.id })
+			expect(scopes?.uplinkScopes).toEqual({})
 		})
 
 		test('billing gets empty scopes (no data access)', async () => {
@@ -219,7 +220,7 @@ describe('RbacEngine', () => {
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos'])
 			expect(scopes).not.toBeNull()
-			expect(scopes).toEqual({})
+			expect(scopes).toEqual({ downlinkScopes: {}, uplinkScopes: {} })
 		})
 
 		test('returns null for non-member', async () => {
@@ -238,8 +239,8 @@ describe('RbacEngine', () => {
 			}))
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos', 'projects'])
-			expect(scopes?.todos).toEqual({ orgId: org.id, userId: 'user-2' })
-			expect(scopes?.projects).toEqual({ orgId: org.id }) // default
+			expect(scopes?.downlinkScopes.todos).toEqual({ orgId: org.id, userId: 'user-2' })
+			expect(scopes?.downlinkScopes.projects).toEqual({ orgId: org.id }) // default
 		})
 
 		test('custom resolver returning null excludes the collection', async () => {
@@ -249,8 +250,8 @@ describe('RbacEngine', () => {
 			rbac.registerScopeResolver('secret', () => null)
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos', 'secret'])
-			expect(scopes?.todos).toBeDefined()
-			expect(scopes?.secret).toBeUndefined()
+			expect(scopes?.downlinkScopes.todos).toBeDefined()
+			expect(scopes?.downlinkScopes.secret).toBeUndefined()
 		})
 	})
 
