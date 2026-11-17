@@ -41,6 +41,26 @@ fn json_to_param(value: &JsonValue) -> Box<dyn rusqlite::types::ToSql> {
     }
 }
 
+/// Convert a column value to its JSON transport form.
+fn value_ref_to_json(value: rusqlite::types::ValueRef<'_>) -> JsonValue {
+    match value {
+        rusqlite::types::ValueRef::Null => JsonValue::Null,
+        rusqlite::types::ValueRef::Integer(n) => JsonValue::Number(n.into()),
+        rusqlite::types::ValueRef::Real(f) => match serde_json::Number::from_f64(f) {
+            Some(n) => JsonValue::Number(n),
+            None => JsonValue::Null,
+        },
+        rusqlite::types::ValueRef::Text(s) => {
+            JsonValue::String(String::from_utf8_lossy(s).into_owned())
+        }
+        rusqlite::types::ValueRef::Blob(b) => {
+            // Encode blobs as hex strings for transport
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            JsonValue::String(hex)
+        }
+    }
+}
+
 /// Open a database and execute DDL statements.
 /// Configures WAL mode, foreign keys, and other pragmas.
 #[tauri::command]
@@ -273,21 +293,8 @@ pub fn query(
     let rows = stmt.query_map(param_slice.as_slice(), |row| {
         let mut map = HashMap::new();
         for (i, name) in column_names.iter().enumerate() {
-            let value: JsonValue = match row.get_ref(i) {
-                Ok(rusqlite::types::ValueRef::Null) => JsonValue::Null,
-                Ok(rusqlite::types::ValueRef::Integer(n)) => JsonValue::Number(n.into()),
-                Ok(rusqlite::types::ValueRef::Real(f)) => match serde_json::Number::from_f64(f) {
-                    Some(n) => JsonValue::Number(n),
-                    None => JsonValue::Null,
-                },
-                Ok(rusqlite::types::ValueRef::Text(s)) => {
-                    JsonValue::String(String::from_utf8_lossy(s).into_owned())
-                }
-                Ok(rusqlite::types::ValueRef::Blob(b)) => {
-                    // Encode blobs as hex strings for transport
-                    let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-                    JsonValue::String(hex)
-                }
+            let value = match row.get_ref(i) {
+                Ok(value) => value_ref_to_json(value),
                 Err(_) => JsonValue::Null,
             };
             map.insert(name.clone(), value);
@@ -399,5 +406,58 @@ mod delete_tests {
         // Nothing left: reports that no database existed.
         assert!(!delete_database_files(&db).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod binary_value_tests {
+    use super::{json_to_param, value_ref_to_json};
+    use serde_json::json;
+
+    /// Bind `param` into a fresh table and read the column back as SQLite stored it.
+    fn store(param: serde_json::Value) -> (String, serde_json::Value) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (v)").unwrap();
+        let bound = json_to_param(&param);
+        conn.execute("INSERT INTO t (v) VALUES (?1)", [bound.as_ref()])
+            .unwrap();
+        conn.query_row("SELECT typeof(v), v FROM t", [], |row| {
+            Ok((row.get::<_, String>(0)?, value_ref_to_json(row.get_ref(1)?)))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_tagged_bytes_value_is_stored_as_a_blob_and_read_back_tagged() {
+        // [0, 1, 255] in base64.
+        let (kind, back) = store(json!({ "$koraBytes": "AAH/" }));
+        assert_eq!(kind, "blob");
+        assert_eq!(back, json!({ "$koraBytes": "AAH/" }));
+    }
+
+    #[test]
+    fn every_length_and_byte_value_round_trips() {
+        for len in 0..70usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 % 256) as u8).collect();
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t (v)").unwrap();
+            conn.execute("INSERT INTO t (v) VALUES (?1)", [&bytes])
+                .unwrap();
+            let back = conn
+                .query_row("SELECT v FROM t", [], |row| {
+                    Ok(value_ref_to_json(row.get_ref(0)?))
+                })
+                .unwrap();
+            let (kind, again) = store(back.clone());
+            assert_eq!(kind, "blob", "length {len}");
+            assert_eq!(again, back, "length {len}");
+        }
+    }
+
+    #[test]
+    fn other_objects_are_still_stored_as_json_text() {
+        let (kind, back) = store(json!({ "a": 1 }));
+        assert_eq!(kind, "text");
+        assert_eq!(back, json!("{\"a\":1}"));
     }
 }
