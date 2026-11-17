@@ -267,6 +267,7 @@ describe('Organization + RBAC integration', () => {
 
 		// The owner reads and writes both collections, filtered by its org
 		expect(scopes).toEqual({
+			type: 'sync-grant',
 			downlinkScopes: { todos: { orgId: org.id }, projects: { orgId: org.id } },
 			uplinkScopes: { todos: { orgId: org.id }, projects: { orgId: org.id } },
 		})

@@ -38,6 +38,7 @@ describe('RbacEngine.resolveScopes / OrgScopeResolver.resolve: directional grant
 			await resolver.resolve('user', orgId, ['todos', 'projects']),
 		]) {
 			expect(grant).toEqual({
+				type: 'sync-grant',
 				downlinkScopes: { todos: { orgId }, projects: { orgId } },
 				uplinkScopes: {},
 			})
@@ -47,6 +48,7 @@ describe('RbacEngine.resolveScopes / OrgScopeResolver.resolve: directional grant
 	test('built-in member: downloads and uploads every collection', async () => {
 		const { orgId, rbac, resolver } = await orgWith('member')
 		const expected = {
+			type: 'sync-grant',
 			downlinkScopes: { todos: { orgId }, projects: { orgId } },
 			uplinkScopes: { todos: { orgId }, projects: { orgId } },
 		}
@@ -59,7 +61,11 @@ describe('RbacEngine.resolveScopes / OrgScopeResolver.resolve: directional grant
 			'member',
 			customRoles(['todos:read'], ['todos:write']),
 		)
-		const expected = { downlinkScopes: { todos: { orgId } }, uplinkScopes: { todos: { orgId } } }
+		const expected = {
+			type: 'sync-grant',
+			downlinkScopes: { todos: { orgId } },
+			uplinkScopes: { todos: { orgId } },
+		}
 		expect(await rbac.resolveScopes('user', orgId, ['todos', 'projects'])).toEqual(expected)
 		expect(await resolver.resolve('user', orgId, ['todos', 'projects'])).toEqual(expected)
 	})
@@ -72,7 +78,11 @@ describe('RbacEngine.resolveScopes / OrgScopeResolver.resolve: directional grant
 		})
 		rbac.registerScopeResolver('todos', own)
 		resolver.registerCollectionScope('todos', own)
-		const expected = { downlinkScopes: { todos: { orgId, userId: 'user' } }, uplinkScopes: {} }
+		const expected = {
+			type: 'sync-grant',
+			downlinkScopes: { todos: { orgId, userId: 'user' } },
+			uplinkScopes: {},
+		}
 		expect(await rbac.resolveScopes('user', orgId, ['todos'])).toEqual(expected)
 		expect(await resolver.resolve('user', orgId, ['todos'])).toEqual(expected)
 	})
@@ -81,7 +91,7 @@ describe('RbacEngine.resolveScopes / OrgScopeResolver.resolve: directional grant
 		const { orgs, orgId, rbac, resolver } = await orgWith('viewer')
 		expect(await rbac.resolveScopes('stranger', orgId, ['todos'])).toBeNull()
 		await orgs.addMember(orgId, 'payer', 'billing', 'owner')
-		const empty = { downlinkScopes: {}, uplinkScopes: {} }
+		const empty = { type: 'sync-grant', downlinkScopes: {}, uplinkScopes: {} }
 		expect(await rbac.resolveScopes('payer', orgId, ['todos'])).toEqual(empty)
 		expect(await resolver.resolve('payer', orgId, ['todos'])).toEqual(empty)
 	})

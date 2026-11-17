@@ -1341,7 +1341,7 @@ const perms = await rbac.getUserPermissions(userId, orgId)
 
 // Resolve the sync grant: what the user may download and upload, per collection
 const grant = await rbac.resolveScopes(userId, orgId, ['todos', 'projects'])
-// A viewer: { downlinkScopes: { todos: { orgId }, projects: { orgId } }, uplinkScopes: {} }
+// A viewer: { type: 'sync-grant', downlinkScopes: { todos: { orgId }, projects: { orgId } }, uplinkScopes: {} }
 ```
 
 Pass the grant to the sync server through `resolveScopes`. A collection the user may read but

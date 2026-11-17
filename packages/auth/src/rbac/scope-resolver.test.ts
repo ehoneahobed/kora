@@ -53,7 +53,7 @@ describe('OrgScopeResolver', () => {
 			await store.addMember(org.id, 'user-2', 'billing', 'user-1')
 
 			const scopes = await resolver.resolve('user-2', org.id, ['todos'])
-			expect(scopes).toEqual({ downlinkScopes: {}, uplinkScopes: {} })
+			expect(scopes).toEqual({ type: 'sync-grant', downlinkScopes: {}, uplinkScopes: {} })
 		})
 	})
 

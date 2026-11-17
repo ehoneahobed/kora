@@ -684,7 +684,7 @@ type OrgRole = 'owner' | 'admin' | 'member' | 'viewer' | 'billing'
 type InvitationStatus = 'pending' | 'accepted' | 'revoked' | 'expired'
 type Permission = `${string}:${string}`  // 'resource:action'
 type SyncScopes = Record<string, ScopeFilter>
-interface SyncGrant { downlinkScopes: SyncScopes; uplinkScopes: SyncScopes }
+interface SyncGrant { type: 'sync-grant'; downlinkScopes: SyncScopes; uplinkScopes: SyncScopes }
 interface ScopeContext { userId: string; orgId: string; role: string; permissions: Permission[] }
 type CollectionScopeResolver = (ctx: ScopeContext) => ScopeFilter | null
 ```
