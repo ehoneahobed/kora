@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test } from 'vitest'
 import { createAdapter, detectAdapterType } from './adapter-resolver'
 
 describe('detectAdapterType', () => {
@@ -23,5 +23,27 @@ describe('createAdapter', () => {
 		await expect(createAdapter('unknown' as 'better-sqlite3', ':memory:')).rejects.toThrow(
 			'Unknown adapter type',
 		)
+	})
+})
+
+describe('tauri-sqlite', () => {
+	const key = Symbol.for('korajs.storage.tauri-sqlite')
+	const registry = globalThis as unknown as Record<symbol, unknown>
+	afterEach(() => {
+		delete registry[key]
+	})
+
+	test('uses the adapter @korajs/tauri registered when the app imported it', async () => {
+		class RegisteredAdapter {
+			constructor(readonly options: { path: string }) {}
+		}
+		registry[key] = RegisteredAdapter
+		const adapter = await createAdapter('tauri-sqlite', 'notes')
+		expect(adapter).toBeInstanceOf(RegisteredAdapter)
+		expect((adapter as unknown as RegisteredAdapter).options).toEqual({ path: 'notes.db' })
+	})
+
+	test('without @korajs/tauri, the error says what to add', async () => {
+		await expect(createAdapter('tauri-sqlite', 'notes')).rejects.toThrow("import '@korajs/tauri'")
 	})
 })
