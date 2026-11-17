@@ -49,6 +49,11 @@ export interface TotpSecret {
 	failedAttempts?: number
 	/** While set and in the future, every code check fails without being evaluated. */
 	lockedUntil?: number
+	/**
+	 * Incremented by every write {@link TotpManager} makes; {@link TotpStore.saveIf} compares
+	 * it. `undefined` reads as 0. Store it as is.
+	 */
+	revision?: number
 }
 
 /**
@@ -69,6 +74,16 @@ export interface TotpSetupResult {
 export interface TotpStore {
 	/** Save or update a TOTP secret for a user */
 	save(secret: TotpSecret): Promise<void>
+	/**
+	 * Save `secret` only if the stored one's `revision` (absent: 0) still equals
+	 * `expectedRevision`, atomically (for SQL: `UPDATE ... WHERE user_id = ? AND revision = ?`
+	 * and check the affected row count). Returns whether it saved.
+	 *
+	 * Code checks are serialized per user inside one process. When several server processes
+	 * share the store, only this keeps one code from signing in twice, or two parallel wrong
+	 * guesses from being counted once: implement it for any shared store.
+	 */
+	saveIf?(secret: TotpSecret, expectedRevision: number): Promise<boolean>
 	/** Get a TOTP secret by user ID */
 	getByUserId(userId: string): Promise<TotpSecret | null>
 	/** Delete TOTP secret for a user (disable MFA) */
@@ -142,11 +157,18 @@ export class InMemoryTotpStore implements TotpStore {
 	private readonly secrets = new Map<string, TotpSecret>()
 
 	async save(secret: TotpSecret): Promise<void> {
-		this.secrets.set(secret.userId, secret)
+		this.secrets.set(secret.userId, structuredClone(secret))
+	}
+
+	async saveIf(secret: TotpSecret, expectedRevision: number): Promise<boolean> {
+		if ((this.secrets.get(secret.userId)?.revision ?? 0) !== expectedRevision) return false
+		this.secrets.set(secret.userId, structuredClone(secret))
+		return true
 	}
 
 	async getByUserId(userId: string): Promise<TotpSecret | null> {
-		return this.secrets.get(userId) ?? null
+		const stored = this.secrets.get(userId)
+		return stored ? structuredClone(stored) : null
 	}
 
 	async delete(userId: string): Promise<void> {
@@ -194,6 +216,14 @@ const RECOVERY_CODE_LENGTH = 10
 const FREE_FAILURES = 5
 const LOCK_BASE_MS = 30_000
 const LOCK_MAX_MS = 15 * 60_000
+/** Conditional saves lost to another server before a code check gives up (TOTP_CONFLICT). */
+const MAX_UPDATE_ATTEMPTS = 8
+
+/** What a code check decided: the record to write (null: nothing), then its outcome. */
+interface Decision<T> {
+	write: TotpSecret | null
+	done: () => T
+}
 
 export class TotpManager {
 	private readonly store: TotpStore
@@ -203,6 +233,8 @@ export class TotpManager {
 	private readonly algorithm: 'SHA-1' | 'SHA-256' | 'SHA-512'
 	private readonly window: number
 	private readonly recoveryCodeCount: number
+	/** The tail of each user's queue of code checks in this process. */
+	private readonly userQueues = new Map<string, Promise<unknown>>()
 
 	constructor(config: TotpConfig & { store: TotpStore }) {
 		this.store = config.store
@@ -258,27 +290,27 @@ export class TotpManager {
 	 * Must be called after `enable()` and before MFA is enforced.
 	 */
 	async verifySetup(userId: string, code: string): Promise<boolean> {
-		const stored = await this.store.getByUserId(userId)
-		if (!stored) {
-			throw new TotpNotEnabledError(userId)
-		}
-
-		if (stored.verified) {
-			// Already verified, just validate the code (single-use enforced)
-			return this.consumeCode(stored, code)
-		}
-
-		const valid = await this.consumeCode(stored, code)
-		if (!valid) {
-			throw new TotpInvalidCodeError()
-		}
-
-		// Mark as verified
-		stored.verified = true
-		stored.verifiedAt = Date.now()
-		await this.store.save(stored)
-
-		return true
+		return this.update(userId, async (stored) => {
+			const matched = this.matchFreshTimeStep(stored, code)
+			if (stored.verified) {
+				// Already verified, just validate the code (single-use enforced)
+				if (matched === null) return { write: null, done: () => false }
+				stored.lastUsedTimeStep = matched
+				return { write: stored, done: () => true }
+			}
+			if (matched === null) {
+				return {
+					write: null,
+					done: () => {
+						throw new TotpInvalidCodeError()
+					},
+				}
+			}
+			stored.lastUsedTimeStep = matched
+			stored.verified = true
+			stored.verifiedAt = Date.now()
+			return { write: stored, done: () => true }
+		})
 	}
 
 	/**
@@ -291,19 +323,11 @@ export class TotpManager {
 	 * within the acceptance window (RFC 6238 §5.2).
 	 */
 	async verify(userId: string, code: string): Promise<boolean> {
-		const stored = await this.store.getByUserId(userId)
-		if (!stored) {
-			throw new TotpNotEnabledError(userId)
-		}
-
-		if (!stored.verified) {
-			throw new TotpNotVerifiedError(userId)
-		}
-
-		if (this.isLocked(stored)) {
-			return false
-		}
-		return this.checkTotp(stored, code)
+		return this.update(userId, async (stored) => {
+			if (!stored.verified) throw new TotpNotVerifiedError(userId)
+			if (this.isLocked(stored)) return { write: null, done: () => false }
+			return this.checkTotp(stored, code)
+		})
 	}
 
 	/**
@@ -311,34 +335,21 @@ export class TotpManager {
 	 * Recovery codes are single-use.
 	 */
 	async verifyRecoveryCode(userId: string, recoveryCode: string): Promise<boolean> {
-		const stored = await this.store.getByUserId(userId)
-		if (!stored) {
-			throw new TotpNotEnabledError(userId)
-		}
-
-		if (!stored.verified) {
-			throw new TotpNotVerifiedError(userId)
-		}
-
-		if (this.isLocked(stored)) {
-			return false
-		}
-
 		const hashed = await hashRecoveryCode(recoveryCode.trim())
-
-		const index = stored.recoveryCodes.indexOf(hashed)
-		if (index === -1) {
-			await this.recordFailure(stored)
-			return false
-		}
-
-		// Consume the recovery code (single-use)
-		stored.recoveryCodes.splice(index, 1)
-		stored.failedAttempts = 0
-		stored.lockedUntil = undefined
-		await this.store.save(stored)
-
-		return true
+		return this.update(userId, async (stored) => {
+			if (!stored.verified) throw new TotpNotVerifiedError(userId)
+			if (this.isLocked(stored)) return { write: null, done: () => false }
+			const index = stored.recoveryCodes.indexOf(hashed)
+			if (index === -1) {
+				this.countFailure(stored)
+				return { write: stored, done: () => false }
+			}
+			// Consume the recovery code (single-use)
+			stored.recoveryCodes.splice(index, 1)
+			stored.failedAttempts = 0
+			stored.lockedUntil = undefined
+			return { write: stored, done: () => true }
+		})
 	}
 
 	/**
@@ -346,30 +357,25 @@ export class TotpManager {
 	 * Replaces all existing recovery codes.
 	 */
 	async regenerateRecoveryCodes(userId: string, totpCode: string): Promise<string[]> {
-		const stored = await this.store.getByUserId(userId)
-		if (!stored) {
-			throw new TotpNotEnabledError(userId)
-		}
-
-		if (!stored.verified) {
-			throw new TotpNotVerifiedError(userId)
-		}
-
-		this.assertNotLocked(stored)
-		// consumeCode (not a bare validation): an observed or already-used code
-		// cannot authorize this a second time.
-		const valid = await this.checkTotp(stored, totpCode)
-		if (!valid) {
-			throw new TotpInvalidCodeError()
-		}
-
 		const recoveryCodes = generateRecoveryCodes(this.recoveryCodeCount, RECOVERY_CODE_LENGTH)
 		const hashedCodes = await Promise.all(recoveryCodes.map((c) => hashRecoveryCode(c)))
-
-		stored.recoveryCodes = hashedCodes
-		await this.store.save(stored)
-
-		return recoveryCodes
+		return this.update(userId, async (stored) => {
+			if (!stored.verified) throw new TotpNotVerifiedError(userId)
+			this.assertNotLocked(stored)
+			// A fresh code is consumed (not just validated): an observed or already-used code
+			// cannot authorize this a second time.
+			const checked = this.checkTotp(stored, totpCode)
+			if (checked.write === null || !checked.done()) {
+				return {
+					write: checked.write,
+					done: () => {
+						throw new TotpInvalidCodeError()
+					},
+				}
+			}
+			stored.recoveryCodes = hashedCodes
+			return { write: stored, done: () => recoveryCodes }
+		})
 	}
 
 	/**
@@ -386,30 +392,24 @@ export class TotpManager {
 	 * Requires a valid TOTP code or recovery code for authorization.
 	 */
 	async disable(userId: string, code: string): Promise<void> {
-		const stored = await this.store.getByUserId(userId)
-		if (!stored) {
-			throw new TotpNotEnabledError(userId)
-		}
-
-		this.assertNotLocked(stored)
-
-		// Accept either a fresh (never used) TOTP code or a recovery code
-		let authorized = false
-
-		if (stored.verified) {
-			authorized = this.matchFreshTimeStep(stored, code) !== null
-		}
-
-		if (!authorized) {
-			const hashed = await hashRecoveryCode(code.trim())
-			authorized = stored.recoveryCodes.includes(hashed)
-		}
-
-		if (!authorized) {
-			await this.recordFailure(stored)
-			throw new TotpInvalidCodeError()
-		}
-
+		const hashed = await hashRecoveryCode(code.trim())
+		await this.update(userId, async (stored) => {
+			this.assertNotLocked(stored)
+			// Accept either a fresh (never used) TOTP code or a recovery code
+			const authorized =
+				(stored.verified && this.matchFreshTimeStep(stored, code) !== null) ||
+				stored.recoveryCodes.includes(hashed)
+			if (!authorized) {
+				this.countFailure(stored)
+				return {
+					write: stored,
+					done: () => {
+						throw new TotpInvalidCodeError()
+					},
+				}
+			}
+			return { write: null, done: () => undefined }
+		})
 		await this.store.delete(userId)
 	}
 
@@ -443,34 +443,73 @@ export class TotpManager {
 	}
 
 	/**
-	 * Count a failed code check. After FREE_FAILURES consecutive failures, code
-	 * checks lock for an exponentially growing period (30s, 60s, ... up to 15
-	 * minutes), which bounds online guessing of a 6-digit code (AUTH-10) without
-	 * a permanent lockout an attacker could trigger at will.
+	 * Count a failed code check on `stored` (written by the caller). After FREE_FAILURES
+	 * consecutive failures, code checks lock for an exponentially growing period (30s, 60s, ...
+	 * up to 15 minutes), which bounds online guessing of a 6-digit code (AUTH-10) without a
+	 * permanent lockout an attacker could trigger at will.
 	 */
-	private async recordFailure(stored: TotpSecret): Promise<void> {
+	private countFailure(stored: TotpSecret): void {
 		const failures = (stored.failedAttempts ?? 0) + 1
 		stored.failedAttempts = failures
 		if (failures >= FREE_FAILURES) {
 			const delay = Math.min(LOCK_BASE_MS * 2 ** (failures - FREE_FAILURES), LOCK_MAX_MS)
 			stored.lockedUntil = Date.now() + delay
 		}
-		await this.store.save(stored)
 	}
 
-	/** consumeCode plus failure accounting. */
-	private async checkTotp(stored: TotpSecret, code: string): Promise<boolean> {
-		const ok = await this.consumeCode(stored, code)
-		if (!ok) {
-			await this.recordFailure(stored)
-			return false
+	/** Consume a fresh code's time-step, or count a failure: the decision of a TOTP check. */
+	private checkTotp(stored: TotpSecret, code: string): Decision<boolean> {
+		const matched = this.matchFreshTimeStep(stored, code)
+		if (matched === null) {
+			this.countFailure(stored)
+			return { write: stored, done: () => false }
 		}
-		if (stored.failedAttempts || stored.lockedUntil !== undefined) {
-			stored.failedAttempts = 0
-			stored.lockedUntil = undefined
-			await this.store.save(stored)
+		stored.lastUsedTimeStep = matched
+		stored.failedAttempts = 0
+		stored.lockedUntil = undefined
+		return { write: stored, done: () => true }
+	}
+
+	/**
+	 * Load the user's enrollment, decide, and write the decision, as one step: checks of one
+	 * user run one at a time in this process, and a store with `saveIf` makes the write
+	 * conditional on nothing else having written since the load (another server), retrying
+	 * on a fresh load otherwise. A single-use code is consumed once, and every failure counts.
+	 */
+	private update<T>(
+		userId: string,
+		decide: (stored: TotpSecret) => Promise<Decision<T>>,
+	): Promise<T> {
+		const run = async (): Promise<T> => {
+			for (let attempt = 0; attempt < MAX_UPDATE_ATTEMPTS; attempt++) {
+				const stored = await this.store.getByUserId(userId)
+				if (!stored) throw new TotpNotEnabledError(userId)
+				const base = stored.revision ?? 0
+				const { write, done } = await decide(structuredClone(stored))
+				if (write !== null) {
+					const next = { ...write, revision: base + 1 }
+					if (this.store.saveIf) {
+						if (!(await this.store.saveIf(next, base))) continue
+					} else {
+						await this.store.save(next)
+					}
+				}
+				return done()
+			}
+			throw new TotpError(
+				'The two-factor enrollment kept changing during the check. Try again.',
+				'TOTP_CONFLICT',
+				{ userId },
+			)
 		}
-		return true
+		const previous = this.userQueues.get(userId) ?? Promise.resolve()
+		const result = previous.then(run, run)
+		const tail = result.catch(() => undefined)
+		this.userQueues.set(userId, tail)
+		void tail.then(() => {
+			if (this.userQueues.get(userId) === tail) this.userQueues.delete(userId)
+		})
+		return result
 	}
 
 	/** A matching time-step that has not been consumed yet, or null. */
@@ -500,24 +539,6 @@ export class TotpManager {
 		}
 
 		return null
-	}
-
-	/**
-	 * Validate a code AND consume its time-step so it (and any earlier code in
-	 * the window) cannot be reused. Returns false for an invalid code or a
-	 * replay of an already-consumed time-step. Persists the consumed time-step.
-	 */
-	private async consumeCode(stored: TotpSecret, code: string): Promise<boolean> {
-		// Reject replays: a code whose time-step was already used (or predates
-		// the last consumed time-step) must not authenticate a second time.
-		const matched = this.matchFreshTimeStep(stored, code)
-		if (matched === null) {
-			return false
-		}
-
-		stored.lastUsedTimeStep = matched
-		await this.store.save(stored)
-		return true
 	}
 }
 
