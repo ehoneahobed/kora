@@ -143,7 +143,7 @@ export class OrgClient {
 	 * Get an organization by ID.
 	 */
 	async getOrg(orgId: string): Promise<ClientOrganization> {
-		return this.request<ClientOrganization>(`/orgs/${orgId}`, { method: 'GET' })
+		return this.request<ClientOrganization>(`/orgs/${encodeURIComponent(orgId)}`, { method: 'GET' })
 	}
 
 	/**
@@ -153,7 +153,7 @@ export class OrgClient {
 		orgId: string,
 		params: { name?: string; slug?: string; metadata?: Record<string, unknown> },
 	): Promise<ClientOrganization> {
-		const result = await this.request<ClientOrganization>(`/orgs/${orgId}`, {
+		const result = await this.request<ClientOrganization>(`/orgs/${encodeURIComponent(orgId)}`, {
 			method: 'PATCH',
 			body: params,
 		})
@@ -168,7 +168,7 @@ export class OrgClient {
 	 * Delete an organization.
 	 */
 	async deleteOrg(orgId: string): Promise<void> {
-		await this.request(`/orgs/${orgId}`, { method: 'DELETE' })
+		await this.request(`/orgs/${encodeURIComponent(orgId)}`, { method: 'DELETE' })
 		if (this._activeOrgId === orgId) {
 			this._activeOrgId = null
 			this._activeOrg = null
@@ -184,10 +184,15 @@ export class OrgClient {
 	 * Fetches the org details and the user's membership/role.
 	 */
 	async switchOrg(orgId: string): Promise<void> {
-		const org = await this.request<ClientOrganization>(`/orgs/${orgId}`, { method: 'GET' })
-		const membership = await this.request<ClientMembership>(`/orgs/${orgId}/membership`, {
+		const org = await this.request<ClientOrganization>(`/orgs/${encodeURIComponent(orgId)}`, {
 			method: 'GET',
 		})
+		const membership = await this.request<ClientMembership>(
+			`/orgs/${encodeURIComponent(orgId)}/membership`,
+			{
+				method: 'GET',
+			},
+		)
 
 		this._activeOrgId = orgId
 		this._activeOrg = org
@@ -211,31 +216,38 @@ export class OrgClient {
 	 * List members of an organization.
 	 */
 	async listMembers(orgId: string): Promise<ClientMembership[]> {
-		return this.request<ClientMembership[]>(`/orgs/${orgId}/members`, { method: 'GET' })
+		return this.request<ClientMembership[]>(`/orgs/${encodeURIComponent(orgId)}/members`, {
+			method: 'GET',
+		})
 	}
 
 	/**
 	 * Remove a member from an organization.
 	 */
 	async removeMember(orgId: string, userId: string): Promise<void> {
-		await this.request(`/orgs/${orgId}/members/${userId}`, { method: 'DELETE' })
+		await this.request(`/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}`, {
+			method: 'DELETE',
+		})
 	}
 
 	/**
 	 * Update a member's role.
 	 */
 	async updateMemberRole(orgId: string, userId: string, role: string): Promise<ClientMembership> {
-		return this.request<ClientMembership>(`/orgs/${orgId}/members/${userId}/role`, {
-			method: 'PATCH',
-			body: { role },
-		})
+		return this.request<ClientMembership>(
+			`/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}/role`,
+			{
+				method: 'PATCH',
+				body: { role },
+			},
+		)
 	}
 
 	/**
 	 * Transfer ownership to another member.
 	 */
 	async transferOwnership(orgId: string, newOwnerId: string): Promise<void> {
-		await this.request(`/orgs/${orgId}/transfer`, {
+		await this.request(`/orgs/${encodeURIComponent(orgId)}/transfer`, {
 			method: 'POST',
 			body: { newOwnerId },
 		})
@@ -245,7 +257,7 @@ export class OrgClient {
 	 * Leave an organization (remove yourself).
 	 */
 	async leaveOrg(orgId: string): Promise<void> {
-		await this.request(`/orgs/${orgId}/leave`, { method: 'POST' })
+		await this.request(`/orgs/${encodeURIComponent(orgId)}/leave`, { method: 'POST' })
 		if (this._activeOrgId === orgId) {
 			this._activeOrgId = null
 			this._activeOrg = null
@@ -263,7 +275,7 @@ export class OrgClient {
 		orgId: string,
 		params: { email: string; role: string },
 	): Promise<ClientInvitation> {
-		return this.request<ClientInvitation>(`/orgs/${orgId}/invitations`, {
+		return this.request<ClientInvitation>(`/orgs/${encodeURIComponent(orgId)}/invitations`, {
 			method: 'POST',
 			body: params,
 		})
@@ -283,14 +295,19 @@ export class OrgClient {
 	 * List pending invitations for an organization.
 	 */
 	async listInvitations(orgId: string): Promise<ClientInvitation[]> {
-		return this.request<ClientInvitation[]>(`/orgs/${orgId}/invitations`, { method: 'GET' })
+		return this.request<ClientInvitation[]>(`/orgs/${encodeURIComponent(orgId)}/invitations`, {
+			method: 'GET',
+		})
 	}
 
 	/**
 	 * Revoke a pending invitation.
 	 */
 	async revokeInvitation(orgId: string, invitationId: string): Promise<void> {
-		await this.request(`/orgs/${orgId}/invitations/${invitationId}`, { method: 'DELETE' })
+		await this.request(
+			`/orgs/${encodeURIComponent(orgId)}/invitations/${encodeURIComponent(invitationId)}`,
+			{ method: 'DELETE' },
+		)
 	}
 
 	/**
