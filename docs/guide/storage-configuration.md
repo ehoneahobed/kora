@@ -79,7 +79,7 @@ back. Databases created by earlier releases in the shared pool move into their o
 automatically on first open (`store:storage-migrated`). Many per-user databases on one device no
 longer exhaust a shared pool.
 
-This is the only durable SQLite WASM multi-tab path. OPFS synchronous access handles are available only in dedicated Web Workers, not the main thread or SharedWorker. A SharedWorker-hosted database cannot be durable, so Kora does not offer it as a storage mode. The old `sharedWorkerUrl` option is deprecated and ignored; remove it from app config.
+This is the only durable SQLite WASM multi-tab path. OPFS synchronous access handles are available only in dedicated Web Workers, not the main thread or SharedWorker. A SharedWorker-hosted database cannot be durable, so Kora does not offer it as a storage mode. The old `sharedWorkerUrl` option was removed in 1.0.0-beta.15.
 
 Kora also keeps open tabs reactive on this path. Local operations committed in one tab are announced over a database-scoped same-origin channel, and sibling tabs invalidate only the affected queries. The operation is not re-applied by receivers; the shared local database remains the source of truth. Worker RPC is serialized across complete transaction spans at the leader boundary, and abandoned follower spans are rolled back so closing a tab mid-transaction cannot freeze the database for other tabs. The crash-case idle reclaim defaults to 10s.
 
@@ -226,7 +226,6 @@ In most cases, let Kora auto-detect the adapter. Only override when you have a s
 | `maxOperationBytes` | `number` | 256 KiB | Largest operation a write may produce; set it to the server's value. |
 | `persistence` | `'auto' \| 'manual'` | `'auto'` | When Kora asks the browser for persistent storage. See [Durable Storage](#durable-storage-persist). Never delays `app.ready`. |
 | `workerResponseTimeoutMs` | `number` | `30000` | Longest wait for a worker reply (for example `open`). |
-| `sharedWorkerUrl` | `string \| URL` | | Deprecated and ignored. SharedWorker-hosted SQLite cannot use OPFS SyncAccessHandle and is never durable. |
 
 ---
 
