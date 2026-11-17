@@ -145,7 +145,7 @@ fn value_ref_to_json(value: rusqlite::types::ValueRef<'_>) -> JsonValue {
 
 /// Open a database and execute DDL statements.
 /// Configures WAL mode, foreign keys, and other pragmas.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, DbState>,
@@ -262,7 +262,7 @@ fn data_dir_path<R: Runtime>(app: &AppHandle<R>, path: &str) -> Result<std::path
 }
 
 /// Whether a database is open in this app, and whether its file exists.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn inspect<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, DbState>,
@@ -281,7 +281,7 @@ pub fn inspect<R: Runtime>(
 
 /// Permanently delete a closed database (`app.storage.deleteDatabase`). Refuses while the
 /// database is open: close the app first. Returns whether a database file existed.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, DbState>,
@@ -304,7 +304,7 @@ pub fn delete<R: Runtime>(
 }
 
 /// Close a database connection.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn close(state: State<'_, DbState>, path: String) -> Result<(), Error> {
     let mut connections = state
         .connections
@@ -318,7 +318,7 @@ pub fn close(state: State<'_, DbState>, path: String) -> Result<(), Error> {
 }
 
 /// Execute a write query (INSERT, UPDATE, DELETE, or DDL like BEGIN/COMMIT/ROLLBACK).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn execute(
     state: State<'_, DbState>,
     path: String,
@@ -348,7 +348,7 @@ pub fn execute(
 }
 
 /// Execute a read query (SELECT) and return results as JSON.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn query(
     state: State<'_, DbState>,
     path: String,
@@ -392,7 +392,7 @@ pub fn query(
 }
 
 /// Apply a migration within a transaction.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn migrate(
     state: State<'_, DbState>,
     path: String,
