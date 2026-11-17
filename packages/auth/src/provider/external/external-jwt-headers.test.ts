@@ -18,7 +18,11 @@ function sign(header: Record<string, unknown> | string, claims: Record<string, u
 	return `${head}.${body}.${signature}`
 }
 
-const claims = () => ({ sub: 'user-1', exp: Math.floor(Date.now() / 1000) + 3600 })
+const claims = () => ({
+	sub: 'user-1',
+	aud: 'authenticated',
+	exp: Math.floor(Date.now() / 1000) + 3600,
+})
 const provider = new ExternalJwtProvider({ providerName: 'supabase', jwtSecret: SECRET })
 const accepted = async (token: string) => (await provider.validateAccessToken(token)) !== null
 
