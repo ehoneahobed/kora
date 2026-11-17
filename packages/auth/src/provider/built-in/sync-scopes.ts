@@ -38,7 +38,7 @@ export interface SyncScopeOptions {
 	 * collections it omits are not visible. Use `claimScopes(values, explicit)`
 	 * from `@korajs/core` to combine claim binding with explicit predicates.
 	 *
-	 * Return a {@link SyncGrant} (`{ downlinkScopes, uplinkScopes }`, as
+	 * Return a {@link SyncGrant} (`{ type: 'sync-grant', downlinkScopes, uplinkScopes }`, as
 	 * `RbacEngine.resolveScopes` does) to grant reading and writing separately: a
 	 * collection in `downlinkScopes` only is read-only for the session.
 	 */
@@ -94,18 +94,15 @@ export async function resolveSyncGrant(
 }
 
 /**
- * Whether a resolved grant is directional (`{ downlinkScopes, uplinkScopes }`) rather than one
- * scope map for both directions. Both keys must be present, and no others, so a scope map whose
- * collections happen to be named alike is never mistaken for one.
+ * Whether a resolved grant is directional rather than one scope map for both directions. It is
+ * told by its `type: 'sync-grant'` marker, never by key names: a scope map's values are filter
+ * objects, so no scope map carries that string, whatever its collections are named.
  */
 export function isSyncGrant(value: ScopeMap | SyncGrant): value is SyncGrant {
-	const keys = Object.keys(value)
 	return (
-		keys.length === 2 &&
-		'downlinkScopes' in value &&
-		'uplinkScopes' in value &&
-		isPlainObject(value.downlinkScopes) &&
-		isPlainObject(value.uplinkScopes)
+		(value as { type?: unknown }).type === 'sync-grant' &&
+		isPlainObject((value as SyncGrant).downlinkScopes) &&
+		isPlainObject((value as SyncGrant).uplinkScopes)
 	)
 }
 

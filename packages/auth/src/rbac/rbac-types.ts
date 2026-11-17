@@ -165,12 +165,18 @@ export type SyncScopes = Record<string, ScopeFilter>
  * ```typescript
  * // A viewer: reads todos and projects of its org, writes nothing
  * const grant: SyncGrant = {
+ *   type: 'sync-grant',
  *   downlinkScopes: { todos: { orgId: 'org-1' }, projects: { orgId: 'org-1' } },
  *   uplinkScopes: {},
  * }
  * ```
  */
 export interface SyncGrant {
+	/**
+	 * Marks the object as a directional grant. A scope map's values are filter objects, never
+	 * strings, so the marker tells the two apart whatever the collections are named.
+	 */
+	type: 'sync-grant'
 	/** Records the member may download (it holds `<collection>:read`). */
 	downlinkScopes: SyncScopes
 	/** Records the member may upload (it holds `<collection>:write`). */
@@ -204,7 +210,7 @@ export function buildSyncGrant(
 	collections: readonly string[],
 	customScope: (collection: string) => CollectionScopeResolver | undefined,
 ): SyncGrant {
-	const grant: SyncGrant = { downlinkScopes: {}, uplinkScopes: {} }
+	const grant: SyncGrant = { type: 'sync-grant', downlinkScopes: {}, uplinkScopes: {} }
 	for (const collection of collections) {
 		const canRead = permissionsAllow(ctx.permissions, 'read', collection)
 		const canWrite = permissionsAllow(ctx.permissions, 'write', collection)

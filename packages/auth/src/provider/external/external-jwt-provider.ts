@@ -183,7 +183,7 @@ export interface ExternalJwtProviderConfig {
 
 	/**
 	 * Full explicit sync grant from the validated claims (replaces the default). Return a
-	 * `SyncGrant` (`{ downlinkScopes, uplinkScopes }`, as `RbacEngine.resolveScopes` does) to
+	 * `SyncGrant` (`{ type: 'sync-grant', downlinkScopes, uplinkScopes }`, as `RbacEngine.resolveScopes` does) to
 	 * grant reading and writing separately.
 	 */
 	resolveScopes?: (

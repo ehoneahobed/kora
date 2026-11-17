@@ -220,7 +220,7 @@ describe('RbacEngine', () => {
 
 			const scopes = await rbac.resolveScopes('user-2', org.id, ['todos'])
 			expect(scopes).not.toBeNull()
-			expect(scopes).toEqual({ downlinkScopes: {}, uplinkScopes: {} })
+			expect(scopes).toEqual({ type: 'sync-grant', downlinkScopes: {}, uplinkScopes: {} })
 		})
 
 		test('returns null for non-member', async () => {
