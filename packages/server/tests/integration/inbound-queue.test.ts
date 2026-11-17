@@ -88,7 +88,7 @@ describe('the inbound queue of a session is bounded', () => {
 		}
 		client.send(anonymous as SyncMessage)
 		await vi.waitFor(() => expect(messages.some((m) => m.type === 'handshake-response')).toBe(true))
-		for (let i = 0; i < 1100 && client.isConnected(); i++) {
+		for (let i = 0; i < 10_100 && client.isConnected(); i++) {
 			client.send({
 				type: 'acknowledgment',
 				messageId: `a${i}`,
