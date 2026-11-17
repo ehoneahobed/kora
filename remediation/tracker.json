@@ -3527,6 +3527,18 @@
    "pr": null,
    "acceptanceTest": "packages/server/tests/integration/access-stale-write-leak.test.ts (withhold on expiry and past the cap; a revival converges through a scope entry; the withheld mark survives a reconnect; SQLite and Postgres)",
    "notes": "Owner decision 2026-11-16: withhold and quarantine (option B in PR #79). Never send what the gate cannot prove; remember the record per device durably; when the record is live again, deliver a scope entry with its current state before the next write so the device converges. FIXED: ClientSession.undeterminedTombstone withholds (never sends) on expiry, past the cap and on unholdable streams; withholdWrite records the record per device via ServerStore.markDeliveryWithheld (memory, SQLite, Postgres: kora_server_meta keys delivery_withheld:[node,collection,record]); withheldEntryFor sends the record's current state (scope entry) before the next live write onto it on the stream, relay and delta paths; clearServedWithheld forgets it once the device acknowledges. Event action 'withheld', metric withheldDeliveries."
+  },
+  {
+   "id": "RT-116",
+   "title": "A handshake's syncQueries is neither validated nor capped, and its pairwise dedupe is O(n²): ~8,000 entries stall the whole server for seconds (20,000: about 70 s)",
+   "severity": "P1",
+   "workstream": "W1",
+   "phase": 4,
+   "status": "open",
+   "tests": [],
+   "pr": null,
+   "acceptanceTest": "packages/server/tests/integration/handshake-sync-queries.test.ts (cap and shape refused with clear codes) + packages/sync/src/scopes/query-subset-dedupe.test.ts (equivalence property against the pairwise definition; 5,000 entries dedupe fast)",
+   "notes": "Audit 2026-11-16, measured: 2,000 entries 0.8 s, 8,000 14.6 s, 20,000 70.8 s of synchronous server work."
   }
  ],
  "rejectedProposalPins": {
