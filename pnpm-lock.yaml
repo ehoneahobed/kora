@@ -203,6 +203,9 @@ importers:
       '@korajs/sync':
         specifier: workspace:*
         version: link:../packages/sync
+      '@korajs/tauri':
+        specifier: workspace:*
+        version: link:../packages/tauri
     devDependencies:
       '@korajs/auth':
         specifier: workspace:*

@@ -10,6 +10,32 @@ export function importOptionalPeer<T>(specifier: string): Promise<T> {
 	return dynamicImport(specifier)
 }
 
+type TauriAdapterClass = new (options: { path: string }) => StorageAdapter
+
+/** Where `@korajs/tauri` registers its adapter when the app imports it (see its register.ts). */
+const TAURI_ADAPTER_REGISTRY_KEY = Symbol.for('korajs.storage.tauri-sqlite')
+
+/**
+ * The native SQLite adapter for an app running inside Tauri. A webview cannot resolve a bare
+ * `import('@korajs/tauri')`, so the adapter comes from the app's own import of the package,
+ * which registers it. Outside a bundle (Node), the package is imported directly.
+ */
+async function resolveTauriAdapter(): Promise<TauriAdapterClass> {
+	const registered = (globalThis as unknown as Record<symbol, unknown>)[TAURI_ADAPTER_REGISTRY_KEY]
+	if (typeof registered === 'function') return registered as TauriAdapterClass
+	try {
+		const { TauriSqliteAdapter } = await importOptionalPeer<{
+			TauriSqliteAdapter: TauriAdapterClass
+		}>('@korajs/tauri')
+		return TauriSqliteAdapter
+	} catch (cause) {
+		throw new Error(
+			"Kora detected Tauri, but @korajs/tauri is not loaded. Install it and add import '@korajs/tauri' to your app's entry file (before createApp).",
+			{ cause },
+		)
+	}
+}
+
 /**
  * Detect the best storage adapter for the current environment.
  *
@@ -70,11 +96,7 @@ export async function createAdapter(
 ): Promise<StorageAdapter> {
 	switch (type) {
 		case 'tauri-sqlite': {
-			// @korajs/tauri is only installed in Tauri projects (optional peer dep).
-			// Runtime import via Function so Vite/Rollup do not pre-bundle or resolve the module.
-			const { TauriSqliteAdapter } = await importOptionalPeer<{
-				TauriSqliteAdapter: new (options: { path: string }) => StorageAdapter
-			}>('@korajs/tauri')
+			const TauriSqliteAdapter = await resolveTauriAdapter()
 			return new TauriSqliteAdapter({ path: `${dbName}.db` })
 		}
 		case 'better-sqlite3': {

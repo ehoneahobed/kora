@@ -94,7 +94,7 @@ On the web, Kora runs SQLite compiled to WebAssembly inside a Web Worker. In a T
 - Direct filesystem access via app data directories
 - Faster queries, especially for large datasets
 
-The adapter is auto-detected. When your app runs inside Tauri, `@korajs/tauri`'s `TauriSqliteAdapter` is used automatically, no configuration needed:
+The adapter is auto-detected. When your app runs inside Tauri, `@korajs/tauri`'s `TauriSqliteAdapter` is used automatically. The one requirement is that your entry file imports `@korajs/tauri`, which puts the adapter in the app's bundle (a webview cannot load a package by name). The `tauri-react` template already does this in `src/main.tsx`:
 
 <!-- docs-check-prelude
 import { createApp, defineSchema, t } from 'korajs'
@@ -102,9 +102,13 @@ const schema = defineSchema({ version: 1, collections: { todos: { fields: { titl
 -->
 
 ```typescript
-// Kora detects Tauri and uses native SQLite automatically
+import '@korajs/tauri'
+
+// Kora detects Tauri and uses native SQLite
 const app = createApp({ schema })
 ```
+
+Without the import, `createApp` inside Tauri fails with an error that names it.
 
 ### Same React Code
 
