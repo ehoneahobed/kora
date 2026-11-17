@@ -1,4 +1,4 @@
-import { generateFullDDL } from '@korajs/core'
+import { base64ToBytes, bytesToBase64, generateFullDDL } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
 
 /**
@@ -184,7 +184,11 @@ export class TauriSqliteAdapter implements StorageAdapter {
 
 	private async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		const invokeFn = await this.getInvoke()
-		return invokeFn<T>(`${PLUGIN_PREFIX}${cmd}`, args)
+		// Arguments and results cross the IPC boundary as JSON: bytes travel tagged.
+		const wireArgs =
+			args && Array.isArray(args.params) ? { ...args, params: args.params.map(toWire) } : args
+		const result = await invokeFn<T>(`${PLUGIN_PREFIX}${cmd}`, wireArgs)
+		return (cmd === 'query' && Array.isArray(result) ? result.map(rowFromWire) : result) as T
 	}
 
 	/**
@@ -326,4 +330,36 @@ export class TauriSqliteAdapter implements StorageAdapter {
 			throw new TauriStoreNotOpenError()
 		}
 	}
+}
+
+/**
+ * The JSON form of bytes on the IPC boundary (`{ $koraBytes: base64 }`, the tag Kora uses for
+ * binary values in operations). The plugin binds it as a BLOB and returns BLOB columns in it.
+ */
+const BYTES_TAG = '$koraBytes'
+
+/** A parameter in its IPC form: bytes tagged, everything else unchanged. */
+function toWire(value: unknown): unknown {
+	if (value instanceof Uint8Array) return { [BYTES_TAG]: bytesToBase64(value) }
+	if (value instanceof ArrayBuffer) return { [BYTES_TAG]: bytesToBase64(new Uint8Array(value)) }
+	return value
+}
+
+/** A result row with tagged bytes turned back into Uint8Arrays. */
+function rowFromWire(row: unknown): unknown {
+	if (typeof row !== 'object' || row === null) return row
+	const out: Record<string, unknown> = {}
+	for (const [key, value] of Object.entries(row)) {
+		out[key] = isTaggedBytes(value) ? base64ToBytes(value[BYTES_TAG]) : value
+	}
+	return out
+}
+
+function isTaggedBytes(value: unknown): value is { [BYTES_TAG]: string } {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		Object.keys(value).length === 1 &&
+		typeof (value as Record<string, unknown>)[BYTES_TAG] === 'string'
+	)
 }

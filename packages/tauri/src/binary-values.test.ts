@@ -130,7 +130,10 @@ describe('binary values through the Tauri plugin', () => {
 		await store.open()
 		const note = await store.collection('notes').insert({ title: 'n', body: 'hello rich text' })
 		const read = await store.collection('notes').findById(note.id)
-		expect(read?.body).toBe('hello rich text')
+		// The store returns rich text as its Yjs state (as on every adapter): byte-exact here.
+		expect(read?.body).toBeInstanceOf(Uint8Array)
+		expect(Array.from(read?.body as Uint8Array)).toEqual(Array.from(note.body as Uint8Array))
+		expect((read?.body as Uint8Array).byteLength).toBeGreaterThan(0)
 		await store.close()
 	})
 })
