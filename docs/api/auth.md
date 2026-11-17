@@ -594,6 +594,7 @@ const orgRoutes = new OrgRoutes({ orgStore: new InMemoryOrgStore(), userLookup: 
 |--------|----------|
 | `createOrg(userId, { name, slug?, metadata? })` | any user (becomes owner) |
 | `getOrg(userId, orgId)`, `listMembers(userId, orgId)` | membership |
+| `getMyMembership(userId, orgId)`, `leaveOrg(userId, orgId)` | membership (the owner cannot leave: transfer first) |
 | `updateOrg(userId, orgId, params)` | admin |
 | `deleteOrg(userId, orgId)`, `transferOwnership(userId, orgId, { newOwnerId })` | owner |
 | `listUserOrgs(userId)` | |
@@ -603,6 +604,11 @@ const orgRoutes = new OrgRoutes({ orgStore: new InMemoryOrgStore(), userLookup: 
 
 Invitations are matched to the caller's verified email, from `userLookup` (a `UserStore` works) or
 an explicit `identity`; invitee listings never include the token.
+
+`routeOrgRequest(orgRoutes, { method, path, userId, body })` dispatches a request to the handler
+for every path `OrgClient` calls (`/orgs/...`, `/invitations/...`; segments URL-decoded) and returns
+`null` for any other path; the [authentication guide](/guide/authentication#mounting-the-routes)
+mounts it with one route.
 
 ### RBAC
 

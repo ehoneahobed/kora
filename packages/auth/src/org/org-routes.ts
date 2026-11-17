@@ -318,6 +318,26 @@ export class OrgRoutes {
 	/**
 	 * List all organizations the authenticated user belongs to.
 	 */
+	/**
+	 * The caller's own membership (its role) in an organization: what `OrgClient.switchOrg`
+	 * reads. 404 for a non-member, like {@link getOrg}.
+	 */
+	async getMyMembership(userId: string, orgId: string): Promise<OrgRouteResponse<Membership>> {
+		const membership = await this.store.getMembership(orgId, userId)
+		if (!membership) {
+			return { status: 404, body: { error: 'Organization not found.' } }
+		}
+		return { status: 200, body: { data: membership } }
+	}
+
+	/**
+	 * Leave an organization (remove yourself). The owner cannot leave: transfer ownership
+	 * first (400).
+	 */
+	async leaveOrg(userId: string, orgId: string): Promise<OrgRouteResponse<{ removed: true }>> {
+		return this.removeMember(userId, orgId, userId)
+	}
+
 	async listUserOrgs(userId: string): Promise<OrgRouteResponse<Organization[]>> {
 		const orgs = await this.store.listUserOrgs(userId)
 		return { status: 200, body: { data: orgs } }

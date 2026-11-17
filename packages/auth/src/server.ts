@@ -181,6 +181,8 @@ export type { OperationEncryptorConfig } from './encryption/operation-encryptor'
 
 // === Organizations & Memberships ===
 export { OrgRoutes } from './org/org-routes'
+export { routeOrgRequest } from './org/org-http'
+export type { OrgHttpRequest } from './org/org-http'
 export type { OrgRouteResponse, OrgRoutesConfig } from './org/org-routes'
 export { InMemoryOrgStore } from './org/org-store'
 export type { OrgStore } from './org/org-store'

@@ -566,6 +566,7 @@ declare const app: {
   post(path: string, ...handlers: Handler[]): void
   patch(path: string, ...handlers: Handler[]): void
   delete(path: string, ...handlers: Handler[]): void
+  all(path: string | string[], ...handlers: Handler[]): void
 }
 declare const userStore: UserStore
 declare const orgStore: OrgStore
@@ -675,6 +676,7 @@ declare const app: {
   post(path: string, ...handlers: Handler[]): void
   patch(path: string, ...handlers: Handler[]): void
   delete(path: string, ...handlers: Handler[]): void
+  all(path: string | string[], ...handlers: Handler[]): void
 }
 declare const userStore: UserStore
 declare const orgStore: OrgStore
@@ -844,6 +846,7 @@ declare const app: {
   post(path: string, ...handlers: Handler[]): void
   patch(path: string, ...handlers: Handler[]): void
   delete(path: string, ...handlers: Handler[]): void
+  all(path: string | string[], ...handlers: Handler[]): void
 }
 declare const userStore: UserStore
 declare const orgStore: OrgStore
@@ -1214,99 +1217,39 @@ const orgStore = new InMemoryOrgStore()
 const orgRoutes = new OrgRoutes({ orgStore, userLookup: userStore })
 ```
 
-### Creating Organizations
+### Mounting the Routes
+
+`routeOrgRequest` maps every request `OrgClient` makes to its `OrgRoutes` handler, so one route serves the whole client:
 
 ```typescript
-app.post('/orgs', async (req, res) => {
-  const userId = req.userId // from your auth middleware
-  const result = await orgRoutes.createOrg(userId, {
-    name: req.body.name,
-    slug: req.body.slug,       // optional, auto-generated if omitted
-    metadata: req.body.metadata, // optional
+import { routeOrgRequest } from '@korajs/auth/server'
+
+// OrgClient({ serverUrl: 'https://api.example.com/auth' }) calls /auth/orgs/... and /auth/invitations/...
+app.all(['/auth/orgs*', '/auth/invitations*'], async (req, res) => {
+  const result = await routeOrgRequest(orgRoutes, {
+    method: req.method,
+    path: req.path.slice('/auth'.length), // the path below OrgClient's serverUrl
+    userId: req.userId, // from your auth middleware
+    body: req.body,
   })
+  if (!result) return res.status(404).json({ error: 'Not found.' })
   res.status(result.status).json(result.body)
 })
 ```
 
-The creating user automatically becomes the `owner`.
+| Request | Handler | Who may call it |
+|---------|---------|-----------------|
+| `POST /orgs` (`{ name, slug?, metadata? }`), `GET /orgs` | `createOrg`, `listUserOrgs` | any signed-in user; the creator becomes the `owner` |
+| `GET /orgs/:orgId`, `PATCH /orgs/:orgId`, `DELETE /orgs/:orgId` | `getOrg`, `updateOrg`, `deleteOrg` | member, admin, owner |
+| `GET /orgs/:orgId/membership` | `getMyMembership` (what `switchOrg` reads) | member |
+| `POST /orgs/:orgId/leave` | `leaveOrg` | member (the owner transfers ownership first) |
+| `GET /orgs/:orgId/members`, `POST /orgs/:orgId/members` (`{ userId, role }`) | `listMembers`, `addMember` | member, admin |
+| `PATCH /orgs/:orgId/members/:userId/role` (`{ role }`), `DELETE /orgs/:orgId/members/:userId` | `updateMemberRole`, `removeMember` | admin; only the owner acts on an admin |
+| `POST /orgs/:orgId/transfer` (`{ newOwnerId }`) | `transferOwnership` | owner |
+| `GET /orgs/:orgId/invitations`, `POST /orgs/:orgId/invitations` (`{ email, role }`), `DELETE /orgs/:orgId/invitations/:invitationId` | `listPendingInvitations`, `createInvitation`, `revokeInvitation` | admin |
+| `GET /invitations`, `POST /invitations/accept` (`{ token }`) | `listMyInvitations`, `acceptInvitation` | the invitee (matched on their verified email) |
 
-### Managing Members
-
-```typescript
-// List members (requires membership in the org)
-app.get('/orgs/:orgId/members', async (req, res) => {
-  const result = await orgRoutes.listMembers(req.userId, req.params.orgId)
-  res.status(result.status).json(result.body)
-})
-
-// Add a member (requires admin or higher)
-app.post('/orgs/:orgId/members', async (req, res) => {
-  const result = await orgRoutes.addMember(req.userId, req.params.orgId, {
-    targetUserId: req.body.userId,
-    role: req.body.role,  // 'admin', 'member', 'viewer', or 'billing'
-  })
-  res.status(result.status).json(result.body)
-})
-
-// Update a member's role (requires admin or higher; only the owner changes an admin's role)
-app.patch('/orgs/:orgId/members/role', async (req, res) => {
-  const result = await orgRoutes.updateMemberRole(req.userId, req.params.orgId, {
-    targetUserId: req.body.userId,
-    role: req.body.role,
-  })
-  res.status(result.status).json(result.body)
-})
-
-// Remove a member (requires admin, or self-removal for any member; only the owner removes an admin)
-app.delete('/orgs/:orgId/members/:userId', async (req, res) => {
-  const result = await orgRoutes.removeMember(req.userId, req.params.orgId, req.params.userId)
-  res.status(result.status).json(result.body)
-})
-
-// Transfer ownership (requires owner)
-app.post('/orgs/:orgId/transfer', async (req, res) => {
-  const result = await orgRoutes.transferOwnership(req.userId, req.params.orgId, {
-    newOwnerId: req.body.newOwnerId,
-  })
-  res.status(result.status).json(result.body)
-})
-```
-
-### Invitations
-
-Invitations let you invite users by email. Each invitation has a single-use token and a 7-day expiry.
-
-```typescript
-// Create an invitation (requires admin or higher)
-app.post('/orgs/:orgId/invitations', async (req, res) => {
-  const result = await orgRoutes.createInvitation(req.userId, req.params.orgId, {
-    email: req.body.email,
-    role: req.body.role,
-  })
-  // Send the invitation.token to the invitee via email
-  res.status(result.status).json(result.body)
-})
-
-// Accept an invitation (authenticated user joins the org)
-app.post('/orgs/invitations/accept', async (req, res) => {
-  const result = await orgRoutes.acceptInvitation(req.userId, {
-    token: req.body.token,
-  })
-  res.status(result.status).json(result.body)
-})
-
-// List pending invitations for the org (requires admin)
-app.get('/orgs/:orgId/invitations', async (req, res) => {
-  const result = await orgRoutes.listPendingInvitations(req.userId, req.params.orgId)
-  res.status(result.status).json(result.body)
-})
-
-// Revoke a pending invitation (requires admin)
-app.delete('/orgs/:orgId/invitations/:invId', async (req, res) => {
-  const result = await orgRoutes.revokeInvitation(req.userId, req.params.orgId, req.params.invId)
-  res.status(result.status).json(result.body)
-})
-```
+Each invitation has a single-use token and a 7-day expiry: send `invitation.token` to the invitee yourself (by email). Every handler can also be called directly (`orgRoutes.createOrg(userId, params)` and so on) if your server routes requests its own way.
 
 ### RBAC Engine
 
@@ -1725,6 +1668,7 @@ declare const app: {
   post(path: string, ...handlers: Handler[]): void
   patch(path: string, ...handlers: Handler[]): void
   delete(path: string, ...handlers: Handler[]): void
+  all(path: string | string[], ...handlers: Handler[]): void
 }
 declare const userStore: UserStore
 declare const orgStore: OrgStore
