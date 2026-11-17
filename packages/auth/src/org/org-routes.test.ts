@@ -490,6 +490,56 @@ describe('OrgRoutes', () => {
 	// listMembers
 	// =========================================================================
 
+	describe('admins cannot act on other admins (only the owner can)', () => {
+		async function orgWithTwoAdmins(): Promise<string> {
+			const created = await routes.createOrg('user-1', { name: 'Acme', slug: 'acme' })
+			const orgId = 'data' in created.body ? created.body.data.id : ''
+			await store.addMember(orgId, 'user-2', 'admin', 'user-1')
+			await store.addMember(orgId, 'user-3', 'admin', 'user-1')
+			return orgId
+		}
+		const roleOf = async (orgId: string, userId: string) =>
+			(await store.getMembership(orgId, userId))?.role ?? null
+
+		test('an admin cannot demote another admin', async () => {
+			const orgId = await orgWithTwoAdmins()
+			const result = await routes.updateMemberRole('user-2', orgId, {
+				targetUserId: 'user-3',
+				role: 'viewer',
+			})
+			expect(result.status).toBe(403)
+			expect(await roleOf(orgId, 'user-3')).toBe('admin')
+		})
+
+		test('an admin cannot remove another admin', async () => {
+			const orgId = await orgWithTwoAdmins()
+			const result = await routes.removeMember('user-2', orgId, 'user-3')
+			expect(result.status).toBe(403)
+			expect(await roleOf(orgId, 'user-3')).toBe('admin')
+		})
+
+		test('the owner can demote and remove an admin', async () => {
+			const orgId = await orgWithTwoAdmins()
+			expect(
+				(await routes.updateMemberRole('user-1', orgId, { targetUserId: 'user-3', role: 'member' }))
+					.status,
+			).toBe(200)
+			expect((await routes.removeMember('user-1', orgId, 'user-2')).status).toBe(200)
+			expect(await roleOf(orgId, 'user-2')).toBeNull()
+		})
+
+		test('an admin can still leave, and still manage members below admin', async () => {
+			const orgId = await orgWithTwoAdmins()
+			await store.addMember(orgId, 'user-5', 'member', 'user-1')
+			expect(
+				(await routes.updateMemberRole('user-2', orgId, { targetUserId: 'user-5', role: 'viewer' }))
+					.status,
+			).toBe(200)
+			expect((await routes.removeMember('user-2', orgId, 'user-5')).status).toBe(200)
+			expect((await routes.removeMember('user-3', orgId, 'user-3')).status).toBe(200)
+		})
+	})
+
 	describe('listMembers', () => {
 		test('member can list members', async () => {
 			const createResult = await routes.createOrg('user-1', { name: 'Acme', slug: 'acme' })
