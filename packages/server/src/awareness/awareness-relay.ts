@@ -12,11 +12,24 @@ export type AwarenessAudience = (targetSessionId: string) => boolean
 /**
  * Tracks a single client's awareness registration.
  */
+/** Relay ids start above every id a client picks for itself (at most 2^31 - 1). */
+const RELAY_ID_BASE = 2 ** 31
+/** Relay ids span 2^52 values above the base, staying below 2^53 (exact in JSON). */
+const RELAY_ID_SPAN = 2 ** 52
+
 interface AwarenessClient {
 	/** Session ID for this client */
 	sessionId: string
 	/** Client-assigned awareness ID, bound to the session on its first update */
 	clientId: number
+	/**
+	 * The id this client's presence is relayed under: its own id while no other connected
+	 * client uses it, otherwise one from a range clients never pick for themselves (2^31 and
+	 * above; a client's own id is at most 2^31 - 1). Two pages that announce the same id are
+	 * therefore relayed under different ids, and no client ever receives a peer under its own
+	 * id (which it would drop as its own echo).
+	 */
+	relayId: number
 	/** Transport for sending messages to this client */
 	transport: ServerTransport
 	/** Current awareness state, if any */
@@ -78,6 +91,7 @@ export class AwarenessRelay {
 		const joining: AwarenessClient = {
 			sessionId,
 			clientId,
+			relayId: this.relayIdForJoiner(clientId),
 			transport,
 			state: null,
 			partition,
@@ -92,7 +106,7 @@ export class AwarenessRelay {
 			if (client.sessionId === sessionId) continue
 			if (!client.state) continue
 			if (!this.mayReceive(client, joining)) continue
-			existingStates[String(client.clientId)] = client.state
+			existingStates[String(client.relayId)] = client.state
 			client.deliveredTo.add(sessionId)
 			hasStates = true
 		}
@@ -176,16 +190,17 @@ export class AwarenessRelay {
 		if (!sender) return
 		if (message.clientId !== sender.clientId) return
 
-		const key = String(sender.clientId)
-		if (!(key in message.states)) return
-		const senderState = message.states[key] ?? null
+		const ownKey = String(sender.clientId)
+		if (!(ownKey in message.states)) return
+		const senderState = message.states[ownKey] ?? null
+		const key = String(sender.relayId)
 		sender.state = senderState
 		sender.audience = audience ?? null
 
 		const sanitized: SyncMessage = {
 			type: 'awareness-update',
 			messageId: message.messageId,
-			clientId: sender.clientId,
+			clientId: sender.relayId,
 			states: { [key]: senderState },
 		}
 		let removal: SyncMessage | null = null
@@ -218,7 +233,7 @@ export class AwarenessRelay {
 		if (!sender) return
 		sender.audience = audience
 		if (sender.state === null) return
-		const key = String(sender.clientId)
+		const key = String(sender.relayId)
 		let current: SyncMessage | null = null
 		let removal: SyncMessage | null = null
 		for (const [, client] of this.clients) {
@@ -230,7 +245,7 @@ export class AwarenessRelay {
 				current ??= {
 					type: 'awareness-update',
 					messageId: generateUUIDv7(),
-					clientId: sender.clientId,
+					clientId: sender.relayId,
 					states: { [key]: sender.state },
 				}
 				client.transport.send(current)
@@ -270,12 +285,69 @@ export class AwarenessRelay {
 		}
 	}
 
+	/**
+	 * The relay id of a joining client announcing `clientId`. A connected peer relayed under
+	 * that id is moved to a fresh id first (the joiner would drop it as its own echo), and the
+	 * joiner keeps its own id only when no connected client uses it.
+	 */
+	private relayIdForJoiner(clientId: number): number {
+		for (const other of this.clients.values()) {
+			if (other.relayId === clientId) this.moveToFreshRelayId(other)
+		}
+		for (const other of this.clients.values()) {
+			if (other.clientId === clientId) return this.freeRelayId()
+		}
+		return clientId
+	}
+
+	/**
+	 * Relay `client` under a fresh id: every session that was shown its state gets a removal
+	 * of the old id and the same state under the new one.
+	 */
+	private moveToFreshRelayId(client: AwarenessClient): void {
+		const previous = client.relayId
+		client.relayId = this.freeRelayId()
+		if (client.state === null || client.deliveredTo.size === 0) return
+		const removal: SyncMessage = {
+			type: 'awareness-update',
+			messageId: generateUUIDv7(),
+			clientId: previous,
+			states: { [String(previous)]: null },
+		}
+		const current: SyncMessage = {
+			type: 'awareness-update',
+			messageId: generateUUIDv7(),
+			clientId: client.relayId,
+			states: { [String(client.relayId)]: client.state },
+		}
+		for (const targetId of client.deliveredTo) {
+			const target = this.clients.get(targetId)
+			if (!target?.transport.isConnected()) continue
+			target.transport.send(removal)
+			target.transport.send(current)
+		}
+	}
+
+	/**
+	 * A relay id no registered client uses, random in [2^31, 2^31 + 2^52): it never equals an
+	 * id a client picks for itself and stays an exact number on the wire.
+	 */
+	private freeRelayId(): number {
+		const used = new Set<number>()
+		for (const client of this.clients.values()) used.add(client.relayId)
+		let candidate: number
+		do {
+			candidate = RELAY_ID_BASE + Math.floor(Math.random() * RELAY_ID_SPAN)
+		} while (used.has(candidate))
+		return candidate
+	}
+
 	private removalMessage(client: AwarenessClient): SyncMessage {
 		return {
 			type: 'awareness-update',
 			messageId: generateUUIDv7(),
-			clientId: client.clientId,
-			states: { [String(client.clientId)]: null },
+			clientId: client.relayId,
+			states: { [String(client.relayId)]: null },
 		}
 	}
 }

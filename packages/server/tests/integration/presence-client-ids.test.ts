@@ -67,9 +67,13 @@ describe('presence when sessions announce the same awareness id', () => {
 		const a = await harness.login('anyone', 'node-a')
 		const b = await harness.login('anyone', 'node-b')
 		const c = await harness.login('anyone', 'node-c')
+		// A session joins presence when it first publishes (as a real client does).
+		publish(c, 7, 'Cat')
+		await harness.settle()
 		publish(a, 1, 'Ann')
 		publish(b, 1, 'Bob')
 		await harness.settle()
+		expect(seenBy(c, 7)).toEqual(['Ann', 'Bob'])
 		await a.client.disconnect()
 		await harness.settle()
 		expect(seenBy(c, 7)).toEqual(['Bob'])
