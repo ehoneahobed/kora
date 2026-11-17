@@ -97,8 +97,9 @@ describe.each([
 		await Promise.all(Array.from({ length: 4 }, () => manager.verify('user-1', '000000')))
 		expect((await store.getByUserId('user-1'))?.failedAttempts).toBe(4)
 		await Promise.all(Array.from({ length: 3 }, () => manager.verify('user-1', '000000')))
+		// The fifth failure locks; attempts while locked are not evaluated, so not counted.
 		const after = await store.getByUserId('user-1')
-		expect(after?.failedAttempts).toBe(7)
+		expect(after?.failedAttempts).toBe(5)
 		expect(after?.lockedUntil).toBeGreaterThan(Date.now())
 	})
 })
