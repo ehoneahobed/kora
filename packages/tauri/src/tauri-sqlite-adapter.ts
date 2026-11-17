@@ -91,7 +91,7 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error)
 }
 
-// Mutex for serializing transactions over async IPC
+// Serializes every statement and transaction over async IPC (the plugin has one connection).
 class AsyncMutex {
 	private queue: Array<() => void> = []
 	private locked = false
@@ -213,10 +213,13 @@ export class TauriSqliteAdapter implements StorageAdapter {
 	}
 
 	/**
-	 * Execute a write query (INSERT, UPDATE, DELETE).
+	 * Execute a write query (INSERT, UPDATE, DELETE). Takes the same mutex as
+	 * {@link transaction}: the plugin has one connection, so a statement sent while a
+	 * transaction is open would run inside it (and be lost on its ROLLBACK).
 	 */
 	async execute(sql: string, params?: unknown[]): Promise<void> {
 		this.ensureOpen()
+		const release = await this.txMutex.acquire()
 		try {
 			await this.invoke('execute', {
 				path: this.dbPath,
@@ -228,14 +231,18 @@ export class TauriSqliteAdapter implements StorageAdapter {
 				sql,
 				params,
 			})
+		} finally {
+			release()
 		}
 	}
 
 	/**
-	 * Execute a read query (SELECT).
+	 * Execute a read query (SELECT). Waits for an open transaction, like {@link execute},
+	 * so it never sees that transaction's uncommitted rows.
 	 */
 	async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
 		this.ensureOpen()
+		const release = await this.txMutex.acquire()
 		try {
 			return await this.invoke<T[]>('query', {
 				path: this.dbPath,
@@ -247,6 +254,8 @@ export class TauriSqliteAdapter implements StorageAdapter {
 				sql,
 				params,
 			})
+		} finally {
+			release()
 		}
 	}
 
@@ -312,6 +321,7 @@ export class TauriSqliteAdapter implements StorageAdapter {
 	 */
 	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
 		this.ensureOpen()
+		const release = await this.txMutex.acquire()
 		try {
 			await this.invoke('migrate', {
 				path: this.dbPath,
@@ -322,6 +332,8 @@ export class TauriSqliteAdapter implements StorageAdapter {
 				`Migration from v${from} to v${to} failed: ${errorMessage(error)}`,
 				{ from, to },
 			)
+		} finally {
+			release()
 		}
 	}
 
