@@ -1,3 +1,6 @@
+// Registers the adapter for createApp's Tauri detection (a side effect of importing this package).
+import './register'
+
 export {
 	TauriSqliteAdapter,
 	TauriAdapterError,
