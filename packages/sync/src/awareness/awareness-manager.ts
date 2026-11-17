@@ -11,7 +11,18 @@ type AwarenessChangeListener = (change: AwarenessChange) => void
 // sends explicit removal on disconnect.
 const DEFAULT_TIMEOUT_MS = 30_000
 
-let nextLocalClientId = 1
+/**
+ * A random positive 31-bit awareness id. Each page picks its own: a counter starting at 1
+ * gave every page the same id, so pages dropped each other's presence as their own echo.
+ * The server also relays every session under an id no other connected session uses.
+ */
+function randomClientId(): number {
+	const values = new Uint32Array(1)
+	const crypto = globalThis.crypto
+	if (crypto?.getRandomValues) crypto.getRandomValues(values)
+	else values[0] = Math.floor(Math.random() * 0x7fffffff)
+	return (values[0] ?? 0) & 0x7fffffff || 1
+}
 
 /**
  * Manages collaborative awareness state (cursor positions, user presence).
@@ -47,7 +58,7 @@ export class AwarenessManager {
 		emitter?: KoraEventEmitter
 		timeoutMs?: number
 	}) {
-		this.clientId = options?.clientId ?? nextLocalClientId++
+		this.clientId = options?.clientId ?? randomClientId()
 		this.emitter = options?.emitter ?? null
 		this.timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS
 	}

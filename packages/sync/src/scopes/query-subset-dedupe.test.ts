@@ -1,5 +1,5 @@
 import { fc, test as propTest } from '@fast-check/vitest'
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { type SyncQuerySubset, dedupeQuerySubsets, querySubsetContains } from './query-subset'
 
 /**
@@ -158,26 +158,36 @@ describe('dedupeQuerySubsets', () => {
 		)
 	})
 
-	test('5,000-entry containment checks are quick', () => {
+	test('5,000-entry containment checks do linear work, not pairwise', () => {
 		const narrow: SyncQuerySubset[] = Array.from({ length: 5000 }, (_, i) => ({
 			collection: 'todos',
 			where: { owner: `u${i % 50}`, project: `p${i}` },
 		}))
-		const started = performance.now()
-		expect(querySubsetContains(narrow, narrow)).toBe(true)
-		expect(performance.now() - started).toBeLessThan(250)
+		// Counted, not timed (a loaded runner makes wall-clock bounds flaky): the pairwise
+		// version serializes about n² times, this one O(n log n) times (the final sort serializes in its comparator).
+		const serialize = vi.spyOn(JSON, 'stringify')
+		try {
+			expect(querySubsetContains(narrow, narrow)).toBe(true)
+			expect(serialize.mock.calls.length).toBeLessThan(narrow.length * 50)
+		} finally {
+			serialize.mockRestore()
+		}
 	})
 
-	test('5,000 legal entries dedupe quickly (no pairwise blow-up)', () => {
+	test('5,000 legal entries dedupe with linear work (no pairwise blow-up)', () => {
 		const subsets: SyncQuerySubset[] = Array.from({ length: 5000 }, (_, i) => ({
 			collection: i % 2 === 0 ? 'todos' : 'notes',
 			where: { owner: `u${i % 50}`, project: `p${i}` },
 		}))
-		const started = performance.now()
-		const result = dedupeQuerySubsets(subsets)
-		const elapsed = performance.now() - started
-		expect(result).toHaveLength(5000)
-		// Generous for slow CI runners; the pairwise version takes seconds here.
-		expect(elapsed).toBeLessThan(250)
+		// Counted, not timed (a loaded runner makes wall-clock bounds flaky): the pairwise
+		// version serializes about n² times, this one O(n log n) times (the final sort serializes in its comparator).
+		const serialize = vi.spyOn(JSON, 'stringify')
+		try {
+			const result = dedupeQuerySubsets(subsets)
+			expect(result).toHaveLength(5000)
+			expect(serialize.mock.calls.length).toBeLessThan(subsets.length * 50)
+		} finally {
+			serialize.mockRestore()
+		}
 	})
 })
