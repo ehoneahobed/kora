@@ -469,6 +469,8 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 					(entry.details as { action?: string } | undefined)?.action === 'withheld',
 			),
 		).toBe(true)
+		// Operators can see it: a counter of withheld deliveries.
+		expect(harness.server.getMetricsCollector().getSnapshot(0).withheldDeliveries).toBeGreaterThan(0)
 		// The record comes back: cat receives its current state first and converges.
 		const desk = await harness.login('ann', 'ann-desk', FRESH)
 		await sendAndAwaitAck(desk, [
