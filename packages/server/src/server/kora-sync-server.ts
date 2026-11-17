@@ -264,6 +264,7 @@ export class KoraSyncServer {
 	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxScopePredicateValues: number | undefined
+	private readonly maxSyncQueries: number | undefined
 	private readonly maxMessageBytes: number
 	private readonly heartbeatIntervalMs: number
 	private readonly appHeartbeatIntervalMs: number
@@ -533,6 +534,15 @@ export class KoraSyncServer {
 			})
 		}
 		this.maxScopePredicateValues = config.maxScopePredicateValues
+		if (
+			config.maxSyncQueries !== undefined &&
+			(!Number.isInteger(config.maxSyncQueries) || config.maxSyncQueries < 1)
+		) {
+			throw new SyncError('maxSyncQueries must be a positive integer', {
+				maxSyncQueries: config.maxSyncQueries,
+			})
+		}
+		this.maxSyncQueries = config.maxSyncQueries
 		this.validateOperation = config.validateOperation
 		// One trusted data-plane context, shared by custom HTTP routes (via
 		// production-server) and by the operation validator. It holds no per-request
@@ -1858,6 +1868,7 @@ export class KoraSyncServer {
 			...(this.maxScopePredicateValues !== undefined
 				? { maxScopePredicateValues: this.maxScopePredicateValues }
 				: {}),
+			...(this.maxSyncQueries !== undefined ? { maxSyncQueries: this.maxSyncQueries } : {}),
 			...(this.validateOperation
 				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
 				: {}),

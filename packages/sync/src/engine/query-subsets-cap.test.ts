@@ -31,7 +31,7 @@ describe('query views sent at handshake stay under the server cap', () => {
 		for (let i = 0; i < 1500; i++) {
 			const subset = { collection: i % 3 === 0 ? 'notes' : 'comments', where: { postId: `p${i}` } }
 			registered.push(subset)
-			engine.registerQuerySubset(subset)
+			engine.seedQuerySubset(subset)
 		}
 		const sent = engine.getActiveQuerySubsets()
 		expect(sent.length).toBeLessThanOrEqual(MAX_HANDSHAKE_QUERY_SUBSETS)

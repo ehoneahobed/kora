@@ -3534,11 +3534,11 @@
    "severity": "P1",
    "workstream": "W1",
    "phase": 4,
-   "status": "open",
+   "status": "fixed",
    "tests": [],
    "pr": null,
    "acceptanceTest": "packages/server/tests/integration/handshake-sync-queries.test.ts (cap and shape refused with clear codes) + packages/sync/src/scopes/query-subset-dedupe.test.ts (equivalence property against the pairwise definition; 5,000 entries dedupe fast)",
-   "notes": "Audit 2026-11-16, measured: 2,000 entries 0.8 s, 8,000 14.6 s, 20,000 70.8 s of synchronous server work."
+   "notes": "Audit 2026-11-16, measured: 2,000 entries 0.8 s, 8,000 14.6 s, 20,000 70.8 s of synchronous server work. FIXED: checkSyncQueries (server) refuses a non-list, a malformed entry or a where of more than 32 fields (INVALID_SYNC_QUERIES) and more than maxSyncQueries entries (default 1000, SYNC_QUERIES_LIMIT) at the start of the handshake. dedupeQuerySubsets and querySubsetContains index entries by canonical where (sub-dictionary lookups up to 10 fields, a scan of smaller entries beyond), matching the pairwise definitions exactly (property tests); 5,000 entries take milliseconds. The client caps its handshake views at MAX_HANDSHAKE_QUERY_SUBSETS (500) by collapsing the collections with most views to the whole collection."
   }
  ],
  "rejectedProposalPins": {

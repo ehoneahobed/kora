@@ -75,6 +75,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `maxMessageBytes` | 32 MiB | Largest WebSocket message. |
 | `maxOpsPerBatch` | 1000 | Largest upload batch (`BATCH_TOO_LARGE`). |
 | `maxScopePredicateValues` | 100 | Most values in one `$in` grant predicate (`SCOPE_PREDICATE_LIMIT` above it). See [Large grants](#large-grants-the-in-value-limit). |
+| `maxSyncQueries` | 1000 | Most query views one handshake may carry (`SYNC_QUERIES_LIMIT` above it; a malformed list is `INVALID_SYNC_QUERIES`). The client collapses its views to whole collections past 500, so a legitimate app never reaches it. |
 | `maxOperationBytes` | 256 KiB | Largest operation (`OPERATION_TOO_LARGE`, per operation). |
 | `maxOpsPerMinute` | 600 | Per device node (`RATE_LIMIT`, retriable). |
 | `maxOpsPerMinutePerUser` | 4 x `maxOpsPerMinute` | Per authenticated user across their devices; `0` disables. |
