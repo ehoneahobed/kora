@@ -46,6 +46,29 @@ function hmacSha256Base64url(data: string, secret: string): string {
 const ENCODED_HEADER = base64urlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
 
 /**
+ * A JWS header whose meaning is HS256 (RFC 7515/7519): an object with `alg` exactly "HS256",
+ * a `typ` that is absent, "JWT" (any case) or the access-token type "at+jwt" (RFC 9068), and
+ * no `crit` (critical extensions this verifier does not implement). Other fields (`kid`, ...)
+ * are allowed. `alg: "none"` and every other algorithm are refused.
+ */
+function isStandardHs256Header(segment: string): boolean {
+	let header: unknown
+	try {
+		header = JSON.parse(base64urlDecode(segment))
+	} catch {
+		return false
+	}
+	if (typeof header !== 'object' || header === null || Array.isArray(header)) return false
+	const fields = header as Record<string, unknown>
+	if (fields.alg !== 'HS256') return false
+	if ('crit' in fields) return false
+	if (fields.typ === undefined) return true
+	if (typeof fields.typ !== 'string') return false
+	const typ = fields.typ.toLowerCase()
+	return typ === 'jwt' || typ === 'at+jwt'
+}
+
+/**
  * Creates a signed JWT (HS256) from a payload and secret.
  *
  * The token is structured as `header.payload.signature` per RFC 7519.
@@ -123,6 +146,9 @@ export function decodeJwt(token: string): Record<string, unknown> | null {
  *
  * @param token - The JWT string to verify
  * @param secret - The HMAC-SHA256 secret key that was used to sign the token
+ * @param options - `headers: 'standard'` accepts any JWS header whose meaning is HS256 (a
+ *   `kid`, no `typ`, keys in any order), for tokens another identity provider signed.
+ *   The default accepts only the exact header Kora writes.
  * @returns The decoded payload if the signature is valid, or null otherwise
  *
  * @example
@@ -136,7 +162,11 @@ export function decodeJwt(token: string): Record<string, unknown> | null {
  * }
  * ```
  */
-export function verifyJwt(token: string, secret: string): Record<string, unknown> | null {
+export function verifyJwt(
+	token: string,
+	secret: string,
+	options: { headers?: 'kora' | 'standard' } = {},
+): Record<string, unknown> | null {
 	// Callers ultimately trace back to request bodies (handleRefresh,
 	// handleSignOut, handleDeviceRegister, handleDeviceVerify all pass a body
 	// field straight through to validateToken -> verifyJwt). A malformed or
@@ -166,7 +196,11 @@ export function verifyJwt(token: string, secret: string): Record<string, unknown
 
 	// Validate the header to prevent algorithm confusion attacks.
 	// Only HS256 is supported; reject any token claiming a different algorithm.
-	if (headerSegment !== ENCODED_HEADER) {
+	const headerOk =
+		options.headers === 'standard'
+			? isStandardHs256Header(headerSegment)
+			: headerSegment === ENCODED_HEADER
+	if (!headerOk) {
 		return null
 	}
 

@@ -124,8 +124,10 @@ function defaultSupabaseClaimMapping(claims: Record<string, unknown>): ExternalU
 /**
  * Creates an ExternalJwtProvider configured for Supabase Auth.
  *
- * Supabase Auth uses HS256 signing with the project's JWT secret, making it
- * compatible with Kora's built-in `verifyJwt` utility. No external SDK is needed.
+ * For a project that signs with its legacy shared JWT secret (HS256), Kora verifies the
+ * tokens itself, whatever their header carries (a `kid`, no `typ`). No external SDK is
+ * needed. A project that signs with asymmetric JWT signing keys (RS256, ES256) needs
+ * `validateToken` instead (for example `jose` with the project's JWKS).
  *
  * This adapter validates the JWT signature and expiration, then maps Supabase's
  * standard claims (sub, email, role, user_metadata) to Kora's auth context format.
