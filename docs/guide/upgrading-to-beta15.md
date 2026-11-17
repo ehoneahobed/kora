@@ -388,6 +388,13 @@ exports of `@korajs/merge` (`MergeEngine`, `mergeField`, `lastWriteWins`, `addWi
 A database that ran with the option re-materializes with the fold on its next open. Remove the option
 from `createApp`; TypeScript reports it, and JavaScript callers have it ignored.
 
+## Removed: `store.sharedWorkerUrl`
+
+Ignored since beta.6: SharedWorker-hosted SQLite cannot use OPFS and was never durable, so Kora uses
+the dedicated-worker leader/follower path for several tabs. The option is gone from `createApp`'s
+`store` options and from `SqliteWasmAdapter`. Remove it; TypeScript reports it, and JavaScript
+callers have it ignored (without the old warning).
+
 ## Deprecations kept
 
 The `allowLegacyAnonymousClaims` default of `true` is still present in beta.15, deprecated. The

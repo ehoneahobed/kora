@@ -59,7 +59,6 @@ export async function createAdapter(
 	workerUrl?: string | URL,
 	emitter?: KoraEventEmitter,
 	workerResponseTimeoutMs?: number,
-	sharedWorkerUrl?: string | URL,
 	suppressNonPersistentDiagnostic = false,
 	durability: {
 		allowNonDurable?: boolean
@@ -97,7 +96,6 @@ export async function createAdapter(
 			return new SqliteWasmAdapter({
 				dbName,
 				workerUrl,
-				sharedWorkerUrl,
 				workerResponseTimeoutMs,
 				emitter,
 				emitNonPersistentDiagnostic: !suppressNonPersistentDiagnostic,

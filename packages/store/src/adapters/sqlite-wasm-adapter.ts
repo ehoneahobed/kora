@@ -43,7 +43,6 @@ import { StorageEvidence, readFoundStorageEvidence } from './storage-evidence'
 import { isManifestAvailable, recordDatabase } from './storage-manifest'
 
 type WorkerSuccessResponse = Extract<WorkerResponse, { type: 'success' }>
-let warnedSharedWorkerDeprecated = false
 
 /** Per-request options for {@link SqliteWasmAdapter.execute} and `query`. */
 export interface StorageRequestOptions {
@@ -81,13 +80,6 @@ export interface SqliteWasmAdapterOptions {
 
 	/** Timeout for worker / follower RPC responses. Defaults to 30000ms. */
 	workerResponseTimeoutMs?: number
-
-	/**
-	 * @deprecated SharedWorker-hosted SQLite cannot use OPFS SyncAccessHandle and
-	 * is never durable. Kora ignores this option and uses the dedicated-worker
-	 * leader/follower path for durable multi-tab storage.
-	 */
-	sharedWorkerUrl?: string | URL
 
 	/**
 	 * When false, the adapter records a non-persistent open without emitting
@@ -259,7 +251,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private readonly injectedBridge: WorkerBridge | undefined
 	private readonly stagingBridgeFactory: (() => WorkerBridge | Promise<WorkerBridge>) | undefined
 	private readonly workerUrl: string | URL | undefined
-	private readonly sharedWorkerUrl: string | URL | undefined
 	private readonly workerResponseTimeoutMs: number
 	private readonly dbName: string
 	private readonly emitter: KoraEventEmitter | undefined
@@ -299,7 +290,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.injectedBridge = options.bridge
 		this.stagingBridgeFactory = options.stagingBridgeFactory
 		this.workerUrl = options.workerUrl
-		this.sharedWorkerUrl = options.sharedWorkerUrl
 		this.workerResponseTimeoutMs = options.workerResponseTimeoutMs ?? 30_000
 		this.dbName = options.dbName ?? 'kora-db'
 		this.emitter = options.emitter
@@ -368,7 +358,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			return
 		}
 		if (this.workerUrl) {
-			this.warnSharedWorkerDeprecated()
 			this.schema = schema
 			try {
 				const response = await this.attachAndOpen(ddlStatements)
@@ -789,18 +778,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				this.durabilityLoss.reason,
 			)
 		}
-	}
-
-	private warnSharedWorkerDeprecated(): void {
-		if (!this.sharedWorkerUrl || warnedSharedWorkerDeprecated) {
-			return
-		}
-		warnedSharedWorkerDeprecated = true
-		console.warn(
-			'[kora] sharedWorkerUrl is deprecated and ignored: SharedWorker-hosted SQLite ' +
-				'cannot use OPFS and is never durable. Kora uses the durable dedicated-worker ' +
-				'leader/follower path for multi-tab storage.',
-		)
 	}
 
 	/**

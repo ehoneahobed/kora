@@ -229,7 +229,6 @@ async function initializeAppSteps(
 		config.store?.workerUrl,
 		emitter,
 		config.store?.workerResponseTimeoutMs,
-		config.store?.sharedWorkerUrl,
 		adapterType === 'sqlite-wasm',
 		// createApp inspects the open state below and moves to durable IndexedDB
 		// itself; a later leader promotion that loses durability is still refused.
@@ -313,7 +312,6 @@ async function initializeAppSteps(
 				config.store?.workerUrl,
 				emitter,
 				config.store?.workerResponseTimeoutMs,
-				undefined,
 				false,
 				{ versionGate: nextGate('indexeddb') },
 			)
@@ -350,7 +348,6 @@ async function initializeAppSteps(
 				config.store?.workerUrl,
 				emitter,
 				config.store?.workerResponseTimeoutMs,
-				config.store?.sharedWorkerUrl,
 				true,
 				// Neither OPFS nor IndexedDB is durable here. Without an explicit
 				// opt-in the adapter emits store:durability-lost and refuses writes
