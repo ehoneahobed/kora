@@ -21,9 +21,29 @@ impl Default for DbState {
     }
 }
 
-/// Convert a JSON value to a rusqlite parameter.
-fn json_to_param(value: &JsonValue) -> Box<dyn rusqlite::types::ToSql> {
-    match value {
+/// The JSON form of bytes on the IPC boundary: `{ "$koraBytes": "<base64>" }`, the same tag
+/// Kora uses for binary values in operations.
+const BYTES_TAG: &str = "$koraBytes";
+
+/// The bytes of a tagged binary value, or None for any other JSON value.
+fn tagged_bytes(value: &JsonValue) -> Option<Result<Vec<u8>, Error>> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let encoded = object.get(BYTES_TAG)?.as_str()?;
+    Some(
+        base64_decode(encoded)
+            .ok_or_else(|| Error::Plugin(format!("Invalid {BYTES_TAG} value: not base64"))),
+    )
+}
+
+/// Convert a JSON value to a rusqlite parameter. A tagged binary value binds as a BLOB.
+fn json_to_param(value: &JsonValue) -> Result<Box<dyn rusqlite::types::ToSql>, Error> {
+    if let Some(bytes) = tagged_bytes(value) {
+        return Ok(Box::new(bytes?));
+    }
+    Ok(match value {
         JsonValue::Null => Box::new(rusqlite::types::Null),
         JsonValue::Bool(b) => Box::new(if *b { 1i64 } else { 0i64 }),
         JsonValue::Number(n) => {
@@ -38,6 +58,88 @@ fn json_to_param(value: &JsonValue) -> Box<dyn rusqlite::types::ToSql> {
         JsonValue::String(s) => Box::new(s.clone()),
         // Arrays and objects are stored as JSON text
         _ => Box::new(value.to_string()),
+    })
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding (the encoding `bytesToBase64` in @korajs/core produces).
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(BASE64_ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(BASE64_ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64_ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64_ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode standard base64 (padding required); None when the input is not valid base64.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let input = text.as_bytes();
+    if !input.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |c: u8| -> Option<u32> {
+        BASE64_ALPHABET
+            .iter()
+            .position(|&a| a == c)
+            .map(|p| p as u32)
+    };
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    for (index, chunk) in input.chunks(4).enumerate() {
+        let last = index == input.len() / 4 - 1;
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            let digit = if i >= 4 - pad { 0 } else { value(c)? };
+            n = (n << 6) | digit;
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Convert a column value to its JSON transport form.
+fn value_ref_to_json(value: rusqlite::types::ValueRef<'_>) -> JsonValue {
+    match value {
+        rusqlite::types::ValueRef::Null => JsonValue::Null,
+        rusqlite::types::ValueRef::Integer(n) => JsonValue::Number(n.into()),
+        rusqlite::types::ValueRef::Real(f) => match serde_json::Number::from_f64(f) {
+            Some(n) => JsonValue::Number(n),
+            None => JsonValue::Null,
+        },
+        rusqlite::types::ValueRef::Text(s) => {
+            JsonValue::String(String::from_utf8_lossy(s).into_owned())
+        }
+        rusqlite::types::ValueRef::Blob(b) => {
+            // Tagged, so the adapter turns it back into a Uint8Array (rich text, blobs).
+            let mut object = serde_json::Map::new();
+            object.insert(BYTES_TAG.to_string(), JsonValue::String(base64_encode(b)));
+            JsonValue::Object(object)
+        }
     }
 }
 
@@ -237,7 +339,7 @@ pub fn execute(
         conn.execute_batch(&sql)?;
     } else {
         let param_refs: Vec<Box<dyn rusqlite::types::ToSql>> =
-            params.iter().map(json_to_param).collect();
+            params.iter().map(json_to_param).collect::<Result<_, _>>()?;
         let param_slice: Vec<&dyn rusqlite::types::ToSql> =
             param_refs.iter().map(|p| p.as_ref()).collect();
         conn.execute(&sql, param_slice.as_slice())?;
@@ -263,7 +365,7 @@ pub fn query(
         .ok_or_else(|| Error::DatabaseNotLoaded(path.clone()))?;
 
     let param_refs: Vec<Box<dyn rusqlite::types::ToSql>> =
-        params.iter().map(json_to_param).collect();
+        params.iter().map(json_to_param).collect::<Result<_, _>>()?;
     let param_slice: Vec<&dyn rusqlite::types::ToSql> =
         param_refs.iter().map(|p| p.as_ref()).collect();
 
@@ -273,21 +375,8 @@ pub fn query(
     let rows = stmt.query_map(param_slice.as_slice(), |row| {
         let mut map = HashMap::new();
         for (i, name) in column_names.iter().enumerate() {
-            let value: JsonValue = match row.get_ref(i) {
-                Ok(rusqlite::types::ValueRef::Null) => JsonValue::Null,
-                Ok(rusqlite::types::ValueRef::Integer(n)) => JsonValue::Number(n.into()),
-                Ok(rusqlite::types::ValueRef::Real(f)) => match serde_json::Number::from_f64(f) {
-                    Some(n) => JsonValue::Number(n),
-                    None => JsonValue::Null,
-                },
-                Ok(rusqlite::types::ValueRef::Text(s)) => {
-                    JsonValue::String(String::from_utf8_lossy(s).into_owned())
-                }
-                Ok(rusqlite::types::ValueRef::Blob(b)) => {
-                    // Encode blobs as hex strings for transport
-                    let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-                    JsonValue::String(hex)
-                }
+            let value = match row.get_ref(i) {
+                Ok(value) => value_ref_to_json(value),
                 Err(_) => JsonValue::Null,
             };
             map.insert(name.clone(), value);
@@ -399,5 +488,58 @@ mod delete_tests {
         // Nothing left: reports that no database existed.
         assert!(!delete_database_files(&db).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod binary_value_tests {
+    use super::{json_to_param, value_ref_to_json};
+    use serde_json::json;
+
+    /// Bind `param` into a fresh table and read the column back as SQLite stored it.
+    fn store(param: serde_json::Value) -> (String, serde_json::Value) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (v)").unwrap();
+        let bound = json_to_param(&param).unwrap();
+        conn.execute("INSERT INTO t (v) VALUES (?1)", [bound.as_ref()])
+            .unwrap();
+        conn.query_row("SELECT typeof(v), v FROM t", [], |row| {
+            Ok((row.get::<_, String>(0)?, value_ref_to_json(row.get_ref(1)?)))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_tagged_bytes_value_is_stored_as_a_blob_and_read_back_tagged() {
+        // [0, 1, 255] in base64.
+        let (kind, back) = store(json!({ "$koraBytes": "AAH/" }));
+        assert_eq!(kind, "blob");
+        assert_eq!(back, json!({ "$koraBytes": "AAH/" }));
+    }
+
+    #[test]
+    fn every_length_and_byte_value_round_trips() {
+        for len in 0..70usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 % 256) as u8).collect();
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t (v)").unwrap();
+            conn.execute("INSERT INTO t (v) VALUES (?1)", [&bytes])
+                .unwrap();
+            let back = conn
+                .query_row("SELECT v FROM t", [], |row| {
+                    Ok(value_ref_to_json(row.get_ref(0)?))
+                })
+                .unwrap();
+            let (kind, again) = store(back.clone());
+            assert_eq!(kind, "blob", "length {len}");
+            assert_eq!(again, back, "length {len}");
+        }
+    }
+
+    #[test]
+    fn other_objects_are_still_stored_as_json_text() {
+        let (kind, back) = store(json!({ "a": 1 }));
+        assert_eq!(kind, "text");
+        assert_eq!(back, json!("{\"a\":1}"));
     }
 }

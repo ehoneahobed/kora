@@ -445,7 +445,7 @@ fn test_null_values() {
 }
 
 #[test]
-fn test_blob_as_hex() {
+fn test_blob_round_trips_through_sqlite() {
     let conn = open_kora_db();
     conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
         .unwrap();
