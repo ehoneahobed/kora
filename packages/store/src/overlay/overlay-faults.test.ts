@@ -217,6 +217,21 @@ async function until(done: () => boolean, turns = 5000): Promise<void> {
 	if (!done()) throw new Error(`until(): condition not reached after ${turns} event-loop turns`)
 }
 
+/**
+ * Wait (bounded) until the subscription shows what a fresh query returns. The registry is
+ * emptied synchronously when a write settles, but the display it changes is refreshed on a
+ * later turn, so an empty registry is not yet a settled display. A display that never
+ * settles still fails here, naming the cause.
+ */
+async function untilDisplaySettled(h: Harness, turns = 500): Promise<void> {
+	for (let i = 0; i < turns; i++) {
+		const stored = await h.store.collection('todos').where({}).orderBy('id', 'asc').exec()
+		if (JSON.stringify(h.seen.rows) === JSON.stringify(stored)) return
+		await quiesce()
+	}
+	throw new Error(`the display did not settle to the stored rows after ${turns} turns`)
+}
+
 /** The settled state: what the subscription shows is what a fresh query returns. */
 async function expectDisplayedEqualsStored(h: Harness): Promise<void> {
 	const stored = await h.store.collection('todos').where({}).orderBy('id', 'asc').exec()
@@ -1116,6 +1131,7 @@ describe('fault injection: every point of a transaction (S6a entry groups)', () 
 		)
 		await until(() => h.registry.list().length === 0)
 		await quiesce()
+		await untilDisplaySettled(h)
 		unsubscribe()
 		return { adapter, h, before, outcome, shown }
 	}

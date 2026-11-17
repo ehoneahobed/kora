@@ -159,7 +159,7 @@ const stepArb: fc.Arbitrary<Step> = fc.oneof(
 			.map(([target, intents]): Step => ({ kind: 'remote', target, intents })),
 	},
 	{ weight: 4, arbitrary: fc.constant<Step>({ kind: 'release' }) },
-	{ weight: 1, arbitrary: fc.constant<Step>({ kind: 'fail' }) },
+	{ weight: 3, arbitrary: fc.constant<Step>({ kind: 'fail' }) },
 	{ weight: 2, arbitrary: fc.constant<Step>({ kind: 'turn' }) },
 )
 
@@ -464,6 +464,16 @@ async function runWorkload(workload: Workload): Promise<void> {
 }
 
 describe('atomic operations, merge strategies and arrays are predicted (S6b)', () => {
+	// CI seed 1589080204 (shrunk): a remote max lands, a group writes `best` (and an increment),
+	// an update writes `best` back, the next write fails, and a later array write follows.
+	test('regression: a remote max, a group, an update of the same field and a failed write', async () => {
+		await runWorkload(
+			JSON.parse(
+				'{"mode":"faulty","initial":[{"tags":[],"hits":0}],"steps":[{"kind":"remote","target":0,"intents":[{"field":"best","atomic":"max","value":4}]},{"kind":"release"},{"kind":"group","writes":[{"target":0,"intents":[{"field":"best","value":5},{"field":"hits","atomic":"increment","value":0}]}]},{"kind":"update","target":0,"intents":[{"field":"best","value":4}]},{"kind":"fail"},{"kind":"update","target":0,"intents":[{"field":"tags","items":[]}]}]}',
+			) as Parameters<typeof runWorkload>[0],
+		)
+	})
+
 	test(`prediction equals the committed fold over ${runs} generated workloads`, async () => {
 		const before = { ...counters, declined: new Map(counters.declined) }
 		await fc.assert(
@@ -481,9 +491,9 @@ describe('atomic operations, merge strategies and arrays are predicted (S6b)', (
 		// half of the generated remote array writes no longer count; this still fails a run in
 		// which the generator stopped producing them.
 		expect(counters.remoteArrays - before.remoteArrays).toBeGreaterThan(ran / 40)
-		expect(counters.groupsPredicted - before.groupsPredicted).toBeGreaterThan(0)
-		expect(counters.withRemote - before.withRemote).toBeGreaterThan(0)
-		expect(counters.withFails - before.withFails).toBeGreaterThan(0)
+		expect(counters.groupsPredicted - before.groupsPredicted, 'groupsPredicted').toBeGreaterThan(0)
+		expect(counters.withRemote - before.withRemote, 'withRemote').toBeGreaterThan(0)
+		expect(counters.withFails - before.withFails, 'withFails').toBeGreaterThan(0)
 		expect(counters.soundnessChecked - before.soundnessChecked).toBeGreaterThan(ran / 4)
 	}, 600_000)
 })

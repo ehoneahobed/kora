@@ -1,4 +1,4 @@
-import type { FoldState, SchemaDefinition } from '@korajs/core'
+import type { CollectionDefinition, FoldState, SchemaDefinition } from '@korajs/core'
 import { deserializeFoldState, mismatchedFoldFields, quoteIdent } from '@korajs/core'
 import type { LocalMutationContext } from '../mutations/types'
 import type { WriteEnv } from '../mutations/write-context'
@@ -171,6 +171,7 @@ function divergenceOf(
 	change: PredictedChange | undefined,
 	result: WriteResult,
 	committed: CollectionRecord,
+	definition: CollectionDefinition | undefined,
 ): string[] {
 	if (entry.kind !== 'update') {
 		// A delete removes the record whatever a remote write changed in it meanwhile.
@@ -232,7 +233,21 @@ function divergenceOf(
 		for (const field of skipped) expected[field] = committed[field]
 		return divergentFields(expected as CollectionRecord, committed)
 	}
+	// A field whose stored value depends on its base (a merge strategy, an array, an atomic
+	// intent) cannot be judged on a base that is not settled: the write before it may have
+	// failed (its rollback on the way) or be queued behind this one, so the prediction folded
+	// the write into a different base than the one it was stored on.
+	const atomic = result.operation?.atomicOps ?? null
+	const baseDependent = (field: string): boolean => {
+		const descriptor = definition?.fields[field]
+		return (
+			(descriptor?.mergeStrategy ?? null) !== null ||
+			descriptor?.kind === 'array' ||
+			(atomic !== null && field in atomic)
+		)
+	}
 	return written
+		.filter((field) => !(unsettled && baseDependent(field)))
 		.filter((field) => !skipped.has(field) && !sameValue(expected[field], committed[field]))
 		.sort()
 }
@@ -294,7 +309,7 @@ function track(
 					if (retired && record && result) {
 						overlay.registry.reportDivergence(
 							entry,
-							divergenceOf(overlay, entry, changes[index], result, record),
+							divergenceOf(overlay, entry, changes[index], result, record, definition),
 						)
 					}
 				})
@@ -941,7 +956,14 @@ function groupTracker(
 					if (record && result && retired.some((one) => one.writeId === entry.writeId)) {
 						overlay.registry.reportDivergence(
 							entry,
-							divergenceOf(overlay, entry, changes[index], result, record),
+							divergenceOf(
+								overlay,
+								entry,
+								changes[index],
+								result,
+								record,
+								env.schema.collections[entry.collection],
+							),
 						)
 					}
 				})
