@@ -1,5 +1,6 @@
 import { defineSchema, t } from '@korajs/core'
 import type Database from 'better-sqlite3'
+import fc from 'fast-check'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import {
 	type InvokeFn,
@@ -254,6 +255,138 @@ describe('TauriSqliteAdapter', () => {
 
 			const rows = await adapter.query('SELECT * FROM todos')
 			expect(rows).toHaveLength(2)
+		})
+	})
+
+	describe('statements outside a transaction wait for it', () => {
+		const insert =
+			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, 0, 1, 1)'
+
+		function recordingAdapter() {
+			const inner = createMockInvoke()
+			const log: string[] = []
+			const invoke: InvokeFn = async <T>(cmd: string, args?: Record<string, unknown>) => {
+				const command = cmd.replace('plugin:kora-sqlite|', '')
+				if (command === 'execute' || command === 'query') {
+					const sql = String(args?.sql)
+					const params = (args?.params as unknown[]) ?? []
+					log.push(sql.startsWith('INSERT') ? `insert ${params[0]}` : (sql.split(' ')[0] ?? sql))
+				}
+				return inner<T>(cmd, args)
+			}
+			return { adapter: new TauriSqliteAdapter({ path: 'serial.db', invoke }), log }
+		}
+
+		test('a write issued during a transaction that rolls back is kept, and runs after it', async () => {
+			const { adapter: serial, log } = recordingAdapter()
+			await serial.open(minimalSchema)
+			let open!: () => void
+			const opened = new Promise<void>((resolve) => {
+				open = resolve
+			})
+			let proceed!: () => void
+			const gate = new Promise<void>((resolve) => {
+				proceed = resolve
+			})
+			const failing = serial.transaction(async (tx) => {
+				await tx.execute(insert, ['in-tx', 'rolled back'])
+				open()
+				await gate
+				throw new Error('rollback')
+			})
+			await opened
+			const standalone = serial.execute(insert, ['outside', 'kept'])
+			proceed()
+			await expect(failing).rejects.toThrow('rollback')
+			await standalone
+			const rows = await serial.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
+			expect(rows.map((row) => row.id)).toEqual(['outside'])
+			expect(log.indexOf('insert outside')).toBeGreaterThan(log.indexOf('ROLLBACK'))
+			await serial.close()
+		})
+
+		test('a read issued during a transaction runs after it ends', async () => {
+			const { adapter: serial, log } = recordingAdapter()
+			await serial.open(minimalSchema)
+			let open!: () => void
+			const opened = new Promise<void>((resolve) => {
+				open = resolve
+			})
+			let proceed!: () => void
+			const gate = new Promise<void>((resolve) => {
+				proceed = resolve
+			})
+			const committing = serial.transaction(async (tx) => {
+				await tx.execute(insert, ['a', 'A'])
+				open()
+				await gate
+			})
+			await opened
+			const read = serial.query<{ id: string }>('SELECT id FROM todos')
+			proceed()
+			await committing
+			expect((await read).map((row) => row.id)).toEqual(['a'])
+			expect(log.lastIndexOf('SELECT')).toBeGreaterThan(log.indexOf('COMMIT'))
+			await serial.close()
+		})
+
+		test('property: any interleaving gives the rows of running the calls one by one in issue order', async () => {
+			type Job =
+				| { kind: 'write'; id: string; start: number }
+				| { kind: 'tx'; ids: string[]; fails: boolean; pauses: number; start: number }
+			const job = fc.oneof(
+				fc.record({ kind: fc.constant<'write'>('write'), start: fc.integer({ min: 0, max: 12 }) }),
+				fc.record({
+					kind: fc.constant<'tx'>('tx'),
+					size: fc.integer({ min: 1, max: 3 }),
+					fails: fc.boolean(),
+					pauses: fc.integer({ min: 0, max: 3 }),
+					start: fc.integer({ min: 0, max: 12 }),
+				}),
+			)
+			await fc.assert(
+				fc.asyncProperty(fc.array(job, { minLength: 1, maxLength: 8 }), async (drawn) => {
+					let next = 0
+					const jobs: Job[] = drawn.map((one) =>
+						one.kind === 'write'
+							? { kind: 'write', id: `w${next++}`, start: one.start }
+							: {
+									kind: 'tx',
+									ids: Array.from({ length: one.size }, () => `t${next++}`),
+									fails: one.fails,
+									pauses: one.pauses,
+									start: one.start,
+								},
+					)
+					const { adapter: serial } = recordingAdapter()
+					await serial.open(minimalSchema)
+					const turns = async (n: number) => {
+						for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r))
+					}
+					const runs = jobs.map(async (one) => {
+						await turns(one.start)
+						return one.kind === 'write'
+							? serial.execute(insert, [one.id, 'w'])
+							: serial
+									.transaction(async (tx) => {
+										for (const id of one.ids) {
+											await tx.execute(insert, [id, 't'])
+											for (let i = 0; i < one.pauses; i++) await new Promise((r) => setImmediate(r))
+										}
+										if (one.fails) throw new Error('rollback')
+									})
+									.catch(() => {})
+					})
+					await Promise.all(runs)
+					const expected = jobs
+						.flatMap((one) => (one.kind === 'write' ? [one.id] : one.fails ? [] : one.ids))
+						.sort()
+					const rows = await serial.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
+					expect(rows.map((row) => row.id)).toEqual(expected)
+					await serial.close()
+				}),
+				{ numRuns: 150 },
+			)
 		})
 	})
 
