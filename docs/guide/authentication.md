@@ -1248,7 +1248,7 @@ app.post('/orgs/:orgId/members', async (req, res) => {
   res.status(result.status).json(result.body)
 })
 
-// Update a member's role (requires admin or higher)
+// Update a member's role (requires admin or higher; only the owner changes an admin's role)
 app.patch('/orgs/:orgId/members/role', async (req, res) => {
   const result = await orgRoutes.updateMemberRole(req.userId, req.params.orgId, {
     targetUserId: req.body.userId,
@@ -1257,7 +1257,7 @@ app.patch('/orgs/:orgId/members/role', async (req, res) => {
   res.status(result.status).json(result.body)
 })
 
-// Remove a member (requires admin, or self-removal for any member)
+// Remove a member (requires admin, or self-removal for any member; only the owner removes an admin)
 app.delete('/orgs/:orgId/members/:userId', async (req, res) => {
   const result = await orgRoutes.removeMember(req.userId, req.params.orgId, req.params.userId)
   res.status(result.status).json(result.body)

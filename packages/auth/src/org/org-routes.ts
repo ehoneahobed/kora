@@ -394,6 +394,8 @@ export class OrgRoutes {
 		if (!isSelfRemoval) {
 			const authResult = await this.requireRole(orgId, userId, 'admin')
 			if (authResult) return authResult
+			const refused = await this.refuseAdminTarget(orgId, userId, targetUserId, 'remove')
+			if (refused) return refused
 		} else {
 			// Verify caller is a member
 			const membership = await this.store.getMembership(orgId, userId)
@@ -458,6 +460,14 @@ export class OrgRoutes {
 				body: { error: "The organization owner's role cannot be changed. Use ownership transfer." },
 			}
 		}
+
+		const refused = await this.refuseAdminTarget(
+			orgId,
+			userId,
+			params.targetUserId,
+			'change the role of',
+		)
+		if (refused) return refused
 
 		// Admins cannot promote to admin (only owner can)
 		const callerMembership = await this.store.getMembership(orgId, userId)
@@ -727,6 +737,23 @@ export class OrgRoutes {
 	 * Check if the caller has the required role in the org.
 	 * Returns an error response if not authorized, or null if authorized.
 	 */
+	/**
+	 * Only the owner acts on an admin: adding and promoting admins is owner-only, so an admin
+	 * may not demote or remove another one either (leaving is self-removal, allowed elsewhere).
+	 */
+	private async refuseAdminTarget(
+		orgId: string,
+		callerId: string,
+		targetUserId: string,
+		action: 'remove' | 'change the role of',
+	): Promise<{ status: 403; body: { error: string } } | null> {
+		const caller = await this.store.getMembership(orgId, callerId)
+		if (caller?.role === 'owner') return null
+		const target = await this.store.getMembership(orgId, targetUserId)
+		if (target?.role !== 'admin') return null
+		return { status: 403, body: { error: `Only the owner can ${action} an admin.` } }
+	}
+
 	private async requireRole(
 		orgId: string,
 		userId: string,

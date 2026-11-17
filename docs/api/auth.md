@@ -597,7 +597,7 @@ const orgRoutes = new OrgRoutes({ orgStore: new InMemoryOrgStore(), userLookup: 
 | `updateOrg(userId, orgId, params)` | admin |
 | `deleteOrg(userId, orgId)`, `transferOwnership(userId, orgId, { newOwnerId })` | owner |
 | `listUserOrgs(userId)` | |
-| `addMember(userId, orgId, { targetUserId, role })`, `updateMemberRole(...)`, `removeMember(userId, orgId, targetUserId)` | admin (or removing oneself) |
+| `addMember(userId, orgId, { targetUserId, role })`, `updateMemberRole(...)`, `removeMember(userId, orgId, targetUserId)` | admin (or removing oneself). Only the owner adds, promotes, demotes or removes an admin (`403` otherwise). |
 | `createInvitation(userId, orgId, { email, role })`, `revokeInvitation(...)`, `listPendingInvitations(...)` | admin |
 | `acceptInvitation(userId, { token }, identity?)`, `listMyInvitations(userId, identity?)` | the invitee's **verified** email |
 
