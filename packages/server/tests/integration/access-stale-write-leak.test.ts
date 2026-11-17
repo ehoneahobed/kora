@@ -470,7 +470,9 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 			),
 		).toBe(true)
 		// Operators can see it: a counter of withheld deliveries.
-		expect(harness.server.getMetricsCollector().getSnapshot(0).withheldDeliveries).toBeGreaterThan(0)
+		expect(harness.server.getMetricsCollector().getSnapshot(0).withheldDeliveries).toBeGreaterThan(
+			0,
+		)
 		// The record comes back: cat receives its current state first and converges.
 		const desk = await harness.login('ann', 'ann-desk', FRESH)
 		await sendAndAwaitAck(desk, [
@@ -1286,7 +1288,7 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		await s.backend.store.close()
 		await s.backend.done()
 	})
-	test('a hold expires on its own deadline while an unrelated backfill is still pending', async () => {
+	test('a hold expires on its own deadline while an unrelated backfill is still pending (the write is withheld, the stream moves past it)', async () => {
 		// Session logic, the same on every store; faked timers would starve the Postgres driver.
 		if (_name !== 'sqlite') return
 		// Only the retry timers are faked; the clock the deadline is read from is controlled.
@@ -1320,10 +1322,17 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 			}
 			await s.harness.settle()
 			// Past the 15 s hold, with the delivery poll off: only the hold's own retry can run.
+			// It withholds the write (RT-115) and the stream moves past it.
+			const log = await s.store.getOperationsAfterDelivery(0, 1000)
+			const staleSeq = log.find((d) => d.operation.id === stale?.id)?.deliverySequence ?? -1
+			expect(Math.max(0, ...chainOf(cat.messages).map((b) => b.max))).toBeLessThan(staleSeq)
 			clock.advance(16_000)
 			await vi.advanceTimersByTimeAsync(15_000)
 			await s.harness.settle()
-			expect(deliveredOpIds(cat.messages)).toContain(stale?.id)
+			expect(deliveredOpIds(cat.messages)).not.toContain(stale?.id)
+			expect(Math.max(0, ...chainOf(cat.messages).map((b) => b.max))).toBeGreaterThanOrEqual(
+				staleSeq,
+			)
 			await s.harness.server.stop()
 			await s.backend.store.close()
 			await s.backend.done()

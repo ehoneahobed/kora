@@ -93,9 +93,11 @@ export type KoraEvent =
 			 * deleted record (`reason`: the lookup failed, or the record's history is longer
 			 * than the bound). The member's delivery stream is held before the write
 			 * (`action: 'held'`, its watermark not advanced) while the record's summary is
-			 * rebuilt; when the hold cannot resolve in time, or the stream cannot be held (a
-			 * protocol-1 client), the write is sent as it was before access rules
-			 * (`action: 'sent'`). Logged; counted as an error unless held.
+			 * rebuilt. When the hold cannot resolve in time, past the hold cap, or on a stream
+			 * that cannot be held, the write is withheld (`action: 'withheld'`): it is never
+			 * sent, and when the record is live again the device first receives its current
+			 * state. Logged; counted as an error unless held, and in the server metrics'
+			 * `withheldDeliveries`.
 			 */
 			type: 'server:tombstone-delivery-undetermined'
 			sessionId: string
@@ -103,7 +105,7 @@ export type KoraEvent =
 			recordId: string
 			operationId: string
 			reason: 'lookup-failed' | 'undetermined' | 'hold-expired'
-			action: 'held' | 'sent'
+			action: 'held' | 'withheld'
 			message: string
 	  }
 	| { type: 'sync:auth-failed'; reason: string }

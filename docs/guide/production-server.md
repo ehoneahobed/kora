@@ -692,17 +692,19 @@ fails, or the history is longer than the bound), that one write is held back
 (the member's watermark does not advance past it, and nothing else of the member's stream
 waits: later operations are delivered at once),
 the record's summary is rebuilt and the write is judged again with a backoff from 500 ms to
-5 s (the answer is cached per operation, shared by all sessions); a hold that does not
-resolve within 15 seconds sends the write as before access rules applied to it. Until that
-expiry the write is withheld from a member who joined after the delete, but once it expires
-the write goes out to that member too: a late joiner can be shown one stale write in that
-window, which is the accepted cost of not letting a device diverge, and why every expiry is
-logged at `error` level. At most 1,024 writes are held at a time per session; further
-undetermined writes are sent without a hold (a client without a delivery watermark, whose stream could not be held, is
-refused outright when access rules apply: `CLIENT_TOO_OLD`),
-logged as `session.tombstone_delivery_undetermined` at `error` level and emitted as
-`server:tombstone-delivery-undetermined`: a narrow disclosure of one stale write to a
-current member is accepted over a device that diverges. A snapshot wipe by an older
+5 s (the answer is cached per operation, shared by all sessions). A hold that does not
+resolve within 15 seconds **withholds** the write: the gate never sends what it cannot prove
+the member may receive, so a member who joined after the delete is never shown it. The member's
+stream then moves past the write. Its device keeps the record deleted, which is what it shows
+anyway, and the server remembers the record for that device (in `kora_server_meta`, so the mark
+survives reconnects and is shared by every instance). If the record is later revived, the
+device first receives the record's current state, so a member who did hold the record
+converges. At most 1,024 writes are held at a time per session; further undetermined writes
+are withheld at once (a client without a delivery watermark, whose stream could not be held,
+is refused outright when access rules apply: `CLIENT_TOO_OLD`). Every withheld write is
+logged as `session.tombstone_delivery_undetermined` at `error` level, emitted as
+`server:tombstone-delivery-undetermined` with `action: 'withheld'`, and counted in the
+metrics' `withheldDeliveries`: a rising count means the deletion lookup keeps failing. A snapshot wipe by an older
 instance (its fingerprint change) does not bump `live_view_epoch`: the wipe drops the
 snapshots' tombstone state and the summaries only, which are then rebuilt, and a rebuild
 that read the old log writes nothing the wipe left behind because every summary write is

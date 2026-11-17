@@ -413,6 +413,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 				duplicateOperations: snapshot.duplicateOperationsReceived,
 				rejectedOperations: snapshot.rejectedOperations,
 				forgedDuplicates: snapshot.forgedDuplicates,
+				withheldDeliveries: snapshot.withheldDeliveries,
 				bytesReceived: snapshot.bytesReceived,
 				bytesSent: snapshot.bytesSent,
 				errors: snapshot.errorCount,

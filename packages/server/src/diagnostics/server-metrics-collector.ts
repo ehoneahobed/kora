@@ -15,6 +15,12 @@ export interface ServerMetricsSnapshot {
 	rejectedOperations: number
 	/** Uploads refused for reusing a stored operation id with other content (RT-77). */
 	forgedDuplicates: number
+	/**
+	 * Writes withheld from a device because the access gate could not prove it may receive
+	 * them (an undetermined tombstone, RT-115). The device receives the record's state once
+	 * the record is live again; a rising count means the deletion lookup keeps failing.
+	 */
+	withheldDeliveries: number
 	operationsSent: number
 	bytesReceived: number
 	bytesSent: number
@@ -61,6 +67,7 @@ export class ServerMetricsCollector {
 	private duplicateOperationsReceived = 0
 	private rejectedOperations = 0
 	private forgedDuplicates = 0
+	private withheldDeliveries = 0
 	private operationsSent = 0
 	private bytesReceived = 0
 	private bytesSent = 0
@@ -161,6 +168,11 @@ export class ServerMetricsCollector {
 		this.forgedDuplicates++
 	}
 
+	/** Record a write withheld from a device by the access gate (RT-115). */
+	recordWithheldDelivery(): void {
+		this.withheldDeliveries++
+	}
+
 	/** Record an error. */
 	recordError(): void {
 		this.errorCount++
@@ -186,6 +198,7 @@ export class ServerMetricsCollector {
 			duplicateOperationsReceived: this.duplicateOperationsReceived,
 			rejectedOperations: this.rejectedOperations,
 			forgedDuplicates: this.forgedDuplicates,
+			withheldDeliveries: this.withheldDeliveries,
 			operationsSent: this.operationsSent,
 			bytesReceived: this.bytesReceived,
 			bytesSent: this.bytesSent,
@@ -208,6 +221,7 @@ export class ServerMetricsCollector {
 		this.duplicateOperationsReceived = 0
 		this.rejectedOperations = 0
 		this.forgedDuplicates = 0
+		this.withheldDeliveries = 0
 		this.operationsSent = 0
 		this.bytesReceived = 0
 		this.bytesSent = 0

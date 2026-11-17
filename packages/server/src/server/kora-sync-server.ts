@@ -1732,9 +1732,12 @@ export class KoraSyncServer {
 		})
 
 		// Logged by the session; surfaced on the server's emitter, and counted as an error
-		// unless the stream was only held.
+		// unless the stream was only held. A withheld write is also counted on its own.
 		sessionEmitter.on('server:tombstone-delivery-undetermined', (event) => {
-			if (event.action === 'sent' || event.reason === 'lookup-failed') this.metrics.recordError()
+			if (event.action === 'withheld') this.metrics.recordWithheldDelivery()
+			if (event.action === 'withheld' || event.reason === 'lookup-failed') {
+				this.metrics.recordError()
+			}
 			this.emitter?.emit(event)
 		})
 

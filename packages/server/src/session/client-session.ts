@@ -904,6 +904,19 @@ export class ClientSession {
 	/** Writes a watermark stream is held before, by id: when the hold began. */
 	private readonly tombstoneHoldSince = new Map<string, number>()
 	/**
+	 * Records a write onto was withheld from this device (RT-115), by recordCacheKey: the
+	 * gate could not prove the device may receive it. Loaded from the store once per session
+	 * (see withheldEntryFor); when such a record is live again, its current state goes out
+	 * before the next write onto it.
+	 */
+	private readonly withheldRecords = new Set<string>()
+	private withheldLoad: Promise<void> | null = null
+	/** Withheld records whose current state went out, with the delivery sequence it went at. */
+	private readonly withheldServed = new Map<
+		string,
+		{ collection: string; recordId: string; seq: number }
+	>()
+	/**
 	 * Writes the delivery stream is held before right now, by delivery sequence (the
 	 * operation id as value). Everything else keeps flowing; the watermark stays below the
 	 * lowest of them (see undeterminedTombstone).
@@ -1260,8 +1273,14 @@ export class ClientSession {
 				continue
 			}
 			if (await this.operationVisibleToClient(op, snapshot)) {
-				// A record entering the scope arrives whole, before the op that moved it (RT-19).
-				const entry = await this.scopeEntryFor(op, snapshot)
+				// A record entering the scope arrives whole, before the op that moved it (RT-19),
+				// and so does a record whose write was withheld from this device (RT-115).
+				const entry = await this.withheldEntryFor(
+					op,
+					null,
+					null,
+					await this.scopeEntryFor(op, snapshot),
+				)
 				if (entry) visibleOperations.push(entry)
 				visibleOperations.push(op)
 			} else if (await this.scopeRetractionFor(op, snapshot)) {
@@ -1514,6 +1533,7 @@ export class ClientSession {
 		const now = Date.now()
 		this.lastAckedDeliverySeq = acked
 		this.lastDeliveryProgressAtMs = now
+		if (this.withheldServed.size > 0) this.clearServedWithheld(acked)
 		this.deliveryRewinds = 0
 		// An ack of a batch sent before a rewind: the re-send skips what it covers.
 		if (this.lastSentDeliverySeq < acked) this.lastSentDeliverySeq = acked
@@ -4851,7 +4871,12 @@ export class ClientSession {
 						continue
 					}
 					if (await this.operationVisibleToClient(op, snapshot)) {
-						const entry = await this.scopeEntryFor(op, snapshot)
+						const entry = await this.withheldEntryFor(
+							op,
+							null,
+							null,
+							await this.scopeEntryFor(op, snapshot),
+						)
 						if (entry) collect(entry)
 						collect(op)
 					}
@@ -5520,7 +5545,13 @@ export class ClientSession {
 			if (visible) {
 				// The scope-entry shares the trigger's delivery sequence and precedes it,
 				// so a resend from any watermark regenerates it (same id) with its trigger.
-				const entry = await this.scopeEntryFor(delivered.operation, snapshot, rows)
+				// A record whose write was withheld from this device (RT-115) arrives whole too.
+				const entry = await this.withheldEntryFor(
+					delivered.operation,
+					rows,
+					delivered.deliverySequence,
+					await this.scopeEntryFor(delivered.operation, snapshot, rows),
+				)
 				if (entry) {
 					deliverable.push({
 						operation: entry,
@@ -6128,7 +6159,8 @@ export class ClientSession {
 			failure = error
 		}
 		if (deletedAt === null) {
-			return this.undeterminedTombstone(op, seq, pass, failure) === 'hold' ? 'hold' : 'allow'
+			const verdict = await this.undeterminedTombstone(op, seq, pass, failure)
+			return verdict === 'hold' ? 'hold' : verdict === 'withhold' ? 'deny' : 'allow'
 		}
 		return historyAllows(
 			access,
@@ -6316,17 +6348,19 @@ export class ClientSession {
 	 * access-rules member. A watermark stream (`pass.mode` 'hold', known sequence) is held
 	 * before the write: nothing at or after it is sent and the watermark is not advanced,
 	 * the record's summary is rebuilt, and the stream is pushed again shortly, for at most
-	 * TOMBSTONE_HOLD_MAX_MS. When the hold cannot resolve in time, or the stream cannot be
-	 * held (a protocol-1 relay or delta), the write is sent as before access rules
-	 * applied to it: a narrow disclosure to a current member is less harmful than a
-	 * device that diverges. Each outcome is logged and emitted.
+	 * TOMBSTONE_HOLD_MAX_MS. When the hold cannot resolve in time, past the hold cap, or when
+	 * the stream cannot be held, the write is withheld (RT-115): the gate never sends what it
+	 * cannot prove the device may receive. The device keeps the record deleted, which is what
+	 * it shows anyway; the record is remembered for the device (durably, when the store can),
+	 * and if it is live again the device first receives its current state (withheldEntryFor),
+	 * so it converges. Each outcome is logged and emitted.
 	 */
-	private undeterminedTombstone(
+	private async undeterminedTombstone(
 		op: Operation,
 		seq: number | null,
 		pass: TombstonePass,
 		failure: unknown,
-	): 'hold' | 'send' {
+	): Promise<'hold' | 'withhold' | 'send'> {
 		if (pass.mode === 'probe') return 'send'
 		const reason = failure !== null ? 'lookup-failed' : 'undetermined'
 		if (pass.mode === 'hold' && seq !== null) {
@@ -6335,32 +6369,130 @@ export class ClientSession {
 			if (since === undefined) {
 				if (this.tombstoneHoldSince.size >= ClientSession.maxTombstoneHolds) {
 					// A flood of undetermined writes cannot hold the stream open: past the cap
-					// the new ones are sent like an expired hold.
-					this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)
-					return 'send'
+					// the new ones are withheld like an expired hold.
+					await this.withholdWrite(op, 'hold-expired', failure)
+					return 'withhold'
 				}
 				this.tombstoneHoldSince.set(op.id, now)
 				this.reportTombstoneUndetermined(op, reason, 'held', failure)
 			} else if (since === Number.NEGATIVE_INFINITY) {
-				// Expired and reported already (a pass judging it again).
-				return 'send'
+				// Expired and withheld already (a pass judging it again).
+				return 'withhold'
 			} else if (now - since >= TOMBSTONE_HOLD_MAX_MS) {
 				this.tombstoneHoldSince.set(op.id, Number.NEGATIVE_INFINITY)
-				this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)
-				return 'send'
+				await this.withholdWrite(op, 'hold-expired', failure)
+				return 'withhold'
 			}
 			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
 			this.scheduleTombstoneRetry()
 			return 'hold'
 		}
-		this.reportTombstoneUndetermined(op, reason, 'sent', failure)
-		return 'send'
+		await this.withholdWrite(op, reason, failure)
+		return 'withhold'
+	}
+
+	/** Withhold a write from this device and remember its record (see undeterminedTombstone). */
+	private async withholdWrite(
+		op: Operation,
+		reason: 'lookup-failed' | 'undetermined' | 'hold-expired',
+		failure: unknown,
+	): Promise<void> {
+		this.reportTombstoneUndetermined(op, reason, 'withheld', failure)
+		const key = recordCacheKey(op.collection, op.recordId)
+		if (this.withheldRecords.has(key)) return
+		this.withheldRecords.add(key)
+		const nodeId = this.clientNodeId
+		if (nodeId === null || !this.store.markDeliveryWithheld) return
+		try {
+			await this.store.markDeliveryWithheld(nodeId, op.collection, op.recordId)
+		} catch (error) {
+			// The mark lasts this session only: logged, so an operator can see it.
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'error',
+				event: 'session.delivery_withheld_unrecorded',
+				sessionId: this.sessionId,
+				nodeId,
+				error: error instanceof Error ? error.message : String(error),
+				details: { collection: op.collection, recordId: op.recordId },
+			})
+		}
+	}
+
+	/**
+	 * The record's current state to send before `op` when a write onto that record was
+	 * withheld from this device (RT-115) and the record is live again, or null. `entry` is a
+	 * scope entry the caller already built for `op`: it carries the same state, so it is used
+	 * instead. The device's mark is cleared once it acknowledges `seq` (clearServedWithheld).
+	 */
+	private async withheldEntryFor(
+		op: Operation,
+		rows: RecordRows | null,
+		seq: number | null,
+		entry: Operation | null,
+	): Promise<Operation | null> {
+		const nodeId = this.clientNodeId
+		if (nodeId === null) return entry
+		await this.loadWithheld(nodeId)
+		const key = recordCacheKey(op.collection, op.recordId)
+		if (!this.withheldRecords.has(key)) return entry
+		let state = entry
+		if (state === null) {
+			const row = await this.lookupRecordFields(op.collection, op.recordId, rows)
+			if (!row) return null
+			state = await this.scopeEntryForRecord(op.id, op.collection, op.recordId, row)
+		}
+		if (state !== null && seq !== null) {
+			const served = this.withheldServed.get(key)
+			this.withheldServed.set(key, {
+				collection: op.collection,
+				recordId: op.recordId,
+				seq: Math.max(seq, served?.seq ?? seq),
+			})
+		}
+		return state
+	}
+
+	/** Read the records withheld from this device in earlier sessions (once per session). */
+	private loadWithheld(nodeId: string): Promise<void> {
+		this.withheldLoad ??= (async () => {
+			if (!this.store.getDeliveryWithheld) return
+			try {
+				for (const record of await this.store.getDeliveryWithheld(nodeId)) {
+					this.withheldRecords.add(recordCacheKey(record.collection, record.recordId))
+				}
+			} catch (error) {
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'error',
+					event: 'session.delivery_withheld_unreadable',
+					sessionId: this.sessionId,
+					nodeId,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
+		})()
+		return this.withheldLoad
+	}
+
+	/** Forget the withheld records whose current state the device has acknowledged. */
+	private clearServedWithheld(acked: number): void {
+		const nodeId = this.clientNodeId
+		for (const [key, served] of this.withheldServed) {
+			if (served.seq > acked) continue
+			this.withheldServed.delete(key)
+			this.withheldRecords.delete(key)
+			if (nodeId === null || !this.store.clearDeliveryWithheld) continue
+			void this.store
+				.clearDeliveryWithheld(nodeId, served.collection, served.recordId)
+				.catch(() => undefined) // Kept: the device receives the state once more, harmlessly.
+		}
 	}
 
 	private reportTombstoneUndetermined(
 		op: Operation,
 		reason: 'lookup-failed' | 'undetermined' | 'hold-expired',
-		action: 'held' | 'sent',
+		action: 'held' | 'withheld',
 		failure: unknown,
 	): void {
 		const message =
@@ -6370,10 +6502,10 @@ export class ClientSession {
 					: String(failure)
 				: action === 'held'
 					? 'where the record was deleted is not known yet; delivery is held before this write'
-					: 'where the record was deleted could not be determined; the write was sent'
+					: 'where the record was deleted could not be determined; the write was withheld from this device'
 		this.logger?.log({
 			timestamp: Date.now(),
-			level: action === 'sent' || reason === 'lookup-failed' ? 'error' : 'warn',
+			level: action === 'withheld' || reason === 'lookup-failed' ? 'error' : 'warn',
 			event: 'session.tombstone_delivery_undetermined',
 			sessionId: this.sessionId,
 			nodeId: this.clientNodeId ?? undefined,

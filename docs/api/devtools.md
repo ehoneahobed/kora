@@ -88,7 +88,7 @@ off()
 |-------|---------|---------|
 | `sync:forged-duplicate` | `nodeId`, `operationId`, `collection`, `message` | an upload reused a stored operation id with different content (refused) |
 | `server:commit-hook-failed` | `source`, `sessionId`, `operationIds`, `message` | an `onOperationsCommitted` handler threw or rejected (the write was committed regardless) |
-| `server:tombstone-delivery-undetermined` | `sessionId`, `collection`, `recordId`, `operationId`, `reason`, `action`, `message` | the server could not determine where a record's deletion began for an access-rules member; the member's stream was held before the write (`held`), or, when the hold could not resolve or the stream cannot be held, the write was sent (`sent`, logged as an error) |
+| `server:tombstone-delivery-undetermined` | `sessionId`, `collection`, `recordId`, `operationId`, `reason`, `action`, `message` | the server could not determine where a record's deletion began for an access-rules member; the member's stream was held before the write (`held`), or, when the hold could not resolve, past the hold cap, or when the stream cannot be held, the write was withheld (`withheld`, logged as an error and counted in `withheldDeliveries`): it is never sent, and the device receives the record's state if the record is live again |
 | `sync:delivery-stalled` | `sessionId`, `watermark`, `outstandingMaxDeliverySequence`, `repeatCount`, `reason` | a client stopped acknowledging deliveries |
 
 ### Blobs
