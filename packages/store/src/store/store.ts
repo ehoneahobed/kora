@@ -703,6 +703,23 @@ export class Store implements OperationLog {
 			throw error
 		}
 		this.opened = true
+		try {
+			// A replace restore that stopped between its transaction and re-applying this
+			// device's unsynced writes journaled them: apply them now.
+			const journal = await this.adapter.query<{ name: string }>(
+				"SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_kora_restore_pending'",
+			)
+			if (journal.length > 0) {
+				const { replayInterruptedRestore } = await import('../backup/restore')
+				await replayInterruptedRestore(this.adapter, (operation) =>
+					this.applyRemoteOperation(operation),
+				)
+			}
+		} catch (error) {
+			this.opened = false
+			await this.adapter.close().catch(() => undefined)
+			throw error
+		}
 	}
 
 	/** The part of {@link open} that runs once the adapter is open. */

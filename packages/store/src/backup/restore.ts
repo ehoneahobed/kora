@@ -3,6 +3,7 @@ import type { Operation, SchemaDefinition } from '@korajs/core'
 import {
 	COMPACTED_THROUGH_TABLE,
 	FOLD_BASE_TABLE,
+	FOLD_MATERIALIZATION_META_KEY,
 	FOLD_SNAPSHOT_TABLE,
 	FOLD_STATE_TABLE,
 	PROVISIONAL_OPS_TABLE,
@@ -126,6 +127,7 @@ export async function restoreReplace(
 
 	// Writes that exist only on this device: re-applied after the replace.
 	const kept: Operation[] = []
+	const keptRows = new Map<string, { collection: string; row: OperationRow }>()
 	const dropped = new Set<string>()
 	for (const node of localNodes) {
 		const keep = node.accepted || options.keepUnsyncedWrites
@@ -136,8 +138,11 @@ export async function restoreReplace(
 				[node.nodeId, floor],
 			)
 			for (const row of rows) {
-				if (keep) kept.push(deserializeOperationWithCollection(row, collection))
-				else dropped.add(node.nodeId)
+				if (keep) {
+					const operation = deserializeOperationWithCollection(row, collection)
+					kept.push(operation)
+					keptRows.set(operation.id, { collection, row })
+				} else dropped.add(node.nodeId)
 			}
 		}
 	}
@@ -150,6 +155,7 @@ export async function restoreReplace(
 	)
 
 	await ensureLocalSyncRecordTables(adapter)
+	await ensureRestorePendingTable(adapter)
 	let recordsRestored = 0
 	const hasConflicts = await tableExists(adapter, SEQ_CONFLICTS_TABLE)
 	await adapter.transaction(async (tx) => {
@@ -170,6 +176,21 @@ export async function restoreReplace(
 				)
 			}
 		}
+
+		// The kept writes leave the log here and are applied again after this transaction:
+		// journal them in it, so a crash in between replays them on the next open.
+		await tx.execute(`DELETE FROM ${RESTORE_PENDING_TABLE}`)
+		for (const [position, operation] of kept.entries()) {
+			const entry = keptRows.get(operation.id)
+			if (!entry) continue
+			await tx.execute(
+				`INSERT INTO ${RESTORE_PENDING_TABLE} (position, collection, row) VALUES (?, ?, ?)`,
+				[position, entry.collection, JSON.stringify(entry.row)],
+			)
+		}
+		// The fold states of the restored collections are deleted above: the next open must
+		// rebuild them even if this restore stops before the store does.
+		await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [FOLD_MATERIALIZATION_META_KEY])
 
 		// Version vector. Without a collection filter, remote nodes take the backup's
 		// values; this database's own nodes never go backwards. With a filter, MAX only.
@@ -275,6 +296,7 @@ export async function restoreReplace(
 	}
 
 	await adapter.transaction(async (tx) => {
+		await tx.execute(`DELETE FROM ${RESTORE_PENDING_TABLE}`)
 		// Restartable counters continue after the highest number now in the log.
 		for (const nodeId of restartable) {
 			const highest = await highestSequence(tx, targets, nodeId)
@@ -409,4 +431,40 @@ function toSqlValue(value: unknown): unknown {
 	if (value instanceof Uint8Array) return value
 	if (value !== null && typeof value === 'object') return JSON.stringify(value)
 	return value
+}
+
+/** The unsynced writes a replace restore applies again once its transaction commits. */
+export const RESTORE_PENDING_TABLE = '_kora_restore_pending'
+
+async function ensureRestorePendingTable(adapter: StorageAdapter): Promise<void> {
+	await adapter.execute(
+		`CREATE TABLE IF NOT EXISTS ${RESTORE_PENDING_TABLE} (position INTEGER PRIMARY KEY, collection TEXT NOT NULL, row TEXT NOT NULL)`,
+	)
+}
+
+/**
+ * Apply the writes an interrupted replace restore journaled and did not apply again (the
+ * store opens with them). The apply path deduplicates by operation id, so writes the restore
+ * did re-apply before it stopped are skipped.
+ *
+ * @returns How many writes were applied
+ */
+export async function replayInterruptedRestore(
+	adapter: StorageAdapter,
+	applyOperation: (operation: Operation) => Promise<ApplyResult>,
+): Promise<number> {
+	if (!(await tableExists(adapter, RESTORE_PENDING_TABLE))) return 0
+	const pending = await adapter.query<{ collection: string; row: string }>(
+		`SELECT collection, row FROM ${RESTORE_PENDING_TABLE} ORDER BY position`,
+	)
+	let applied = 0
+	for (const entry of pending) {
+		const operation = deserializeOperationWithCollection(
+			JSON.parse(entry.row) as OperationRow,
+			entry.collection,
+		)
+		if ((await applyOperation(operation)) === 'applied') applied++
+	}
+	if (pending.length > 0) await adapter.execute(`DELETE FROM ${RESTORE_PENDING_TABLE}`)
+	return applied
 }
