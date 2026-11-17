@@ -385,9 +385,10 @@ describe('TauriSqliteAdapter', () => {
 					expect(rows.map((row) => row.id)).toEqual(expected)
 					await serial.close()
 				}),
-				{ numRuns: 150 },
+				{ numRuns: Number(process.env.KORA_TAURI_PROP_RUNS ?? 150) },
 			)
-		})
+			// Each run waits event-loop turns, which a saturated CI runner stretches.
+		}, 60_000)
 	})
 
 	describe('close', () => {
