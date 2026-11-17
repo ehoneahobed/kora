@@ -426,25 +426,24 @@ export const MAX_HANDSHAKE_QUERY_SUBSETS = 500
 
 /**
  * Keep the query views under MAX_HANDSHAKE_QUERY_SUBSETS: past it, the collections with the
- * most views are collapsed to the whole collection (`where: {}`), which covers every view of
- * that collection. The device then receives more of the collection, never less.
+ * most views stop being restricted. A collection with no view is synced whole (the server and
+ * `querySubsetContains` both read it that way), which covers every view it had, so its entries
+ * are dropped: the device then receives more of the collection, never less. With more
+ * collections than the cap, this can drop them all, which is a full sync.
  */
 function capQuerySubsets(subsets: SyncQuerySubset[]): SyncQuerySubset[] {
 	if (subsets.length <= MAX_HANDSHAKE_QUERY_SUBSETS) return subsets
 	const counts = new Map<string, number>()
 	for (const subset of subsets)
 		counts.set(subset.collection, (counts.get(subset.collection) ?? 0) + 1)
-	const collapsed = new Set<string>()
+	const unrestricted = new Set<string>()
 	let total = subsets.length
 	for (const [collection, count] of [...counts].sort(([, countA], [, countB]) => countB - countA)) {
 		if (total <= MAX_HANDSHAKE_QUERY_SUBSETS) break
-		collapsed.add(collection)
-		total -= count - 1
+		unrestricted.add(collection)
+		total -= count
 	}
-	return dedupeQuerySubsets([
-		...subsets.filter((subset) => !collapsed.has(subset.collection)),
-		...[...collapsed].map((collection) => ({ collection, where: {} })),
-	])
+	return subsets.filter((subset) => !unrestricted.has(subset.collection))
 }
 
 /**

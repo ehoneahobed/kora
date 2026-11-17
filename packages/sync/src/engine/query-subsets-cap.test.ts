@@ -8,8 +8,8 @@ import type { SyncStore } from './sync-store'
  * A server refuses a handshake with more than `maxSyncQueries` query views (1,000 by default)
  * and does not retry it. A client that mounts many narrow reactive queries (a long list whose
  * rows each query their own records) must stay under that on its own: past
- * MAX_HANDSHAKE_QUERY_SUBSETS it collapses each collection to the whole collection, which
- * covers every view it had (it syncs more, never less).
+ * MAX_HANDSHAKE_QUERY_SUBSETS it stops restricting the collections with the most views; an
+ * unrestricted collection is synced whole, which covers every view it had (more, never less).
  */
 function store(): SyncStore {
 	return {
@@ -21,7 +21,7 @@ function store(): SyncStore {
 }
 
 describe('query views sent at handshake stay under the server cap', () => {
-	test('many narrow views collapse to collection-wide ones that cover them all', () => {
+	test('many narrow views give way to whole collections that cover them all', () => {
 		const engine = new SyncEngine({
 			transport: createMemoryTransportPair().client,
 			store: store(),
