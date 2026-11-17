@@ -419,6 +419,35 @@ function stableStringify(value: unknown): string {
 }
 
 /**
+ * Most query views a handshake carries. A server refuses more than its `maxSyncQueries`
+ * (1,000 by default) without retrying, so the client stays well under it on its own.
+ */
+export const MAX_HANDSHAKE_QUERY_SUBSETS = 500
+
+/**
+ * Keep the query views under MAX_HANDSHAKE_QUERY_SUBSETS: past it, the collections with the
+ * most views are collapsed to the whole collection (`where: {}`), which covers every view of
+ * that collection. The device then receives more of the collection, never less.
+ */
+function capQuerySubsets(subsets: SyncQuerySubset[]): SyncQuerySubset[] {
+	if (subsets.length <= MAX_HANDSHAKE_QUERY_SUBSETS) return subsets
+	const counts = new Map<string, number>()
+	for (const subset of subsets)
+		counts.set(subset.collection, (counts.get(subset.collection) ?? 0) + 1)
+	const collapsed = new Set<string>()
+	let total = subsets.length
+	for (const [collection, count] of [...counts].sort(([, countA], [, countB]) => countB - countA)) {
+		if (total <= MAX_HANDSHAKE_QUERY_SUBSETS) break
+		collapsed.add(collection)
+		total -= count - 1
+	}
+	return dedupeQuerySubsets([
+		...subsets.filter((subset) => !collapsed.has(subset.collection)),
+		...[...collapsed].map((collection) => ({ collection, where: {} })),
+	])
+}
+
+/**
  * Core sync orchestrator. Manages the sync lifecycle:
  * disconnected → connecting → handshaking → syncing → streaming
  *
@@ -2265,10 +2294,10 @@ export class SyncEngine {
 			mode === 'static'
 				? this.staticQuerySubsets
 				: dedupeQuerySubsets([...this.querySubsets.values()])
-		if (this.pinQuerySubsets.length === 0) return base
+		if (this.pinQuerySubsets.length === 0) return capQuerySubsets(base)
 		const restricted = new Set(base.map((subset) => subset.collection))
 		const pins = this.pinQuerySubsets.filter((subset) => restricted.has(subset.collection))
-		return pins.length === 0 ? base : dedupeQuerySubsets([...base, ...pins])
+		return capQuerySubsets(pins.length === 0 ? base : dedupeQuerySubsets([...base, ...pins]))
 	}
 
 	/**

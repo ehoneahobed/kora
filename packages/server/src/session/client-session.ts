@@ -186,6 +186,7 @@ import {
 	SessionRateLimiter,
 	validateOperationSize,
 } from './session-operation-limits'
+import { DEFAULT_MAX_SYNC_QUERIES, checkSyncQueries } from './sync-queries-validation'
 
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
@@ -624,6 +625,8 @@ export interface ClientSessionOptions {
 	 * {@link DEFAULT_MAX_SCOPE_PREDICATE_VALUES} (100).
 	 */
 	maxScopePredicateValues?: number
+	/** Most entries a handshake's `syncQueries` may hold (see KoraSyncServerConfig.maxSyncQueries). */
+	maxSyncQueries?: number
 	/**
 	 * Adjudicate untrusted client operations before materialization. When present,
 	 * each incoming operation is passed to this validator; a `reject` decision
@@ -1019,6 +1022,7 @@ export class ClientSession {
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
 	private readonly maxScopePredicateValues: number
+	private readonly maxSyncQueries: number
 	/** {@link getScopePartitionKey}, cached for the scope map it was computed from. */
 	private scopePartitionKeyCache: { scopes: ScopeMap; key: string } | null = null
 	/** Store reads for presence cursors (F16), per minute. */
@@ -1118,6 +1122,7 @@ export class ClientSession {
 		this.maxOpsPerBatch = options.maxOpsPerBatch ?? DEFAULT_MAX_OPS_PER_BATCH
 		this.maxScopePredicateValues =
 			options.maxScopePredicateValues ?? DEFAULT_MAX_SCOPE_PREDICATE_VALUES
+		this.maxSyncQueries = options.maxSyncQueries ?? DEFAULT_MAX_SYNC_QUERIES
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
 		this.blobAccess = options.blobAccess ?? null
@@ -2795,6 +2800,14 @@ export class ClientSession {
 		// Only accept handshake in 'connected' state (prevent duplicate handshakes)
 		if (this.state !== 'connected') {
 			this.sendError('DUPLICATE_HANDSHAKE', 'Handshake already completed', false)
+			return
+		}
+
+		// The client-supplied query views are checked before anything works on them (RT-116).
+		const queriesVerdict = checkSyncQueries(msg.syncQueries, this.maxSyncQueries)
+		if (queriesVerdict) {
+			this.sendError(queriesVerdict.code, queriesVerdict.message, false)
+			this.close(queriesVerdict.code)
 			return
 		}
 

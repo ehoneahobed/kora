@@ -66,56 +66,36 @@ function stableValue(value: unknown): unknown {
 	return value
 }
 
-function whereContains(broad: Record<string, unknown>, narrow: Record<string, unknown>): boolean {
-	return Object.entries(broad).every(
-		([field, expected]) =>
-			JSON.stringify(stableValue(narrow[field])) === JSON.stringify(stableValue(expected)),
-	)
+interface CanonicalSubset {
+	collection: string
+	where: Record<string, unknown>
+	/** The canonical where, as JSON (its identity). */
+	key: string
+	/** Field name to the field's canonical value as JSON. */
+	fields: Map<string, string>
 }
 
-/** Canonicalize equality subsets and remove subsets already covered by a broader one. */
+/** Enumerate sub-dictionaries of a where with at most this many fields; scan beyond it. */
+const MAX_ENUMERATED_FIELDS = 10
+
+/**
+ * Canonicalize equality subsets and remove subsets already covered by a broader one: an
+ * entry is dropped when another entry of the same collection selects every record it
+ * selects with fewer conditions (a proper sub-dictionary of its where), and duplicates are
+ * kept once. Runs on every handshake over a list the client sends, so it indexes the
+ * entries by their canonical form instead of comparing every pair: a where with few fields
+ * looks up each of its sub-dictionaries, a larger one scans only entries with fewer fields.
+ */
 export function dedupeQuerySubsets(subsets: SyncQuerySubset[]): SyncQuerySubset[] {
-	const normalized = subsets.map((subset) => ({
-		collection: subset.collection,
-		where: stableValue(subset.where) as Record<string, unknown>,
-	}))
+	const byCollection = indexByCollection(subsets)
 	const result: SyncQuerySubset[] = []
-	for (const candidate of normalized) {
-		if (
-			normalized.some(
-				(other) =>
-					other !== candidate &&
-					other.collection === candidate.collection &&
-					whereContains(other.where, candidate.where) &&
-					(Object.keys(other.where).length < Object.keys(candidate.where).length ||
-						JSON.stringify(other.where) === JSON.stringify(candidate.where)),
-			)
-		) {
-			const duplicateAlreadyKept = result.some(
-				(item) =>
-					item.collection === candidate.collection &&
-					JSON.stringify(item.where) === JSON.stringify(candidate.where),
-			)
-			if (
-				duplicateAlreadyKept ||
-				normalized.some(
-					(other) =>
-						other !== candidate &&
-						other.collection === candidate.collection &&
-						Object.keys(other.where).length < Object.keys(candidate.where).length &&
-						whereContains(other.where, candidate.where),
-				)
-			)
-				continue
+	for (const entries of byCollection.values()) {
+		const all = [...entries.values()]
+		for (const candidate of all) {
+			if (!coveredByBroader(candidate, entries, all)) {
+				result.push({ collection: candidate.collection, where: candidate.where })
+			}
 		}
-		if (
-			!result.some(
-				(item) =>
-					item.collection === candidate.collection &&
-					JSON.stringify(item.where) === JSON.stringify(candidate.where),
-			)
-		)
-			result.push(candidate)
 	}
 	return result.sort((a, b) =>
 		`${a.collection}:${JSON.stringify(a.where)}`.localeCompare(
@@ -124,27 +104,72 @@ export function dedupeQuerySubsets(subsets: SyncQuerySubset[]): SyncQuerySubset[
 	)
 }
 
+/** The distinct canonical subsets of each collection, by canonical where. */
+function indexByCollection(subsets: SyncQuerySubset[]): Map<string, Map<string, CanonicalSubset>> {
+	const byCollection = new Map<string, Map<string, CanonicalSubset>>()
+	for (const subset of subsets) {
+		const where = stableValue(subset.where) as Record<string, unknown>
+		const key = JSON.stringify(where)
+		let entries = byCollection.get(subset.collection)
+		if (!entries) {
+			entries = new Map()
+			byCollection.set(subset.collection, entries)
+		}
+		if (entries.has(key)) continue
+		const fields = new Map<string, string>()
+		for (const [field, value] of Object.entries(where)) fields.set(field, JSON.stringify(value))
+		entries.set(key, { collection: subset.collection, where, key, fields })
+	}
+	return byCollection
+}
+
+/** True when another entry's where is a proper sub-dictionary of the candidate's. */
+function coveredByBroader(
+	candidate: CanonicalSubset,
+	entries: Map<string, CanonicalSubset>,
+	all: CanonicalSubset[],
+): boolean {
+	const names = [...candidate.fields.keys()]
+	if (names.length === 0) return false
+	if (names.length <= MAX_ENUMERATED_FIELDS) {
+		const full = (1 << names.length) - 1
+		for (let mask = 0; mask < full; mask++) {
+			const sub: Record<string, unknown> = {}
+			for (let bit = 0; bit < names.length; bit++) {
+				const name = names[bit]
+				if (name !== undefined && mask & (1 << bit)) sub[name] = candidate.where[name]
+			}
+			if (entries.has(JSON.stringify(sub))) return true
+		}
+		return false
+	}
+	return all.some(
+		(other) =>
+			other.fields.size < candidate.fields.size &&
+			[...other.fields].every(([field, value]) => candidate.fields.get(field) === value),
+	)
+}
+
 /** True when every record selected by `narrow` is also selected by `broad`. */
 export function querySubsetContains(broad: SyncQuerySubset[], narrow: SyncQuerySubset[]): boolean {
-	const collections = new Set([
-		...broad.map((subset) => subset.collection),
-		...narrow.map((subset) => subset.collection),
-	])
+	const broadIndex = indexByCollection(broad)
+	const narrowIndex = indexByCollection(narrow)
+	const collections = new Set([...broadIndex.keys(), ...narrowIndex.keys()])
 	for (const collection of collections) {
-		const broadForCollection = broad.filter((subset) => subset.collection === collection)
-		const narrowForCollection = narrow.filter((subset) => subset.collection === collection)
+		const broadEntries = broadIndex.get(collection)
+		const narrowEntries = narrowIndex.get(collection)
 		// No predicate for a collection means that collection is unrestricted.
-		if (narrowForCollection.length === 0) {
-			if (broadForCollection.length > 0) return false
+		if (!narrowEntries) {
+			if (broadEntries) return false
 			continue
 		}
-		if (broadForCollection.length === 0) continue
-		if (
-			!narrowForCollection.every((candidate) =>
-				broadForCollection.some((other) => whereContains(other.where, candidate.where)),
-			)
-		)
-			return false
+		if (!broadEntries) continue
+		const all = [...broadEntries.values()]
+		for (const candidate of narrowEntries.values()) {
+			if (!broadEntries.has(candidate.key) && !coveredByBroader(candidate, broadEntries, all)) {
+				return false
+			}
+		}
 	}
 	return true
 }

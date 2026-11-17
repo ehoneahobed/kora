@@ -315,6 +315,12 @@ export interface KoraSyncServerConfig {
 	 */
 	maxScopePredicateValues?: number
 	/**
+	 * Most entries a client's handshake `syncQueries` (its reactive query views) may hold. A
+	 * longer list is refused with `SYNC_QUERIES_LIMIT`, and a malformed one with
+	 * `INVALID_SYNC_QUERIES`, before the server deduplicates it. Defaults to 1000.
+	 */
+	maxSyncQueries?: number
+	/**
 	 * Accept anonymous devices whose node claim predates confirmed claims (RT-21):
 	 * nodes whose operation history predates node claims (a database written by a
 	 * beta.12 or older server, which recorded no claims; RT-91), nodes held by the
