@@ -251,7 +251,7 @@ Every store implements `ServerStore`:
 | Method | Description |
 |--------|-------------|
 | `setSchema(schema, { operationTransforms? })` | Creates one table per collection, folds existing operations into it, and enables constraint, relation and scope checks. Call it before serving clients. |
-| `queryCollection(collection, { where?, orderBy?, orderDirection?, limit?, offset?, includeDeleted? })` | Materialized records (`where` is exact match). |
+| `queryCollection(collection, { where?, orderBy?, orderDirection?, limit?, offset?, includeDeleted? })` | Materialized records. `where` is exact match on the stored value (a boolean matches as a boolean; `null` matches a null or absent field). `orderBy` puts nulls last in both directions and compares strings by code point; `id` breaks ties and is the order when none is given, so `limit`/`offset` pages are stable. The memory, SQLite and Postgres stores answer alike. |
 | `findRecord(collection, id)` | One record, or `null` when missing or deleted. |
 | `countCollection(collection, where?)` | Count. |
 | `materializeCollection(collection)` | Every record (from the log when no schema is set). |

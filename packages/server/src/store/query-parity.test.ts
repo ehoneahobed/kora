@@ -47,14 +47,13 @@ type Row = {
 }
 const FIELDS = ['done', 'who', 'status', 'at', 'score'] as const
 
-const pgClients: Array<ReturnType<typeof postgres>> = []
-afterAll(async () => {
-	for (const client of pgClients) await client.end()
-})
 let schemas = 0
-const makers: Array<[string, () => Promise<ServerStore>]> = [
-	['memory', async () => new MemoryServerStore()],
-	['sqlite', async () => createSqliteServerStore({})],
+/** A store for one run, and what ends it (a Postgres run also ends its own client). */
+type Opened = { store: ServerStore; end: () => Promise<void> }
+const closing = (store: ServerStore): Opened => ({ store, end: () => store.close() })
+const makers: Array<[string, () => Promise<Opened>]> = [
+	['memory', async () => closing(new MemoryServerStore())],
+	['sqlite', async () => closing(createSqliteServerStore({}))],
 ]
 if (PG_URL) {
 	makers.push([
@@ -70,8 +69,14 @@ if (PG_URL) {
 				onnotice: () => {},
 				connection: { search_path: name },
 			})
-			pgClients.push(client)
-			return new PostgresServerStore(drizzle(client))
+			const store = new PostgresServerStore(drizzle(client))
+			return {
+				store,
+				end: async () => {
+					await store.close()
+					await client.end({ timeout: 5 })
+				},
+			}
 		},
 	])
 }
@@ -151,7 +156,7 @@ describe.each(makers)('%s server store: queries follow the shared contract', (_k
 				fc.array(rowArb, { minLength: 1, maxLength: 12 }),
 				fc.array(queryArb, { minLength: 1, maxLength: 8 }),
 				async (generated, queries) => {
-					const store = await make()
+					const { store, end } = await make()
 					try {
 						await store.setSchema(schema)
 						// Ids are inserted out of order, so insertion order is not id order.
@@ -185,7 +190,7 @@ describe.each(makers)('%s server store: queries follow the shared contract', (_k
 							).toBe(model(rows, { where: query.where }).length)
 						}
 					} finally {
-						await store.close()
+						await end()
 					}
 				},
 			),

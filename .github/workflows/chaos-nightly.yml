@@ -139,6 +139,9 @@ jobs:
           src/store/delivery-partitions tests/integration/delivery-index
           tests/integration/access-rescope.test.ts
 
+      - name: Server-store query contract on Postgres (memory, SQLite, Postgres agree)
+        run: pnpm --filter @korajs/server exec vitest run src/store/query-parity.test.ts
+
       - name: First-sync benchmark on Postgres (full fixture, Slow 4G)
         env:
           KORA_BENCH_STORE: postgres
