@@ -21,7 +21,7 @@ function randomClientId(): number {
 	const crypto = globalThis.crypto
 	if (crypto?.getRandomValues) crypto.getRandomValues(values)
 	else values[0] = Math.floor(Math.random() * 0x7fffffff)
-	return ((values[0] ?? 0) & 0x7fffffff) || 1
+	return (values[0] ?? 0) & 0x7fffffff || 1
 }
 
 /**
