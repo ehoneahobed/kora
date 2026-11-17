@@ -96,6 +96,45 @@ export function fullResyncUserKey(userId: string): string {
 	return `full_resync:user:${userId}`
 }
 
+/**
+ * `kora_server_meta` key of a record whose write was withheld from a device (RT-115). The
+ * ids are JSON-encoded so any characters they hold stay unambiguous, and every key of one
+ * device starts with {@link withheldDeliveryPrefix}.
+ */
+export function withheldDeliveryKey(nodeId: string, collection: string, recordId: string): string {
+	return `delivery_withheld:${JSON.stringify([nodeId, collection, recordId])}`
+}
+
+/** The prefix every {@link withheldDeliveryKey} of device `nodeId` starts with. */
+export function withheldDeliveryPrefix(nodeId: string): string {
+	return `delivery_withheld:${JSON.stringify([nodeId]).slice(0, -1)},`
+}
+
+/** The record a {@link withheldDeliveryKey} names, or null for another key. */
+export function parseWithheldDeliveryKey(key: string): WithheldRecord | null {
+	if (!key.startsWith('delivery_withheld:')) return null
+	try {
+		const parsed: unknown = JSON.parse(key.slice('delivery_withheld:'.length))
+		if (
+			Array.isArray(parsed) &&
+			parsed.length === 3 &&
+			typeof parsed[1] === 'string' &&
+			typeof parsed[2] === 'string'
+		) {
+			return { collection: parsed[1], recordId: parsed[2] }
+		}
+	} catch {
+		// Not one of ours.
+	}
+	return null
+}
+
+/** A record whose write was withheld from a device (see ServerStore.markDeliveryWithheld). */
+export interface WithheldRecord {
+	collection: string
+	recordId: string
+}
+
 /** `kora_server_meta` key of a full-resync request for one device node. */
 export function fullResyncNodeKey(nodeId: string): string {
 	return `full_resync:node:${nodeId}`
@@ -798,6 +837,17 @@ export interface ServerStore extends SyncStore {
 	 * `view` (keeps the newest). Required with `requestFullResync`.
 	 */
 	completeFullResync?(nodeId: string, token: number, view?: string): Promise<void>
+	/**
+	 * Remember that a write onto a record was withheld from device `nodeId` (RT-115): where
+	 * the record's deletion began could not be determined, so the access gate could not prove
+	 * the device may receive it. When the record is live again the device first receives the
+	 * record's current state. Optional; without it the mark lasts only the device's session.
+	 */
+	markDeliveryWithheld?(nodeId: string, collection: string, recordId: string): Promise<void>
+	/** The records whose writes were withheld from device `nodeId` (see markDeliveryWithheld). */
+	getDeliveryWithheld?(nodeId: string): Promise<WithheldRecord[]>
+	/** Forget a withheld record once the device acknowledged the record's current state. */
+	clearDeliveryWithheld?(nodeId: string, collection: string, recordId: string): Promise<void>
 	/**
 	 * The owner a node id is currently claimed by, or null when unclaimed (RT-21).
 	 * Optional; anonymous provisional claims need it together with

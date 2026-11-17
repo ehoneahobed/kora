@@ -116,10 +116,14 @@ import {
 	FULL_RESYNC_COUNTER_KEY,
 	type FullResyncState,
 	type FullResyncTarget,
+	type WithheldRecord,
 	fullResyncDoneKey,
 	fullResyncNodeKey,
 	fullResyncUserKey,
 	newestFullResyncToken,
+	parseWithheldDeliveryKey,
+	withheldDeliveryKey,
+	withheldDeliveryPrefix,
 } from './server-store'
 import { type StagedBlobOwner, WriteGate, stagingBlobOwners } from './write-gate'
 
@@ -200,6 +204,8 @@ export class MemoryServerStore implements ServerStore {
 	private readonly nodeOwners = new Map<string, string>()
 	/** Full-resync requests and completions (forceFullResync), by meta key. */
 	private readonly fullResyncMeta = new Map<string, string>()
+	/** Withheld deliveries (RT-115), keyed by withheldDeliveryKey. */
+	private readonly withheldDeliveries = new Set<string>()
 	/** Operation id -> scope snapshot captured at apply time (RT-14). */
 	private readonly scopeSnapshots = new Map<string, OperationScopeSnapshot>()
 	/** Live-view summaries by record (see live-views.ts), and each collection's fields. */
@@ -1705,6 +1711,25 @@ export class MemoryServerStore implements ServerStore {
 		if (this.nodeOwners.get(nodeId) !== expectedOwner) return false
 		this.nodeOwners.set(nodeId, newOwner)
 		return true
+	}
+
+	async markDeliveryWithheld(nodeId: string, collection: string, recordId: string): Promise<void> {
+		this.withheldDeliveries.add(withheldDeliveryKey(nodeId, collection, recordId))
+	}
+
+	async getDeliveryWithheld(nodeId: string): Promise<WithheldRecord[]> {
+		const prefix = withheldDeliveryPrefix(nodeId)
+		const records: WithheldRecord[] = []
+		for (const key of this.withheldDeliveries) {
+			if (!key.startsWith(prefix)) continue
+			const record = parseWithheldDeliveryKey(key)
+			if (record) records.push(record)
+		}
+		return records
+	}
+
+	async clearDeliveryWithheld(nodeId: string, collection: string, recordId: string): Promise<void> {
+		this.withheldDeliveries.delete(withheldDeliveryKey(nodeId, collection, recordId))
 	}
 
 	async requestFullResync(target: FullResyncTarget): Promise<number> {

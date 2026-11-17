@@ -383,7 +383,7 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 		await backend.done()
 	})
 
-	test('a hold that cannot resolve in time sends the write (as before access rules) and says so', async () => {
+	test('a hold that cannot resolve in time withholds the write (never sent), says so, and a revival converges', async () => {
 		const backend = await make()
 		const logs: LogEntry[] = []
 		const events: KoraEvent[] = []
@@ -451,13 +451,14 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 		} finally {
 			clock.mockRestore()
 		}
-		expect(deliveredOpIds(cat.messages)).toContain(stale.id)
+		// The gate cannot prove cat may receive it: it is withheld, never sent (#78).
+		expect(deliveredOpIds(cat.messages)).not.toContain(stale.id)
 		expect(events).toContainEqual(
 			expect.objectContaining({
 				type: 'server:tombstone-delivery-undetermined',
 				operationId: stale.id,
 				reason: 'hold-expired',
-				action: 'sent',
+				action: 'withheld',
 			}),
 		)
 		expect(
@@ -465,9 +466,134 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 				(entry) =>
 					entry.event === 'session.tombstone_delivery_undetermined' &&
 					entry.level === 'error' &&
-					(entry.details as { action?: string } | undefined)?.action === 'sent',
+					(entry.details as { action?: string } | undefined)?.action === 'withheld',
 			),
 		).toBe(true)
+		// Operators can see it: a counter of withheld deliveries.
+		expect(harness.server.getMetricsCollector().getSnapshot(0).withheldDeliveries).toBeGreaterThan(
+			0,
+		)
+		// The record comes back: cat receives its current state first and converges.
+		const desk = await harness.login('ann', 'ann-desk', FRESH)
+		await sendAndAwaitAck(desk, [
+			makeOp('ann-desk', 1, {
+				type: 'update',
+				collection: 'comments',
+				recordId: 'c1',
+				data: { pinned: true },
+				timestamp: { wallTime: now + 30, logical: 0, nodeId: 'ann-desk' },
+			}),
+		])
+		await harness.settle()
+		const device = foldRecord(receivedOps(cat.messages, 'c1'), schema).state
+		const server = await backend.store.getRecordFoldState?.('comments', 'c1')
+		expect(server ? materialize(server) : null).toMatchObject({
+			body: 'STALE-SECRET',
+			pinned: true,
+		})
+		expect(device ? materialize(device) : null).toEqual(server ? materialize(server) : null)
+		await harness.server.stop()
+		await backend.store.close()
+		await backend.done()
+	})
+
+	test('a withheld write survives a reconnect: the device resumes past it and still converges on a revival', async () => {
+		const backend = await make()
+		const events: KoraEvent[] = []
+		const emitter = new SimpleEventEmitter()
+		emitter.on('server:tombstone-delivery-undetermined', (event) => events.push(event))
+		const harness = await createHarness(
+			schema,
+			auth,
+			{ emitter },
+			backend.store as unknown as MemoryServerStore,
+		)
+		const store = backend.store as ServerStore
+		store.getRecordLiveViews = async () => new Map()
+		store.requestLiveViewRebuild = () => {}
+		store.getTombstoneStart = async () => {
+			throw new Error('lookup unavailable')
+		}
+		const ann = await harness.login('ann', 'ann-node', FRESH)
+		const now = Date.now()
+		await sendAndAwaitAck(ann, [
+			makeOp('ann-node', 1, {
+				collection: 'documents',
+				recordId: 'd1',
+				data: { title: 'doc', ownerId: 'ann' },
+				timestamp: { wallTime: now, logical: 0, nodeId: 'ann-node' },
+			}),
+			makeOp('ann-node', 2, {
+				collection: 'comments',
+				recordId: 'c1',
+				data: { documentId: 'd1', body: 'first' },
+				timestamp: { wallTime: now + 1, logical: 0, nodeId: 'ann-node' },
+			}),
+		])
+		await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+		await sendAndAwaitAck(ann, [
+			makeOp('ann-node', 3, {
+				type: 'delete',
+				collection: 'comments',
+				recordId: 'c1',
+				data: null,
+				timestamp: { wallTime: now + 10, logical: 0, nodeId: 'ann-node' },
+			}),
+		])
+		const stale = makeOp('ann-tablet', 1, {
+			type: 'update',
+			collection: 'comments',
+			recordId: 'c1',
+			data: { body: 'STALE-SECRET' },
+			timestamp: { wallTime: now + 5, logical: 0, nodeId: 'ann-tablet' },
+		})
+		const tablet = await harness.login('ann', 'ann-tablet', FRESH)
+		await sendAndAwaitAck(tablet, [stale])
+		await harness.settle()
+		const cat = await harness.login('cat', 'cat-node', FRESH)
+		await harness.settle()
+		const realNow = Date.now.bind(Date)
+		const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 60_000)
+		try {
+			await harness.server.pollDeliveryLog()
+			await harness.settle()
+		} finally {
+			clock.mockRestore()
+		}
+		expect(deliveredOpIds(cat.messages)).not.toContain(stale.id)
+		expect(events.some((e) => 'action' in e && e.action === 'withheld')).toBe(true)
+		// The device's watermark is past the withheld write; it goes away.
+		const watermark = Math.max(0, ...chainOf(cat.messages).map((b) => b.max))
+		const log = await backend.store.getOperationsAfterDelivery(0, 1000)
+		const staleSeq = log.find((d) => d.operation.id === stale.id)?.deliverySequence ?? -1
+		expect(watermark).toBeGreaterThanOrEqual(staleSeq)
+		const firstSession = receivedOps(cat.messages, 'c1')
+		await cat.client.disconnect()
+		await harness.settle()
+		// While it is away, the record comes back.
+		const desk = await harness.login('ann', 'ann-desk', FRESH)
+		await sendAndAwaitAck(desk, [
+			makeOp('ann-desk', 1, {
+				type: 'update',
+				collection: 'comments',
+				recordId: 'c1',
+				data: { pinned: true },
+				timestamp: { wallTime: now + 30, logical: 0, nodeId: 'ann-desk' },
+			}),
+		])
+		await harness.settle()
+		const back = await harness.login('cat', 'cat-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: watermark,
+		} as Partial<SyncMessage>)
+		await harness.settle()
+		const device = foldRecord([...firstSession, ...receivedOps(back.messages, 'c1')], schema).state
+		const server = await backend.store.getRecordFoldState?.('comments', 'c1')
+		expect(server ? materialize(server) : null).toMatchObject({
+			body: 'STALE-SECRET',
+			pinned: true,
+		})
+		expect(device ? materialize(device) : null).toEqual(server ? materialize(server) : null)
 		await harness.server.stop()
 		await backend.store.close()
 		await backend.done()
@@ -800,7 +926,7 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		await s.backend.store.close()
 		await s.backend.done()
 	})
-	test('past the hold cap the overflow write is sent (logged), earlier holds are kept and the stream flows', async () => {
+	test('past the hold cap the overflow write is withheld (logged), earlier holds are kept and the stream flows', async () => {
 		const previous = ClientSession.maxTombstoneHolds
 		ClientSession.maxTombstoneHolds = 2
 		try {
@@ -809,15 +935,12 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 			const cat = await s.harness.login('cat', 'cat-node', FRESH)
 			await s.harness.settle()
 			const delivered = deliveredOpIds(cat.messages)
-			// The first two are held; the two beyond the cap are sent, loudly.
-			expect(delivered).not.toContain(s.stale[0]?.id)
-			expect(delivered).not.toContain(s.stale[1]?.id)
-			expect(delivered).toContain(s.stale[2]?.id)
-			expect(delivered).toContain(s.stale[3]?.id)
+			// The first two are held; the two beyond the cap are withheld, loudly: none is sent.
+			for (const op of s.stale) expect(delivered).not.toContain(op.id)
 			const expired = logs.filter(
 				(l) =>
 					l.event === 'session.tombstone_delivery_undetermined' &&
-					(l.details as { action?: string } | undefined)?.action === 'sent',
+					(l.details as { action?: string } | undefined)?.action === 'withheld',
 			)
 			// One entry per session that judged it (ann's own devices are members too).
 			expect(
@@ -1165,7 +1288,7 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		await s.backend.store.close()
 		await s.backend.done()
 	})
-	test('a hold expires on its own deadline while an unrelated backfill is still pending', async () => {
+	test('a hold expires on its own deadline while an unrelated backfill is still pending (the write is withheld, the stream moves past it)', async () => {
 		// Session logic, the same on every store; faked timers would starve the Postgres driver.
 		if (_name !== 'sqlite') return
 		// Only the retry timers are faked; the clock the deadline is read from is controlled.
@@ -1199,10 +1322,17 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 			}
 			await s.harness.settle()
 			// Past the 15 s hold, with the delivery poll off: only the hold's own retry can run.
+			// It withholds the write (RT-115) and the stream moves past it.
+			const log = await s.store.getOperationsAfterDelivery(0, 1000)
+			const staleSeq = log.find((d) => d.operation.id === stale?.id)?.deliverySequence ?? -1
+			expect(Math.max(0, ...chainOf(cat.messages).map((b) => b.max))).toBeLessThan(staleSeq)
 			clock.advance(16_000)
 			await vi.advanceTimersByTimeAsync(15_000)
 			await s.harness.settle()
-			expect(deliveredOpIds(cat.messages)).toContain(stale?.id)
+			expect(deliveredOpIds(cat.messages)).not.toContain(stale?.id)
+			expect(Math.max(0, ...chainOf(cat.messages).map((b) => b.max))).toBeGreaterThanOrEqual(
+				staleSeq,
+			)
 			await s.harness.server.stop()
 			await s.backend.store.close()
 			await s.backend.done()

@@ -234,10 +234,14 @@ import {
 	FULL_RESYNC_COUNTER_KEY,
 	type FullResyncState,
 	type FullResyncTarget,
+	type WithheldRecord,
 	fullResyncDoneKey,
 	fullResyncNodeKey,
 	fullResyncUserKey,
 	newestFullResyncToken,
+	parseWithheldDeliveryKey,
+	withheldDeliveryKey,
+	withheldDeliveryPrefix,
 } from './server-store'
 import {
 	type DeviceActivity,
@@ -3842,6 +3846,35 @@ export class PostgresServerStore implements ServerStore {
 				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
 		)) as unknown as { node_id: string }[]
 		return rows.length > 0
+	}
+
+	async markDeliveryWithheld(nodeId: string, collection: string, recordId: string): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		await this.db.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${withheldDeliveryKey(nodeId, collection, recordId)}, '1')
+				ON CONFLICT (key) DO NOTHING`,
+		)
+	}
+
+	async getDeliveryWithheld(nodeId: string): Promise<WithheldRecord[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT key FROM kora_server_meta WHERE starts_with(key, ${withheldDeliveryPrefix(nodeId)})`,
+		)) as unknown as { key: string }[]
+		return rows.flatMap((row) => {
+			const record = parseWithheldDeliveryKey(row.key)
+			return record ? [record] : []
+		})
+	}
+
+	async clearDeliveryWithheld(nodeId: string, collection: string, recordId: string): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		await this.db.execute(
+			sql`DELETE FROM kora_server_meta WHERE key = ${withheldDeliveryKey(nodeId, collection, recordId)}`,
+		)
 	}
 
 	async requestFullResync(target: FullResyncTarget): Promise<number> {

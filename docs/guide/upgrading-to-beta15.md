@@ -349,7 +349,7 @@ On the server (structured log events):
 |---|---|
 | `delivery.partition_miss` | A scope field is outside the partition plan; sessions read that collection whole. Add it to `deliveryPartitions`. |
 | `session.protocol_refused` | A protocol-1 client tried to connect and was refused. |
-| `session.tombstone_delivery_undetermined`, `server:tombstone-delivery-undetermined` | A delete's delivery point could not be decided yet; only that write is held. |
+| `session.tombstone_delivery_undetermined`, `server:tombstone-delivery-undetermined` | A delete's delivery point could not be decided yet; only that write is held, and withheld from the device if the hold cannot resolve (`action: 'withheld'`, counted in `withheldDeliveries`). |
 | `operations.commit_hook_failed`, `server:commit-hook-failed` | An `onOperationsCommitted` handler threw. The commit is unaffected. |
 | `CLIENT_TOO_OLD`, `ACCESS_RULES_CHANGED` session refusals | An old client reached an access-rules server, or rules were not in force for a session (it reconnects). |
 
