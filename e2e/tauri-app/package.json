@@ -1,0 +1,18 @@
+{
+  "name": "kora-e2e-tauri-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "preview": "vite preview --strictPort"
+  },
+  "dependencies": {
+    "@korajs/tauri": "workspace:*",
+    "@tauri-apps/api": "^2.0.0",
+    "korajs": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

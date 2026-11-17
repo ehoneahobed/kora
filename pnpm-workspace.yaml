@@ -4,5 +4,6 @@ packages:
   - 'kora'
   - 'e2e'
   - 'e2e/fixture-app'
+  - 'e2e/tauri-app'
   - 'examples/*'
   - 'docs'
