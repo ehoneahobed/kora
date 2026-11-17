@@ -84,7 +84,8 @@ export interface ExternalUserInfo {
  *
  * Supports two validation modes:
  * 1. **HMAC secret** (`jwtSecret`): For providers that sign tokens with a shared
- *    secret (e.g., Supabase). Uses HS256 verification via the existing `verifyJwt` utility.
+ *    secret (e.g., Supabase's legacy JWT secret). Any standard HS256 header is accepted (a
+ *    `kid`, no `typ`, keys in any order); `alg: "none"` and every other algorithm are refused.
  * 2. **Custom validator** (`validateToken`): For providers that use asymmetric keys
  *    (RS256, ES256) or require custom validation logic (e.g., Clerk with JWKS rotation).
  *    The developer provides their own validation function.
@@ -469,7 +470,8 @@ export class ExternalJwtProvider implements AuthProviderAdapter {
 
 		// Fall back to HS256 HMAC verification
 		if (this.jwtSecret !== undefined) {
-			const claims = verifyJwt(token, this.jwtSecret)
+			// Another provider signed it: any standard HS256 header (a `kid`, no `typ`).
+			const claims = verifyJwt(token, this.jwtSecret, { headers: 'standard' })
 			if (claims === null) {
 				return null
 			}
