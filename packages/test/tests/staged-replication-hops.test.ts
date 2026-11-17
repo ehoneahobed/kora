@@ -1511,6 +1511,20 @@ function hopsToTry(baseline: CellResult, salt: string): number[] {
 }
 
 describe('the delivery position survives every dropper at every await (hop-level fault injection)', () => {
+	// CI run 44103703060: the hop count of a run varies by a few between runs on a busy runner,
+	// so a hop near the end of the baseline may not exist in the dropper's run. The dropper then
+	// never fires, and checks that assume it did (I7: a full resync was asked) must not run.
+	test('a dropper aimed past the end of the run fires nowhere and reports nothing', async () => {
+		const baseline = await runCell('stagedMulti', null, -1, 'micro')
+		await closeDevices()
+		const beyond = await runCell('stagedMulti', 'fullResync', baseline.hops + 50, 'micro')
+		await closeDevices()
+		expect({ fired: beyond.fired, problems: beyond.problems }).toEqual({
+			fired: false,
+			problems: [],
+		})
+	}, 600_000)
+
 	for (const scenarioName of SELECTED) {
 		test(`${scenarioName}: the undisturbed run is clean`, async () => {
 			const baseline = await runCell(scenarioName, null, -1, 'micro')
