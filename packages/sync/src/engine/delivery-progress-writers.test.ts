@@ -248,6 +248,7 @@ const EXPECTED: Record<string, number> = {
 	'dynamic-import @ packages/store/src/store/store.ts @ Store.flushAuditQueue': 1,
 	'dynamic-import @ packages/store/src/store/store.ts @ Store.getAuditTraces': 1,
 	'dynamic-import @ packages/store/src/store/store.ts @ Store.importBackupNow': 2,
+	'dynamic-import @ packages/store/src/store/store.ts @ Store.open': 1,
 	'dynamic-import @ packages/sync/src/transport/http-long-polling-transport.ts @ HttpLongPollingTransport.loadDefaultSerializer': 1,
 	// ---- Element access with a key the scan cannot read in the files that hold the sync state: row/column lookups by field name, never a writer
 	'dynamic-member-access @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.hasCollection': 1,
@@ -278,13 +279,14 @@ const EXPECTED: Record<string, number> = {
 	'uncarried:applyScopeRetraction @ packages/store/src/store/store.ts @ Store.applyScopeNarrowing': 1,
 	'uncarried:applyScopeRetraction @ packages/store/src/store/store.ts @ Store.recheckAccessNarrowing': 2,
 	'uncarried:deferScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.deferScopeRetraction': 1,
-	// ---- Live-database mutations named outside the engine. The kora apply pipelines apply the DELIVERED operation under its own id, so the store's by-id currency check (noteDeliveryPosition) holds for every one of them; the SyncStore wrapper methods are forwarders; the store's beginStaging merges into a scratch replica and importBackupNow runs with the engine stopped; the offline-mark helpers are called by the engine's guarded sites
+	// ---- Live-database mutations named outside the engine. The kora apply pipelines apply the DELIVERED operation under its own id, so the store's by-id currency check (noteDeliveryPosition) holds for every one of them; the SyncStore wrapper methods are forwarders; the store's beginStaging merges into a scratch replica and importBackupNow runs with the engine stopped, as does Store.open, which re-applies the writes an interrupted restore journaled before any engine starts; the offline-mark helpers are called by the engine's guarded sites
 	'unguarded:applyCollectionNarrowing @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyCollectionNarrowing': 1,
 	'unguarded:applyRemoteOperation @ kora/src/apply-pipeline.ts @ ApplyPipeline.apply': 1,
 	'unguarded:applyRemoteOperation @ kora/src/apply-pipeline.ts @ ApplyPipeline.applyFolded': 1,
 	'unguarded:applyRemoteOperation @ kora/src/apply-pipeline.ts @ ApplyPipeline.applyRemoteInBatch': 2,
 	'unguarded:applyRemoteOperation @ packages/store/src/store/store.ts @ Store.beginStaging': 1,
 	'unguarded:applyRemoteOperation @ packages/store/src/store/store.ts @ Store.importBackupNow': 1,
+	'unguarded:applyRemoteOperation @ packages/store/src/store/store.ts @ Store.open': 1,
 	'unguarded:applyScopeNarrowing @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyScopeNarrowing': 1,
 	'unguarded:applyScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyDeliveryBatch': 1,
 	'unguarded:applyScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyScopeRetraction': 1,
