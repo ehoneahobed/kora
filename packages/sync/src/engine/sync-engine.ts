@@ -504,6 +504,11 @@ export class SyncEngine {
 	 * loads) when stop() runs must not carry on: the owner may close the store right after.
 	 */
 	private stopRequests = 0
+	/**
+	 * The stop count a start attempt began with (after its own stop of an earlier session):
+	 * a stop() since then cancelled the attempt (see start).
+	 */
+	private startAttemptStops: number | null = null
 	/** Set by destroy(): the engine never connects or arms a timer again. */
 	private destroyed = false
 	private readonly statusListeners = new Set<() => void>()
@@ -877,9 +882,20 @@ export class SyncEngine {
 		if (this.state === 'streaming') return
 		if (this.startPromise) return this.startPromise
 
-		this.startPromise = this.startInternal().finally(() => {
-			this.startPromise = null
-		})
+		this.startAttemptStops = null
+		this.startPromise = this.startInternal()
+			.catch((error: unknown) => {
+				// stop() or destroy() ran during this attempt (app.close() destroys the engine and
+				// then closes the store): a read the attempt still had in flight can fail on the
+				// closed store. The attempt was cancelled on purpose, so it settles quietly (#150);
+				// any other failure stays visible.
+				const stops = this.startAttemptStops
+				if (this.destroyed || (stops !== null && this.stopRequests !== stops)) return
+				throw error
+			})
+			.finally(() => {
+				this.startPromise = null
+			})
 		return this.startPromise
 	}
 
@@ -907,6 +923,7 @@ export class SyncEngine {
 		this.rejectKeyRequests('a new sync session is starting')
 		await this.messageChain
 		const stopsAtStart = this.stopRequests
+		this.startAttemptStops = stopsAtStart
 		// Destroyed (app closed, or the tab retired for a newer build) while this start
 		// awaited: nothing of it may touch persisted sync state or open a transport.
 		if (this.destroyed) return
