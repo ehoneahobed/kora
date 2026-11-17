@@ -3512,11 +3512,20 @@ export class PostgresServerStore implements ServerStore {
 		// order is commit order and therefore respects causality.
 		const rows = await this.db.select().from(pgOperations).orderBy(asc(pgOperations.deliverySeq))
 		const operations = rows.map((row) => this.deserializeOperation(row))
+		// The vector of exactly these rows (as the store computes it at load), never the live
+		// cache: an operation committed after the select would be claimed without being in the
+		// backup, and a replace restore would stop its device from sending it again.
+		const versionVector = new Map<string, number>()
+		for (const operation of operations) {
+			if (operation.sequenceNumber > (versionVector.get(operation.nodeId) ?? 0)) {
+				versionVector.set(operation.nodeId, operation.sequenceNumber)
+			}
+		}
 
 		return buildServerBackup(
 			this.nodeId,
 			operations,
-			this.versionVector,
+			versionVector,
 			await this.listEncryptionKeyRecords(),
 		)
 	}
