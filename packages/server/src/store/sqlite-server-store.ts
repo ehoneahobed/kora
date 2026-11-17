@@ -232,10 +232,14 @@ import {
 	FULL_RESYNC_COUNTER_KEY,
 	type FullResyncState,
 	type FullResyncTarget,
+	type WithheldRecord,
 	fullResyncDoneKey,
 	fullResyncNodeKey,
 	fullResyncUserKey,
 	newestFullResyncToken,
+	parseWithheldDeliveryKey,
+	withheldDeliveryKey,
+	withheldDeliveryPrefix,
 } from './server-store'
 import {
 	type DeviceActivity,
@@ -3232,6 +3236,32 @@ export class SqliteServerStore implements ServerStore {
 			)
 			return rows.length > 0
 		})
+	}
+
+	async markDeliveryWithheld(nodeId: string, collection: string, recordId: string): Promise<void> {
+		this.assertOpen()
+		this.db.run(
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${withheldDeliveryKey(nodeId, collection, recordId)}, '1')`,
+		)
+	}
+
+	async getDeliveryWithheld(nodeId: string): Promise<WithheldRecord[]> {
+		this.assertOpen()
+		const prefix = withheldDeliveryPrefix(nodeId)
+		const rows = this.db.all<{ key: string }>(
+			sql`SELECT key FROM kora_server_meta WHERE substr(key, 1, ${prefix.length}) = ${prefix}`,
+		)
+		return rows.flatMap((row) => {
+			const record = parseWithheldDeliveryKey(row.key)
+			return record ? [record] : []
+		})
+	}
+
+	async clearDeliveryWithheld(nodeId: string, collection: string, recordId: string): Promise<void> {
+		this.assertOpen()
+		this.db.run(
+			sql`DELETE FROM kora_server_meta WHERE key = ${withheldDeliveryKey(nodeId, collection, recordId)}`,
+		)
 	}
 
 	async requestFullResync(target: FullResyncTarget): Promise<number> {

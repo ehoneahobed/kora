@@ -566,7 +566,7 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 		const staleSeq = log.find((d) => d.operation.id === stale.id)?.deliverySequence ?? -1
 		expect(watermark).toBeGreaterThanOrEqual(staleSeq)
 		const firstSession = receivedOps(cat.messages, 'c1')
-		cat.client.close()
+		await cat.client.disconnect()
 		await harness.settle()
 		// While it is away, the record comes back.
 		const desk = await harness.login('ann', 'ann-desk', FRESH)
