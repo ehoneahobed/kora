@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import type { AwsLightsailCommandRunner } from './aws-lightsail-adapter'
 import { AwsLightsailAdapter } from './aws-lightsail-adapter'
 
@@ -126,6 +126,97 @@ describe('AwsLightsailAdapter', () => {
 		expect(result.liveUrl).toContain('amazonlightsail.com')
 		expect(result.syncUrl).toContain('kora-sync')
 		expect(result.deploymentId).toBeTruthy()
+	})
+
+	describe('the auth secret reaches the container (templates read KORA_AUTH_SECRET)', () => {
+		const keys = ['KORA_AUTH_SECRET', 'KORA_AUTH_SECRET_PREVIOUS', 'AUTH_SECRET'] as const
+		let saved: Record<string, string | undefined> = {}
+		beforeEach(() => {
+			saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+			for (const key of keys) delete process.env[key]
+		})
+		afterEach(() => {
+			for (const key of keys) {
+				if (saved[key] === undefined) delete process.env[key]
+				else process.env[key] = saved[key]
+			}
+			vi.restoreAllMocks()
+		})
+
+		async function deployedEnvironment(): Promise<Record<string, string>> {
+			const runner = createRunnerMock([
+				{
+					matcher: ['lightsail', 'push-container-image'],
+					result: { exitCode: 0, stdout: 'Refer to this image as ":my-app.latest.1"', stderr: '' },
+				},
+			])
+			const adapter = new AwsLightsailAdapter({
+				runner,
+				context: { projectRoot: '/tmp/test', appName: 'my-app', region: 'us-east-1' },
+			})
+			await adapter.deploy({
+				clientDirectory: '/tmp/test/.kora/deploy/dist',
+				serverBundlePath: '/tmp/test/.kora/deploy/server-bundled.js',
+				deployDirectory: '/tmp/test/.kora/deploy',
+			})
+			const call = runner.run.mock.calls.find((c) =>
+				(c[1] as string[]).includes('create-container-service-deployment'),
+			)
+			const args = (call?.[1] ?? []) as string[]
+			const containers = JSON.parse(args[args.indexOf('--containers') + 1] ?? '{}') as Record<
+				string,
+				{ environment: Record<string, string> }
+			>
+			return Object.values(containers)[0]?.environment ?? {}
+		}
+
+		test('KORA_AUTH_SECRET and KORA_AUTH_SECRET_PREVIOUS are forwarded', async () => {
+			process.env.KORA_AUTH_SECRET = 'current-secret'
+			process.env.KORA_AUTH_SECRET_PREVIOUS = 'previous-secret'
+			const environment = await deployedEnvironment()
+			expect(environment.KORA_AUTH_SECRET).toBe('current-secret')
+			expect(environment.KORA_AUTH_SECRET_PREVIOUS).toBe('previous-secret')
+		})
+
+		test('the old AUTH_SECRET name still turns auth on, with a warning', async () => {
+			process.env.AUTH_SECRET = 'legacy-secret'
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			const environment = await deployedEnvironment()
+			expect(environment.KORA_AUTH_SECRET).toBe('legacy-secret')
+			expect(warn.mock.calls.flat().join(' ')).toContain('KORA_AUTH_SECRET')
+		})
+
+		test('every setting a template server reads is forwarded or set inside the container', async () => {
+			const { readFileSync, readdirSync, existsSync } = await import('node:fs')
+			const { join } = await import('node:path')
+			const root = join(__dirname, '../../../../templates')
+			const read = new Set<string>()
+			for (const template of readdirSync(root)) {
+				const server = join(root, template, 'server.ts')
+				if (!existsSync(server)) continue
+				for (const match of readFileSync(server, 'utf8').matchAll(/process\.env\.([A-Z0-9_]+)/g)) {
+					if (match[1]) read.add(match[1])
+				}
+			}
+			// Set by the adapter, or a path inside the container with a default.
+			const insideContainer = new Set(['PORT', 'KORA_AUTH_DB', 'KORA_SERVER_DB', 'KORA_SYNC_PATH'])
+			const expected = [...read].filter((name) => !insideContainer.has(name)).sort()
+			expect(expected.length).toBeGreaterThan(0)
+			for (const name of expected) process.env[name] = `value-of-${name}`
+			try {
+				const environment = await deployedEnvironment()
+				expect(expected.filter((name) => environment[name] !== `value-of-${name}`)).toEqual([])
+			} finally {
+				for (const name of expected) delete process.env[name]
+			}
+		})
+
+		test('KORA_AUTH_SECRET wins over AUTH_SECRET when both are set', async () => {
+			process.env.KORA_AUTH_SECRET = 'current-secret'
+			process.env.AUTH_SECRET = 'legacy-secret'
+			vi.spyOn(console, 'warn').mockImplementation(() => {})
+			expect((await deployedEnvironment()).KORA_AUTH_SECRET).toBe('current-secret')
+		})
 	})
 
 	test('status returns healthy for running service', async () => {
