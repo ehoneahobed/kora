@@ -70,7 +70,7 @@ describe('WsServerTransport', () => {
 		ws.trigger('message', JSON.stringify(handshakeMsg))
 
 		expect(handler).toHaveBeenCalledOnce()
-		expect(handler).toHaveBeenCalledWith(handshakeMsg)
+		expect(handler).toHaveBeenCalledWith(handshakeMsg, expect.any(Number))
 	})
 
 	test('handles protobuf payloads with negotiated serializer', () => {
@@ -83,7 +83,7 @@ describe('WsServerTransport', () => {
 		const payload = new ProtobufMessageSerializer().encode(handshakeMsg)
 		ws.trigger('message', payload)
 
-		expect(handler).toHaveBeenCalledWith(handshakeMsg)
+		expect(handler).toHaveBeenCalledWith(handshakeMsg, expect.any(Number))
 	})
 
 	test('invalid incoming message triggers error handler', () => {

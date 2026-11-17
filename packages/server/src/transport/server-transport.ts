@@ -3,7 +3,11 @@ import type { SyncMessage } from '@korajs/sync'
 /**
  * Handler for incoming sync messages on the server side.
  */
-export type ServerMessageHandler = (message: SyncMessage) => void
+/**
+ * Handles one decoded message. `frameBytes`: the size of the frame it came in, when the
+ * transport knows it (the session bounds what it holds queued with it).
+ */
+export type ServerMessageHandler = (message: SyncMessage, frameBytes?: number) => void
 
 /**
  * Handler for connection close events on the server side.

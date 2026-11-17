@@ -321,6 +321,15 @@ export interface KoraSyncServerConfig {
 	 */
 	maxSyncQueries?: number
 	/**
+	 * Most messages a session holds received but not yet handled (it handles them one at a
+	 * time, so they queue behind a slow sign-in or a large batch). Past it the session is
+	 * closed with the retriable `INBOUND_QUEUE_FULL`. Until a handshake is accepted only 16
+	 * may queue. Defaults to 10000 (bytes are bounded by `maxQueuedBytes`).
+	 */
+	maxQueuedMessages?: number
+	/** Most bytes of received frames a session holds not yet handled. Defaults to 64 MiB. */
+	maxQueuedBytes?: number
+	/**
 	 * Accept anonymous devices whose node claim predates confirmed claims (RT-21):
 	 * nodes whose operation history predates node claims (a database written by a
 	 * beta.12 or older server, which recorded no claims; RT-91), nodes held by the

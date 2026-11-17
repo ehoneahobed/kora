@@ -188,6 +188,13 @@ import {
 } from './session-operation-limits'
 import { DEFAULT_MAX_SYNC_QUERIES, checkSyncQueries } from './sync-queries-validation'
 
+/** Default of KoraSyncServerConfig.maxQueuedMessages. */
+export const DEFAULT_MAX_QUEUED_MESSAGES = 10_000
+/** Default of KoraSyncServerConfig.maxQueuedBytes. */
+export const DEFAULT_MAX_QUEUED_BYTES = 64 * 1024 * 1024
+/** Messages that may wait before a handshake is accepted (the handshake and a few more). */
+const PRE_HANDSHAKE_QUEUED_MESSAGES = 16
+
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_SCHEMA_VERSION = 1
 
@@ -627,6 +634,10 @@ export interface ClientSessionOptions {
 	maxScopePredicateValues?: number
 	/** Most entries a handshake's `syncQueries` may hold (see KoraSyncServerConfig.maxSyncQueries). */
 	maxSyncQueries?: number
+	/** Most messages held received but not handled (see KoraSyncServerConfig.maxQueuedMessages). */
+	maxQueuedMessages?: number
+	/** Most bytes of frames held received but not handled (KoraSyncServerConfig.maxQueuedBytes). */
+	maxQueuedBytes?: number
 	/**
 	 * Adjudicate untrusted client operations before materialization. When present,
 	 * each incoming operation is passed to this validator; a `reject` decision
@@ -1023,6 +1034,11 @@ export class ClientSession {
 	private readonly maxOpsPerBatch: number
 	private readonly maxScopePredicateValues: number
 	private readonly maxSyncQueries: number
+	private readonly maxQueuedMessages: number
+	private readonly maxQueuedBytes: number
+	/** Messages received and not yet handled, and the bytes of their frames. */
+	private queuedMessages = 0
+	private queuedBytes = 0
 	/** {@link getScopePartitionKey}, cached for the scope map it was computed from. */
 	private scopePartitionKeyCache: { scopes: ScopeMap; key: string } | null = null
 	/** Store reads for presence cursors (F16), per minute. */
@@ -1123,6 +1139,8 @@ export class ClientSession {
 		this.maxScopePredicateValues =
 			options.maxScopePredicateValues ?? DEFAULT_MAX_SCOPE_PREDICATE_VALUES
 		this.maxSyncQueries = options.maxSyncQueries ?? DEFAULT_MAX_SYNC_QUERIES
+		this.maxQueuedMessages = options.maxQueuedMessages ?? DEFAULT_MAX_QUEUED_MESSAGES
+		this.maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
 		this.blobAccess = options.blobAccess ?? null
@@ -1159,7 +1177,7 @@ export class ClientSession {
 			}, this.handshakeTimeoutMs)
 			;(this.handshakeTimer as { unref?: () => void }).unref?.()
 		}
-		this.transport.onMessage((msg) => this.enqueueMessage(msg))
+		this.transport.onMessage((msg, frameBytes) => this.enqueueMessage(msg, frameBytes ?? 0))
 		this.transport.onClose((_code, _reason) => this.handleTransportClose())
 		this.transport.onError((_err) => {
 			// Transport errors during active session cause close
@@ -2251,7 +2269,27 @@ export class ClientSession {
 		}
 	}
 
-	private enqueueMessage(message: SyncMessage): void {
+	private enqueueMessage(message: SyncMessage, frameBytes: number): void {
+		if (this.state === 'closed') return
+		// Messages are handled one at a time, so a peer that sends faster than they are handled
+		// (while its sign-in is pending, or behind a large batch) would hold the server's memory
+		// with parsed frames. Before a handshake is accepted only a handful may wait.
+		const accepted = this.state === 'syncing' || this.state === 'streaming'
+		const messageLimit = accepted ? this.maxQueuedMessages : PRE_HANDSHAKE_QUEUED_MESSAGES
+		if (
+			this.queuedMessages + 1 > messageLimit ||
+			this.queuedBytes + frameBytes > this.maxQueuedBytes
+		) {
+			this.sendError(
+				'INBOUND_QUEUE_FULL',
+				`More than ${String(messageLimit)} messages (or ${String(this.maxQueuedBytes)} bytes) were waiting to be handled. Reconnect and send at the pace of the server's acknowledgments.`,
+				true,
+			)
+			this.close('inbound queue full')
+			return
+		}
+		this.queuedMessages += 1
+		this.queuedBytes += frameBytes
 		if (message.type === 'handshake' && !this.handshakeReceived) {
 			// The deadline covers the handshake's arrival, not its (possibly slow) auth.
 			this.handshakeReceived = true
@@ -2263,6 +2301,10 @@ export class ClientSession {
 		this.messageChain = this.messageChain
 			.then(() => this.handleMessageAsync(message))
 			.catch((error) => this.handleMessageFailure(error))
+			.finally(() => {
+				this.queuedMessages -= 1
+				this.queuedBytes -= frameBytes
+			})
 	}
 
 	private async handleMessageAsync(message: SyncMessage): Promise<void> {

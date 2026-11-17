@@ -207,7 +207,11 @@ export class WsServerTransport implements ServerTransport {
 				}
 
 				const decoded = this.serializer.decode(data)
-				this.messageHandler?.(decoded)
+				const frameBytes =
+					typeof data === 'string'
+						? Buffer.byteLength(data)
+						: (data as ArrayBuffer | Uint8Array).byteLength
+				this.messageHandler?.(decoded, frameBytes)
 			} catch (err) {
 				this.errorHandler?.(err instanceof Error ? err : new Error(String(err)))
 			}
