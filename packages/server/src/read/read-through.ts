@@ -256,11 +256,14 @@ export class ReadThroughService {
 		let context = authenticated.context
 		let stamp = authenticated.stamp
 
+		// An address is limited as its bucket (an IPv6 address as its /64): rotating the low
+		// bits of an address must not mint a fresh budget.
+		const addressKey = addressBucket(request.clientKey) ?? 'anonymous'
 		const principalKey =
 			context === null
-				? `addr:${request.clientKey ?? 'anonymous'}`
+				? `addr:${addressKey}`
 				: context.anonymous === true
-					? `anon:${request.clientKey ?? 'anonymous'}`
+					? `anon:${addressKey}`
 					: `user:${context.userId}`
 		const anonymous = context === null || context.anonymous === true
 		const slot = (anonymous ? this.anonymousLimiter : this.limiter).admit(principalKey)
