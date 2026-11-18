@@ -261,6 +261,26 @@ window.H = {
 	awaitOpen(key) {
 		return window.__opens[key]
 	},
+	/**
+	 * Make the next navigator.locks.query made while this tab holds a version-gate tab lock for
+	 * `dbName` reject (a lock query failing after the gate took its lock), once.
+	 */
+	failNextGateQuery(dbName) {
+		const original = navigator.locks.query.bind(navigator.locks)
+		let armed = true
+		navigator.locks.query = async () => {
+			const snapshot = await original()
+			const holding = (snapshot.held ?? []).some(
+				(lock) => lock.name.includes(dbName) && lock.name.includes('"tabId"'),
+			)
+			if (armed && holding) {
+				armed = false
+				navigator.locks.query = original
+				throw new Error('lock query failed')
+			}
+			return snapshot
+		}
+	},
 	/** Names and holders of every Web Lock on the origin (tabs and workers). */
 	async locks() {
 		const s = await navigator.locks.query()
