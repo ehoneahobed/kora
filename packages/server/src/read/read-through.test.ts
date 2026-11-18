@@ -921,6 +921,20 @@ describe('read-through: addresses and the shared proxy', () => {
 		expect((await send()).status).toBe(429)
 	})
 
+	test('anonymous reads from one IPv6 /64 share a bucket; another /64 has its own', async () => {
+		// One subscriber holds the whole /64: rotating the low 64 bits must not mint new budget.
+		const { server, put } = await setup({
+			auth: undefined,
+			readThrough: { rate: { anonymous: { perSecond: 1, burst: 2, concurrent: 4 } } },
+		})
+		await seed(put)
+		const send = (address: string) => server.handleReadRequest(from('', address))
+		expect((await send('2001:db8:0:0::1')).status).toBe(200)
+		expect((await send('2001:db8:0:0::ffff:1')).status).toBe(200)
+		expect((await send('2001:db8:0:0:1:2:3:4')).status).toBe(429)
+		expect((await send('2001:db8:0:1::1')).status).toBe(200)
+	})
+
 	test('a failing auth provider is a retriable 503, not a 401', async () => {
 		const broken = new TokenAuthProvider({
 			validate: async () => {
