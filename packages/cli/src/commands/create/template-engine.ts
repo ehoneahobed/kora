@@ -1,4 +1,5 @@
 import { composeTemplateLayers, createCompatibilityLayerPlan } from '../../templates/composer'
+import { writeGitignore } from '../../templates/gitignore'
 import type { TemplateContext, TemplateName } from '../../types'
 
 // The template helpers live in templates/composer; re-exported for the create command's callers.
@@ -20,4 +21,5 @@ export async function scaffoldTemplate(
 ): Promise<void> {
 	const plan = createCompatibilityLayerPlan(templateName)
 	await composeTemplateLayers(plan, targetDir, context)
+	await writeGitignore(targetDir, { tauri: templateName.startsWith('tauri') })
 }

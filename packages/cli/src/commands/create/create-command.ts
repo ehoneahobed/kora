@@ -255,7 +255,7 @@ export const createCommand = defineCommand({
 			}
 			if (gitContext.hasRepository) {
 				logger.step(
-					`Detected existing git repository at ${gitContext.repositoryRoot}. Skipping git initialization.`,
+					`The app is inside the git repository at ${gitContext.repositoryRoot}; its .gitignore keeps .env and local databases out of it.`,
 				)
 			}
 			logger.success('Project scaffolded')
