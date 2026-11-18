@@ -746,11 +746,12 @@ export class SyncEngine {
 		value: string
 	} | null = null
 	/**
-	 * The view before a burst of live-query (un)registrations, switched from once in a microtask
-	 * (or at the next view read) instead of once per call: a list mounting a query per row
-	 * registers thousands in one tick.
+	 * The view before a burst of live-query (un)registrations, switched from once on the next
+	 * timer turn (or at the next view read) instead of once per call: a list mounting a query
+	 * per row registers thousands across one render's microtasks.
 	 */
 	private pendingViewChange: { signature: string; effective: SyncQuerySubset[] } | null = null
+	private pendingViewTimer: ReturnType<typeof setTimeout> | null = null
 	private staticQuerySubsets: SyncQuerySubset[] = []
 	/** Subsets of `app.offline.keep()` pins (offline-readiness design 4.3). */
 	private pinQuerySubsets: SyncQuerySubset[] = []
@@ -1252,6 +1253,8 @@ export class SyncEngine {
 	}
 
 	private async stopInternal(): Promise<void> {
+		// A pending view switch (a burst of live-query changes) is settled, not dropped.
+		this.flushViewChange()
 		// Every timer goes first, before any early return (SYNC-10): an engine that is
 		// already disconnected (the server closed the session) still owns the awareness
 		// cleanup interval and a pending query-subset reconnect.
@@ -2087,12 +2090,22 @@ export class SyncEngine {
 	 * the delivery view switches from it once (see {@link flushViewChange}).
 	 */
 	private changeQuerySubsets(change: () => void): void {
+		if (this.watermarksPending() && !this.pendingViewChange) {
+			// The start is still reading the stored watermarks and computes the view itself: no
+			// switch now or later (it would save 0 over a stored watermark), only the reconnect.
+			const before = this.deliverySignatureFor(this.activeScope)
+			change()
+			this.querySubsetsVersion++
+			if (this.deliverySignatureFor(this.activeScope) !== before)
+				this.scheduleQuerySubsetReconnect()
+			return
+		}
 		if (!this.pendingViewChange) {
 			this.pendingViewChange = {
 				signature: this.deliverySignatureFor(this.activeScope),
 				effective: this.getActiveQuerySubsets(),
 			}
-			queueMicrotask(() => this.flushViewChange())
+			this.pendingViewTimer = setTimeout(() => this.flushViewChange(), 0)
 		}
 		change()
 		this.querySubsetsVersion++
@@ -2103,6 +2116,10 @@ export class SyncEngine {
 		const pending = this.pendingViewChange
 		if (!pending) return
 		this.pendingViewChange = null
+		if (this.pendingViewTimer) {
+			clearTimeout(this.pendingViewTimer)
+			this.pendingViewTimer = null
+		}
 		this.switchDeliveryViewWithInheritance(pending.signature, pending.effective)
 		if (this.deliverySignature() !== pending.signature) this.scheduleQuerySubsetReconnect()
 	}

@@ -44,7 +44,7 @@ async function listMountAndUnmount(n: number): Promise<number> {
 	return performance.now() - started
 }
 
-/** Milliseconds to register `n` views one per tick (rows appearing one by one), then remove them. */
+/** Milliseconds to register `n` views one per microtask (rows appearing one by one), then remove them. */
 async function oneByOne(n: number): Promise<number> {
 	const sync = engine()
 	const removers: Array<() => void> = []
@@ -72,12 +72,11 @@ describe('registering many live query views', () => {
 		expect(elapsed).toBeLessThan(1000)
 	}, 120_000)
 
-	// Each tick still recomputes the view once (about 2 s here); before, each call did so about
-	// six times (12.6 s). The bound leaves room for slower runners and still catches a return.
-	test('views mounted one by one: 1,500 take well under the 12.6 s they did', async () => {
+	// Rendering and effects mount rows across microtasks; the view switches once for all of them.
+	test('views mounted one by one across microtasks: 1,500 in well under a second', async () => {
 		await oneByOne(50)
 		const elapsed = await oneByOne(1500)
 		console.log(`one by one 1500: ${elapsed.toFixed(0)} ms`)
-		expect(elapsed).toBeLessThan(6000)
+		expect(elapsed).toBeLessThan(1000)
 	}, 120_000)
 })

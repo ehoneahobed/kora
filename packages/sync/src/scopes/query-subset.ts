@@ -97,11 +97,13 @@ export function dedupeQuerySubsets(subsets: SyncQuerySubset[]): SyncQuerySubset[
 			}
 		}
 	}
-	return result.sort((a, b) =>
-		`${a.collection}:${JSON.stringify(a.where)}`.localeCompare(
-			`${b.collection}:${JSON.stringify(b.where)}`,
-		),
-	)
+	// Each key computed once, not twice per comparison.
+	const keyed = result.map((subset) => ({
+		subset,
+		key: `${subset.collection}:${JSON.stringify(subset.where)}`,
+	}))
+	keyed.sort((a, b) => a.key.localeCompare(b.key))
+	return keyed.map((entry) => entry.subset)
 }
 
 /** The distinct canonical subsets of each collection, by canonical where. */
