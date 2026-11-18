@@ -64,79 +64,79 @@ export async function rebaseUnsyncedOperationsInLog(
 	if (unsyncedOpIds.length === 0) {
 		return emptyResult()
 	}
-	const rebaseIds = new Set(unsyncedOpIds)
+	let result: ClockRebaseResult = emptyResult()
+	await adapter.transaction(async (tx) => {
+		const rebaseIds = new Set(unsyncedOpIds)
 
-	// Read phase. A single full scan per collection serves two purposes at once:
-	// locating the rebased rows and finding the max timestamp of everything else.
-	// This avoids SQL IN-list size limits and keeps the logic trivially correct
-	// (correctness over performance; the op log is compacted periodically anyway).
-	const rebased: Operation[] = []
-	// Serialized HLC strings sort lexicographically in the same order as
-	// HybridLogicalClock.compare, so a plain string max is a timestamp max.
-	let maxOtherSerializedTs: string | null = null
+		// Read phase, inside the transaction (no local write lands between it and the rewrite).
+		// A single full scan per collection serves two purposes at once:
+		// locating the rebased rows and finding the max timestamp of everything else.
+		// This avoids SQL IN-list size limits and keeps the logic trivially correct
+		// (correctness over performance; the op log is compacted periodically anyway).
+		const rebased: Operation[] = []
+		// Serialized HLC strings sort lexicographically in the same order as
+		// HybridLogicalClock.compare, so a plain string max is a timestamp max.
+		let maxOtherSerializedTs: string | null = null
 
-	for (const collectionName of Object.keys(schema.collections)) {
-		const rows = await adapter.query<OperationRow>(
-			`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)}`,
-		)
-		for (const row of rows) {
-			if (rebaseIds.has(row.id)) {
-				rebased.push(deserializeOperationWithCollection(row, collectionName))
-			} else if (maxOtherSerializedTs === null || row.timestamp > maxOtherSerializedTs) {
-				maxOtherSerializedTs = row.timestamp
+		for (const collectionName of Object.keys(schema.collections)) {
+			const rows = await tx.query<OperationRow>(
+				`SELECT * FROM ${quoteIdent(`_kora_ops_${collectionName}`)}`,
+			)
+			for (const row of rows) {
+				if (rebaseIds.has(row.id)) {
+					rebased.push(deserializeOperationWithCollection(row, collectionName))
+				} else if (maxOtherSerializedTs === null || row.timestamp > maxOtherSerializedTs) {
+					maxOtherSerializedTs = row.timestamp
+				}
 			}
 		}
-	}
 
-	if (rebased.length === 0) {
-		return emptyResult()
-	}
+		if (rebased.length === 0) return
 
-	// The new wall time must sort after both corrected real time and every
-	// operation that stays in the log, or the rebased ops could lose LWW
-	// conflicts they previously won locally (silent data reordering).
-	const maxOtherWallTime =
-		maxOtherSerializedTs === null
-			? Number.NEGATIVE_INFINITY
-			: HybridLogicalClock.deserialize(maxOtherSerializedTs).wallTime
-	const baseWallTime = Math.max(correctedNowMs, maxOtherWallTime + 1)
+		// The new wall time must sort after both corrected real time and every
+		// operation that stays in the log, or the rebased ops could lose LWW
+		// conflicts they previously won locally (silent data reordering).
+		const maxOtherWallTime =
+			maxOtherSerializedTs === null
+				? Number.NEGATIVE_INFINITY
+				: HybridLogicalClock.deserialize(maxOtherSerializedTs).wallTime
+		const baseWallTime = Math.max(correctedNowMs, maxOtherWallTime + 1)
 
-	// Preserve the ORIGINAL total order so causal relationships (dep before
-	// dependent) survive the re-stamp.
-	rebased.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
+		// Preserve the ORIGINAL total order so causal relationships (dep before
+		// dependent) survive the re-stamp.
+		rebased.sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp))
 
-	const newTimestamps: HLCTimestamp[] = rebased.map((op, i) => ({
-		// Spill into wallTime past the 5-digit logical serialization limit so the
-		// serialized order stays correct even for enormous offline queues.
-		wallTime: baseWallTime + Math.floor(i / LOGICAL_COUNTER_LIMIT),
-		logical: i % LOGICAL_COUNTER_LIMIT,
-		nodeId: op.nodeId,
-	}))
+		const newTimestamps: HLCTimestamp[] = rebased.map((op, i) => ({
+			// Spill into wallTime past the 5-digit logical serialization limit so the
+			// serialized order stays correct even for enormous offline queues.
+			wallTime: baseWallTime + Math.floor(i / LOGICAL_COUNTER_LIMIT),
+			logical: i % LOGICAL_COUNTER_LIMIT,
+			nodeId: op.nodeId,
+		}))
 
-	// Recompute content-addressed ids in the original (causal) order. A version-2 id
-	// (protocol v2, CORE-1) covers causalDeps, so each dependency's new id must be known
-	// before its dependents are hashed: deps among the rebased set are remapped first.
-	// Deps on non-rebased (already acknowledged or foreign) operations keep their ids.
-	// Each operation keeps its own hash version: a version-1 operation (written before
-	// beta.13) is re-hashed with version 1. The deserialized `data` has the embedded
-	// metadata keys already stripped, matching exactly what the creation path hashed.
-	const idMapping: Record<string, string> = {}
-	const newOperations: Operation[] = []
-	for (let i = 0; i < rebased.length; i++) {
-		const op = rebased[i]
-		const ts = newTimestamps[i]
-		if (!op || !ts) {
-			continue
+		// Recompute content-addressed ids in the original (causal) order. A version-2 id
+		// (protocol v2, CORE-1) covers causalDeps, so each dependency's new id must be known
+		// before its dependents are hashed: deps among the rebased set are remapped first.
+		// Deps on non-rebased (already acknowledged or foreign) operations keep their ids.
+		// Each operation keeps its own hash version: a version-1 operation (written before
+		// beta.13) is re-hashed with version 1. The deserialized `data` has the embedded
+		// metadata keys already stripped, matching exactly what the creation path hashed.
+		const idMapping: Record<string, string> = {}
+		const newOperations: Operation[] = []
+		for (let i = 0; i < rebased.length; i++) {
+			const op = rebased[i]
+			const ts = newTimestamps[i]
+			if (!op || !ts) {
+				continue
+			}
+			const causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
+			const newId = await rehashOperation({ ...op, timestamp: ts, causalDeps })
+			idMapping[op.id] = newId
+			newOperations.push({ ...op, id: newId, timestamp: ts, causalDeps })
 		}
-		const causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
-		const newId = await rehashOperation({ ...op, timestamp: ts, causalDeps })
-		idMapping[op.id] = newId
-		newOperations.push({ ...op, id: newId, timestamp: ts, causalDeps })
-	}
 
-	// Write phase: one transaction so a crash can never leave the log with a
-	// mix of old and new stamps (which would corrupt causal deps).
-	await adapter.transaction(async (tx) => {
+		// Write phase, in the same transaction: a crash can never leave the log with a mix of
+		// old and new stamps (which would corrupt causal deps).
 		for (let i = 0; i < rebased.length; i++) {
 			const oldOp = rebased[i]
 			const newOp = newOperations[i]
@@ -198,14 +198,13 @@ export async function rebaseUnsyncedOperationsInLog(
 		// sequenceNumbers are intentionally unchanged, so `_kora_version_vector`
 		// needs no update: the version vector tracks sequences, not timestamps.
 		await options.inTransaction?.(tx, newOperations)
+
+		result = {
+			operations: newOperations,
+			idMapping,
+			rebasedCount: newOperations.length,
+			newMaxTimestamp: newTimestamps[newTimestamps.length - 1] ?? null,
+		}
 	})
-
-	const newMaxTimestamp = newTimestamps[newTimestamps.length - 1] ?? null
-
-	return {
-		operations: newOperations,
-		idMapping,
-		rebasedCount: newOperations.length,
-		newMaxTimestamp,
-	}
+	return result
 }
