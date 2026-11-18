@@ -370,7 +370,7 @@ record an earlier merge made live replays through the deduplicating apply path.
 
 ## 13. Known limits
 
-- **Warm first data waits for the local store.** A returning device shows its first screen only after SQLite WASM loads and the database opens, about 150 to 250 ms after the baseline's first fetch on a shared runner. `WARM_FIRST_DATA_ALLOWANCE_MS` holds the measured level until a local snapshot of first-screen answers (or an equivalent) removes the wait.
+- **Warm first data waits for the local store.** A returning device shows its first screen only after SQLite WASM loads and the database opens, on a shared runner about 200 ms after the baseline's first fetch at 1x CPU and about 500 ms at 4x (nightly 44343962064, 2026-11-18), with run-to-run swings of a similar size. `WARM_FIRST_DATA_ALLOWANCE_MS` holds the measured level until a local snapshot of first-screen answers (or an equivalent) removes the wait.
 
 - **Client read-through is opt-in and pre-ready only.** After the store opens, a query on data not
   yet replicated renders from the store and waits for replication. Post-open read-through,
