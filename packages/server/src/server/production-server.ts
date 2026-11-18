@@ -24,6 +24,7 @@ import {
 	KoraSyncServer,
 	resolvePerMessageDeflate,
 } from './kora-sync-server'
+import { tokensMatch } from './operational-token'
 import type { OperationsCommittedHandler } from './operations-committed'
 import type { ProductionHttpRouteContext } from './route-context'
 import { type ShellMeta, applyShellMeta } from './shell-meta'
@@ -491,7 +492,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 			)
 			return false
 		}
-		if (extractRequestToken(req) === expected) return true
+		if (tokensMatch(extractRequestToken(req), expected)) return true
 		rejectUnauthorized(res)
 		return false
 	}
@@ -973,7 +974,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 					const insightsToken =
 						config.operationalAuth?.insightsToken ?? process.env.KORA_INSIGHTS_TOKEN
 					if (
-						!(insightsToken && extractRequestToken(req) === insightsToken) &&
+						!(insightsToken && tokensMatch(extractRequestToken(req), insightsToken)) &&
 						!isOperationalRequestAllowed(req, res, 'metrics')
 					)
 						return
