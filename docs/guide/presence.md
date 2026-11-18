@@ -176,7 +176,9 @@ Client A                    Server (AwarenessRelay)              Client B
 
 In addition to explicit removal on disconnect, the `AwarenessManager` runs a periodic cleanup timer. If a remote client's state has not been updated within 30 seconds, it is considered stale and removed automatically.
 
-This handles edge cases where the server does not send an explicit removal (e.g., abrupt network failure, server crash). The timeout ensures that stale presence indicators are cleaned up even in degraded network conditions.
+This handles edge cases where the server does not send an explicit removal (for example a peer whose connection to the server went quiet). The timeout ensures that stale presence indicators are cleaned up even in degraded network conditions.
+
+When this device's own sync session ends (the connection closes or fails), every other person's presence is cleared at once and a `change` fires: presence exists only while connected. Your own state is kept and sent again on reconnect, when the server's catch-up shows the others again.
 
 The timeout is configurable when creating an `AwarenessManager` directly:
 
