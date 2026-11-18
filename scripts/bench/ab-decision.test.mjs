@@ -25,5 +25,8 @@ test('a real 15% slowdown is a regression', () => {
 })
 
 test('differences below the absolute slack are never a regression', () => {
-	assert.equal(decide([4, 4, 4, 4, 4], [5, 5, 5, 5, 5], { maxRegression: 0.1, slackMs: 2 }).regressed, false)
+	assert.equal(
+		decide([4, 4, 4, 4, 4], [5, 5, 5, 5, 5], { maxRegression: 0.1, slackMs: 2 }).regressed,
+		false,
+	)
 })
