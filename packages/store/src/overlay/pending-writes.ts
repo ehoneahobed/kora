@@ -848,6 +848,7 @@ export class PendingWrites {
 	 */
 	markUnknown(writeId: string, lookupOperationId: string | null = null): PendingEntry | null {
 		const entry = this.entries.get(writeId)
+		if (entry?.state === 'unknown') return this.learnWitness(entry, lookupOperationId)
 		if (!entry || entry.state !== 'pending') return null
 		if (entry.groupId !== null) return this.markGroupUnknown(entry, lookupOperationId)
 		const unknown: PendingEntry = { ...entry, state: 'unknown', lookupOperationId }
@@ -861,6 +862,24 @@ export class PendingWrites {
 		})
 		this.changed('unknown', [entry.collection])
 		return unknown
+	}
+
+	/**
+	 * An entry already unknown (the sweep expired it before its commit answered) learns the
+	 * operation that witnesses it, so a later read can decide it ({@link resolveUnknown}). No
+	 * event: its outcome was already reported unknown. The whole group learns it.
+	 */
+	private learnWitness(entry: PendingEntry, lookupOperationId: string | null): PendingEntry | null {
+		if (lookupOperationId === null || entry.lookupOperationId !== null) return null
+		const members = entry.groupId === null ? [entry] : this.groupMembers(entry.groupId)
+		let result: PendingEntry | null = null
+		for (const member of members) {
+			if (member.state !== 'unknown' || member.lookupOperationId !== null) continue
+			const learned: PendingEntry = { ...member, lookupOperationId }
+			this.entries.set(member.writeId, learned)
+			if (member.writeId === entry.writeId) result = learned
+		}
+		return result
 	}
 
 	/** {@link markUnknown} for a member: the whole group becomes unknown, with one event (T2, T7). */
