@@ -226,7 +226,7 @@ client's flow; `OAUTH_CODE_EXCHANGE_FAILED`; `OAUTH_USER_INFO_FAILED`; `OAUTH_PR
 `VERIFICATION_TOKEN_INVALID`, `VERIFICATION_WRONG_ACCOUNT`, `VERIFICATION_RATE_LIMITED`,
 `EMAIL_DELIVERY_FAILED`, and `EMAIL_VERIFICATION_STORE_UNSUPPORTED` when a custom `UserStore` lacks `markEmailVerifiedIfEmail`), users (`DUPLICATE_EMAIL`, `DEVICE_OWNERSHIP_CONFLICT`), passkeys
 (`PASSKEY_VERIFICATION_ERROR`), external providers (`AUTH_EXTERNAL_TOKEN_INVALID`,
-`AUTH_EXTERNAL_OPERATION_NOT_SUPPORTED`), admin and webhooks (`ADMIN_USER_NOT_FOUND`,
+`AUTH_EXTERNAL_OPERATION_NOT_SUPPORTED`), provider adapters (`AUTH_PROVIDER_ERROR`, `AuthProviderError`, with the HTTP-style `status`), admin and webhooks (`ADMIN_USER_NOT_FOUND`,
 `ADMIN_UNAUTHORIZED`, `WEBHOOK_ENDPOINT_NOT_FOUND`, `WEBHOOK_TARGET_REFUSED`: the webhook URL is not
 public `https`). See the [Auth API reference](/api/auth#errors).
 
@@ -241,3 +241,4 @@ public `https`). See the [Auth API reference](/api/auth#errors).
 | `DEPLOY_PLATFORM_UNAVAILABLE` | `DeployPlatformUnavailableError` | `render` or `docker` was chosen. | Use `kora-cloud`, `fly`, `railway`, `aws-ecs` or `aws-lightsail`. |
 | `CLI_ERROR` | `CliError` | Other CLI failures. | See the message. |
 | `TAURI_ADAPTER_ERROR`, `STORE_NOT_OPEN` | `TauriAdapterError`, `TauriStoreNotOpenError` | The Tauri SQLite plugin failed or the database is not open. | Check the `kora-sqlite:default` capability and the plugin build. |
+| `TAURI_DATABASE_IN_USE` | `TauriDatabaseInUseError` | `deleteTauriDatabase` was called while the app has that database open. | Close the app's store first, or use `app.storage.deleteDatabase()`. |

@@ -1,4 +1,4 @@
-import { base64ToBytes, bytesToBase64, generateFullDDL } from '@korajs/core'
+import { KoraError, base64ToBytes, bytesToBase64, generateFullDDL } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
 
 /**
@@ -58,28 +58,20 @@ export interface TauriSqliteOptions {
 /**
  * Thrown when a storage adapter operation fails in the Tauri plugin.
  */
-export class TauriAdapterError extends Error {
-	public readonly code: string
-	public readonly context?: Record<string, unknown>
-
+export class TauriAdapterError extends KoraError {
 	constructor(message: string, context?: Record<string, unknown>) {
-		super(message)
+		super(message, 'TAURI_ADAPTER_ERROR', context)
 		this.name = 'TauriAdapterError'
-		this.code = 'TAURI_ADAPTER_ERROR'
-		this.context = context
 	}
 }
 
 /**
  * Thrown when an operation is attempted on an adapter that has not been opened.
  */
-export class TauriStoreNotOpenError extends Error {
-	public readonly code: string
-
+export class TauriStoreNotOpenError extends KoraError {
 	constructor() {
-		super('Store is not open. Call adapter.open() before performing operations.')
+		super('Store is not open. Call adapter.open() before performing operations.', 'STORE_NOT_OPEN')
 		this.name = 'TauriStoreNotOpenError'
-		this.code = 'STORE_NOT_OPEN'
 	}
 }
 

@@ -1,3 +1,4 @@
+import { KoraError } from '@korajs/core/lite'
 import type { AuthTokens } from '../types'
 import { type AuthRoutesConfig, BuiltInAuthRoutes } from './built-in/auth-routes'
 import type { AuthDevice, AuthUser, UserStore } from './built-in/user-store'
@@ -122,12 +123,12 @@ export interface AuthProviderAdapter {
  * Wraps the HTTP-style status and error message from route handlers
  * into an exception for use in the adapter pattern.
  */
-export class AuthProviderError extends Error {
+export class AuthProviderError extends KoraError {
 	/** HTTP-style status code */
 	readonly status: number
 
 	constructor(message: string, status: number) {
-		super(message)
+		super(message, 'AUTH_PROVIDER_ERROR', { status })
 		this.name = 'AuthProviderError'
 		this.status = status
 	}

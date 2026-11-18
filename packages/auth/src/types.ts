@@ -1,23 +1,4 @@
-// ============================================================================
-// User types
-// ============================================================================
-
-/**
- * Authenticated user record.
- * Represents the public-facing user identity returned by sign-in and sign-up flows.
- */
-export interface AuthUser {
-	/** Unique user identifier (UUID v7) */
-	id: string
-	/** User's email address, used as the primary login credential */
-	email: string
-	/** Display name */
-	name: string
-	/** Timestamp of user creation (milliseconds since epoch) */
-	createdAt: number
-	/** Timestamp of last profile update (milliseconds since epoch) */
-	updatedAt: number
-}
+import type { AuthUser } from './client/auth-client'
 
 // ============================================================================
 // Token types
@@ -148,7 +129,8 @@ export type AuthStatus = 'authenticated' | 'unauthenticated' | 'locked'
 // ============================================================================
 
 /**
- * Events emitted by the auth system.
+ * Events emitted by the auth system. `user` is the client's {@link AuthUser}, the same shape
+ * as `AuthClient.currentUser`.
  * These integrate with Kora's event system for DevTools observability.
  */
 export type AuthEvent =
