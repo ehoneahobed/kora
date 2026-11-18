@@ -42,6 +42,8 @@ export { CONNECTION_QUALITIES, MERGE_STRATEGIES } from './types'
 // === Errors ===
 export {
 	AppNotReadyError,
+	AppOpenFailedError,
+	BlobPullUnavailableError,
 	ClockDriftError,
 	InvalidTimestampError,
 	RemoteClockDriftError,

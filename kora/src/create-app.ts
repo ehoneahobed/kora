@@ -5,7 +5,13 @@ import {
 	OFFLINE_STATUS_UNKNOWN,
 	type SchemaInput,
 } from '@korajs/core/lite'
-import { SimpleEventEmitter, currentWriteObserver, runWithWriteObserver } from '@korajs/core/lite'
+import {
+	AppNotReadyError,
+	AppOpenFailedError,
+	SimpleEventEmitter,
+	currentWriteObserver,
+	runWithWriteObserver,
+} from '@korajs/core/lite'
 import type { Store } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store/lite'
 import type { SyncStatusInfo } from '@korajs/sync'
@@ -449,7 +455,8 @@ export function createApp<const S extends SchemaInput>(
 	const rt = async (): Promise<KoraApp> => {
 		await firstAnswer
 		await whenOpen()
-		if (!runtime) throw new Error('Kora runtime is not available.')
+		if (!runtime)
+			throw new AppOpenFailedError('The Kora runtime is not available: the store did not open.')
 		return runtime
 	}
 
@@ -744,7 +751,9 @@ export function createApp<const S extends SchemaInput>(
 		blobs: {
 			get store() {
 				if (!runtime) {
-					throw new Error('Blob subsystem not initialized. Await app.ready before using app.blobs.')
+					throw new AppNotReadyError(
+						'Blob subsystem not initialized. Await app.ready before using app.blobs.',
+					)
 				}
 				return runtime.blobs.store
 			},
@@ -759,7 +768,9 @@ export function createApp<const S extends SchemaInput>(
 		offline,
 		getStore(): Store {
 			if (!opened || !runtime) {
-				throw new Error('Store not initialized. Await app.ready before accessing the store.')
+				throw new AppNotReadyError(
+					'Store not initialized. Await app.ready before accessing the store.',
+				)
 			}
 			return runtime.getStore()
 		},

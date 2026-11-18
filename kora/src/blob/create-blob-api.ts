@@ -1,4 +1,5 @@
 import type { BlobRef, BlobRefMetadata } from '@korajs/core'
+import { BlobPullUnavailableError } from '@korajs/core/lite'
 import {
 	type BlobGcOptions,
 	type BlobGcResult,
@@ -42,9 +43,7 @@ export function createBlobApi(
 ): BlobApi {
 	function requireProvider(): ChunkProvider {
 		if (!chunkProvider) {
-			throw new Error(
-				'Cannot pull blob bytes without an active sync connection. Configure sync on createApp and ensure the app is connected before calling app.blobs.pull().',
-			)
+			throw new BlobPullUnavailableError()
 		}
 		return chunkProvider
 	}

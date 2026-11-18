@@ -1,3 +1,4 @@
+import { AppOpenFailedError } from '@korajs/core/lite'
 import type {
 	CollectionRecord,
 	OrderByDirection,
@@ -128,7 +129,7 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 			if (!builder) {
 				untrack?.()
 				untrack = undefined
-				this.fail(options, new Error(NOT_OPEN))
+				this.fail(options, new AppOpenFailedError(NOT_OPEN))
 				return
 			}
 			unsubscribe = builder.subscribe(callback as SubscriptionCallback<CollectionRecord>, options)
@@ -179,7 +180,7 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 			await this.host.whenReady()
 			builder = this.host.resolve(this.descriptor)
 		}
-		if (!builder) throw new Error(NOT_OPEN)
+		if (!builder) throw new AppOpenFailedError(NOT_OPEN)
 		return builder
 	}
 

@@ -1,5 +1,6 @@
 import type { Operation } from '@korajs/core'
 import { currentWriteObserver, runWithWriteObserver } from '@korajs/core/internal'
+import { AppNotReadyError } from '@korajs/core/lite'
 import type { Store } from '@korajs/store'
 import type { KoraConfig, TransactionProxy } from './types'
 
@@ -23,7 +24,9 @@ export function createTransactionExecutor(
 		await ready
 		const store = getStore()
 		if (!store) {
-			throw new Error('Store not initialized. Await app.ready before using transactions.')
+			throw new AppNotReadyError(
+				'Store not initialized. Await app.ready before using transactions.',
+			)
 		}
 		// Refused before the transaction starts, also when it would be relayed to another tab.
 		store.assertWritable()
