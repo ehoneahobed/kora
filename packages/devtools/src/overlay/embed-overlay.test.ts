@@ -14,7 +14,7 @@ function toggle(): void {
 }
 
 function hints(): Element[] {
-	return [...document.body.children].filter((el) => el.textContent?.includes('Kora DevTools'))
+	return Array.from(document.body.children).filter((el) => el.textContent?.includes('Kora DevTools'))
 }
 
 afterEach(() => {

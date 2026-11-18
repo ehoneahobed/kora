@@ -4,6 +4,9 @@ import { KORA_DEVTOOLS_STYLES } from '../ui/panel-styles'
 
 const OVERLAY_HOST_ID = 'kora-devtools-overlay-host'
 
+/** The live overlay's teardown, so mounting again (HMR, a second app) replaces it whole. */
+let activeTeardown: (() => void) | null = null
+
 /**
  * Mount an in-page DevTools panel toggled with Ctrl+Shift+K (Cmd+Shift+K on macOS).
  *
@@ -15,10 +18,9 @@ export function mountKoraDevtoolsOverlay(instrumenter: Instrumenter): () => void
 		return () => {}
 	}
 
-	const existing = document.getElementById(OVERLAY_HOST_ID)
-	if (existing) {
-		existing.remove()
-	}
+	// A previous mount's hint, key listener and timer go with its host.
+	activeTeardown?.()
+	document.getElementById(OVERLAY_HOST_ID)?.remove()
 
 	const host = document.createElement('div')
 	host.id = OVERLAY_HOST_ID
@@ -86,12 +88,18 @@ export function mountKoraDevtoolsOverlay(instrumenter: Instrumenter): () => void
 		hint.style.display = 'block'
 	}
 
-	const refresh = (): void => {
+	// The version drawn last: an open overlay redraws only when events arrived (or were
+	// cleared), not every tick — each redraw copies the whole buffer.
+	let drawnVersion: number | null = null
+	const refresh = (force = false): void => {
 		if (!visible) return
-		renderDevtoolsPanel(panelRoot, instrumenter.getBuffer().getAll())
+		const buffer = instrumenter.getBuffer()
+		if (!force && buffer.version === drawnVersion) return
+		drawnVersion = buffer.version
+		renderDevtoolsPanel(panelRoot, buffer.getAll())
 	}
 
-	const intervalId = window.setInterval(refresh, 300)
+	const intervalId = window.setInterval(() => refresh(), 300)
 
 	const onKeyDown = (event: KeyboardEvent): void => {
 		const isToggle = event.key === 'K' && event.shiftKey && (event.ctrlKey || event.metaKey)
@@ -99,7 +107,7 @@ export function mountKoraDevtoolsOverlay(instrumenter: Instrumenter): () => void
 			event.preventDefault()
 			setVisible(!visible)
 			if (visible) {
-				refresh()
+				refresh(true)
 			}
 			return
 		}
@@ -112,7 +120,7 @@ export function mountKoraDevtoolsOverlay(instrumenter: Instrumenter): () => void
 	const onHintClick = (): void => {
 		setVisible(!visible)
 		if (visible) {
-			refresh()
+			refresh(true)
 		}
 	}
 
@@ -124,12 +132,15 @@ export function mountKoraDevtoolsOverlay(instrumenter: Instrumenter): () => void
 	hint.addEventListener('click', onHintClick)
 	closeButton.addEventListener('click', onCloseClick)
 
-	return () => {
+	const teardown = (): void => {
 		window.clearInterval(intervalId)
 		window.removeEventListener('keydown', onKeyDown)
 		hint.removeEventListener('click', onHintClick)
 		closeButton.removeEventListener('click', onCloseClick)
 		host.remove()
 		hint.remove()
+		if (activeTeardown === teardown) activeTeardown = null
 	}
+	activeTeardown = teardown
+	return teardown
 }

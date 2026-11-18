@@ -15,6 +15,8 @@ export class EventBuffer {
 	private head = 0
 	/** Total number of events ever pushed (used to compute readable range) */
 	private _totalPushed = 0
+	/** Bumped by every push and clear (see {@link version}) */
+	private _version = 0
 
 	constructor(capacity: number = DEFAULT_CAPACITY) {
 		if (capacity < 1) {
@@ -27,6 +29,14 @@ export class EventBuffer {
 	/** Maximum number of events the buffer can hold */
 	get capacity(): number {
 		return this._capacity
+	}
+
+	/**
+	 * Changes on every push and clear: a view compares it with the version it last drew to
+	 * skip a redraw when nothing changed (the size stays put once the buffer is full).
+	 */
+	get version(): number {
+		return this._version
 	}
 
 	/** Current number of events in the buffer */
@@ -42,6 +52,7 @@ export class EventBuffer {
 		this.buffer[this.head] = event
 		this.head = (this.head + 1) % this._capacity
 		this._totalPushed++
+		this._version++
 	}
 
 	/**
@@ -89,5 +100,6 @@ export class EventBuffer {
 		this.buffer.fill(undefined)
 		this.head = 0
 		this._totalPushed = 0
+		this._version++
 	}
 }
