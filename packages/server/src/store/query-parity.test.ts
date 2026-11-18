@@ -45,7 +45,7 @@ type Row = {
 	at: number | null
 	score: number
 }
-const FIELDS = ['done', 'who', 'status', 'at', 'score'] as const
+const FIELDS = ['done', 'who', 'status', 'at', 'score', 'id'] as const
 
 let schemas = 0
 /** A store for one run, and what ends it (a Postgres run also ends its own client). */
@@ -161,7 +161,8 @@ describe.each(makers)('%s server store: queries follow the shared contract', (_k
 						await store.setSchema(schema)
 						// Ids are inserted out of order, so insertion order is not id order.
 						const rows: Row[] = generated.map((row, i) => ({
-							id: `r${String((i * 7) % 13).padStart(2, '0')}-${i}`,
+							// Mixed case: a locale collation orders these differently from code points.
+							id: `${['a', 'B', 'b', 'A'][i % 4]}${String((i * 7) % 13).padStart(2, '0')}-${i}`,
 							...row,
 						}))
 						for (const [i, row] of rows.entries()) {

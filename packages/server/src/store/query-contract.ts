@@ -8,7 +8,9 @@ import { type SqlDialect, isTextColumn } from './materialization'
  * - `where { field: value }` matches the stored value; `null` matches a field that is null
  *   or absent (`IS NULL`).
  * - `orderBy` puts nulls last in both directions; strings compare by code point (UTF-8 byte
- *   order: SQLite's BINARY collation, Postgres `COLLATE "C"`).
+ *   order: SQLite's BINARY collation, Postgres `COLLATE "C"`), `id` included. A string that
+ *   contains U+0000, U+FFFF or a lone surrogate is stored escaped (text-codec.ts) and the SQL
+ *   stores order it by the escape: the contract covers strings without them.
  * - `id` breaks every tie and is the order when none is given, so pages are stable.
  */
 
@@ -62,7 +64,8 @@ export function orderByClause(
 	const id = `${quoteIdent('id')}${collate} ASC`
 	if (!field) return ` ORDER BY ${id}`
 	const column = quoteIdent(field)
-	const text = descriptor ? isTextColumn(descriptor, dialect) : false
+	// `id` is a text primary key with no field descriptor.
+	const text = field === 'id' || (descriptor ? isTextColumn(descriptor, dialect) : false)
 	const dir = direction === 'desc' ? 'DESC' : 'ASC'
 	return ` ORDER BY (${column} IS NULL), ${column}${text ? collate : ''} ${dir}, ${id}`
 }
