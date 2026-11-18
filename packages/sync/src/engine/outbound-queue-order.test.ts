@@ -118,7 +118,7 @@ describe('outbound queue order', () => {
 					expect(queued(queue).map((o) => o.id)).toEqual(topologicalSort(ops).map((o) => o.id))
 				},
 			),
-			{ numRuns: 300 },
+			{ numRuns: 1000 },
 		)
 	})
 })
