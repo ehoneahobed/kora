@@ -44,7 +44,7 @@ Root layout component that sets Kora context and renders children at once, befor
 | Prop | Type | Required | Description |
 |------|------|----------|-------------|
 | `app` | `KoraAppLike` | Yes | App instance from `createApp()`. |
-| `fallback` | `Snippet` | No | Shown while initializing, only with `waitForStorage`. |
+| `fallback` | `Snippet` | No | Shown while initializing, only with `waitForStorage`. Without it nothing renders until the store opens. |
 | `waitForStorage` | `boolean` | No | Hold the children back until the store is open. |
 | `children` | `Snippet` | No | App content (rendered at once unless `waitForStorage`). |
 

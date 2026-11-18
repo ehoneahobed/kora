@@ -7,7 +7,7 @@ interface Props {
 	app: KoraAppLike
 	fallback?: import('svelte').Snippet
 	/**
-	 * Hold the children back (render `fallback`) until `app.ready`. By default the children
+	 * Hold the children back (render `fallback`, or nothing without one) until `app.ready`. By default the children
 	 * render at once: queries are empty and writes wait until the store opens.
 	 */
 	waitForStorage?: boolean
@@ -55,10 +55,9 @@ $effect(() => {
 		<strong>Kora initialization error: </strong>{initError.message}
 	</div>
 {:else if !ready && !renderEarly}
+	<!-- Without a fallback nothing renders, as in React and Vue. -->
 	{#if fallback}
 		{@render fallback()}
-	{:else}
-		<div>Loading...</div>
 	{/if}
 {:else if children}
 	<!-- The bridge reads its app once: a new app gets a new bridge. -->

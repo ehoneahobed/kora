@@ -4,6 +4,7 @@ import { QueryStoreCache } from '@korajs/store'
 import { cleanup, render, waitFor } from '@testing-library/svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import EarlyProviderFlow from '../../tests/fixtures/EarlyProviderFlow.svelte'
+import ProviderNoFallback from '../../tests/fixtures/ProviderNoFallback.svelte'
 import type { KoraAppLike, KoraContextValue } from '../types'
 
 afterEach(() => {
@@ -68,6 +69,14 @@ describe('KoraProvider renders before the store opens (S4a, D6)', () => {
 		await open()
 		await waitFor(() => expect(view.queryByText('shell')).not.toBeNull())
 		expect(view.queryByText('gate')).toBeNull()
+	})
+
+	it('waitForStorage without a fallback renders nothing until the store opens, as React and Vue do', async () => {
+		const { app, open } = deferredApp()
+		const view = render(ProviderNoFallback, { app })
+		expect(view.getByTestId('host').textContent?.trim()).toBe('')
+		await open()
+		await waitFor(() => expect(view.queryByText('shell')).not.toBeNull())
 	})
 
 	it('with waitForStorage the children only ever see the real store', async () => {
