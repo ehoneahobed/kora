@@ -149,8 +149,9 @@ describe('AwsEcsAdapter', () => {
 			deployDirectory: '/tmp/test/.kora/deploy',
 		})
 
-		expect(result.liveUrl).toContain('my-app')
-		expect(result.syncUrl).toContain('kora-sync')
+		// The service exists but has no load balancer: deployed, with no URL claimed.
+		expect(result.liveUrl).toBeNull()
+		expect(result.pendingSetup).toBeUndefined()
 		expect(result.deploymentId).toBeTruthy()
 	})
 
@@ -345,6 +346,94 @@ interface RunnerExpectation {
 	matcher: string[]
 	result: { exitCode: number; stdout: string; stderr: string }
 }
+
+describe('AwsEcsAdapter reports only what happened', () => {
+	const pushed: RunnerExpectation[] = [
+		{
+			matcher: ['ecr', 'get-login-password'],
+			result: { exitCode: 0, stdout: 'token', stderr: '' },
+		},
+		{
+			matcher: ['sts', 'get-caller-identity'],
+			result: { exitCode: 0, stdout: '123456789012', stderr: '' },
+		},
+		{
+			matcher: ['ecs', 'register-task-definition'],
+			result: { exitCode: 0, stdout: '{}', stderr: '' },
+		},
+	]
+	const artifacts = {
+		clientDirectory: null,
+		serverBundlePath: null,
+		deployDirectory: '/tmp/test/.kora/deploy',
+	}
+	const context = { projectRoot: '/tmp/test', appName: 'my-app', region: 'us-east-1' }
+
+	test('no ECS service yet: the task is registered, nothing is live, and no URL is made up', async () => {
+		const runner = createRunnerMock([
+			...pushed,
+			{
+				matcher: ['ecs', 'update-service'],
+				result: { exitCode: 254, stdout: '', stderr: 'ServiceNotFoundException' },
+			},
+		])
+		const result = await new AwsEcsAdapter({ runner, context }).deploy(artifacts)
+		expect(result.liveUrl).toBeNull()
+		expect(result.syncUrl).toBeNull()
+		expect(result.pendingSetup).toContain('aws ecs create-service')
+	})
+
+	test('a service behind a load balancer: the live URL is its DNS name', async () => {
+		const runner = createRunnerMock([
+			...pushed,
+			{ matcher: ['ecs', 'update-service'], result: { exitCode: 0, stdout: '{}', stderr: '' } },
+			{
+				matcher: ['ecs', 'describe-services'],
+				result: { exitCode: 0, stdout: 'arn:aws:elasticloadbalancing:tg/my-app\n', stderr: '' },
+			},
+			{
+				matcher: ['elbv2', 'describe-target-groups'],
+				result: { exitCode: 0, stdout: 'arn:aws:elasticloadbalancing:lb/my-app\n', stderr: '' },
+			},
+			{
+				matcher: ['elbv2', 'describe-load-balancers'],
+				result: { exitCode: 0, stdout: 'my-app-123.us-east-1.elb.amazonaws.com\n', stderr: '' },
+			},
+		])
+		const result = await new AwsEcsAdapter({ runner, context }).deploy(artifacts)
+		expect(result.liveUrl).toBe('https://my-app-123.us-east-1.elb.amazonaws.com')
+		expect(result.syncUrl).toBe('wss://my-app-123.us-east-1.elb.amazonaws.com/kora-sync')
+		expect(result.pendingSetup).toBeUndefined()
+	})
+
+	test('a service without a load balancer: deployed, but no URL is claimed', async () => {
+		const runner = createRunnerMock([
+			...pushed,
+			{ matcher: ['ecs', 'update-service'], result: { exitCode: 0, stdout: '{}', stderr: '' } },
+			{
+				matcher: ['ecs', 'describe-services'],
+				result: { exitCode: 0, stdout: 'None\n', stderr: '' },
+			},
+		])
+		const result = await new AwsEcsAdapter({ runner, context }).deploy(artifacts)
+		expect(result.liveUrl).toBeNull()
+		expect(result.pendingSetup).toBeUndefined()
+	})
+
+	test('a missing ecsTaskExecutionRole stops the deploy with setup steps before any build', async () => {
+		const runner = createRunnerMock([
+			...pushed,
+			{
+				matcher: ['iam', 'get-role'],
+				result: { exitCode: 254, stdout: '', stderr: 'NoSuchEntity' },
+			},
+		])
+		await expect(new AwsEcsAdapter({ runner, context }).deploy(artifacts)).rejects.toThrow(
+			/ecsTaskExecutionRole[\s\S]*AmazonECSTaskExecutionRolePolicy/,
+		)
+		expect(runner.run.mock.calls.some(([command]) => command === 'docker')).toBe(false)
+	})
+})
 
 function createRunnerMock(expectations: RunnerExpectation[]): AwsCommandRunner & {
 	run: ReturnType<typeof vi.fn>

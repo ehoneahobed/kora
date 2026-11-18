@@ -17,6 +17,14 @@ import type {
 /**
  * Execution abstraction for AWS CLI interactions.
  */
+
+/** What to do when the task execution role is missing (AWS creates it only through the console). */
+const EXECUTION_ROLE_SETUP = `The IAM role "ecsTaskExecutionRole" does not exist in this account. ECS tasks need it to pull the image from ECR and write logs. Create it once with:
+  aws iam create-role --role-name ecsTaskExecutionRole \\
+    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  aws iam attach-role-policy --role-name ecsTaskExecutionRole \\
+    --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+Then run the deploy again.`
 export interface AwsCommandRunner {
 	/**
 	 * Runs a command. `input`, when given, is written to the child's stdin (for flags such
@@ -199,6 +207,17 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const region = context.region ?? 'us-east-1'
 		const repoName = `kora/${context.appName}`
 
+		// The task runs under ecsTaskExecutionRole (it pulls the image and writes logs): check it
+		// before anything else runs, and say how to create it.
+		const role = await this.runner.run(
+			'aws',
+			['iam', 'get-role', '--role-name', 'ecsTaskExecutionRole'],
+			context.projectRoot,
+		)
+		if (role.exitCode !== 0) {
+			throw new Error(EXECUTION_ROLE_SETUP)
+		}
+
 		// Get ECR login token
 		const loginPassword = await this.runner.run(
 			'aws',
@@ -320,19 +339,70 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const deploymentId = new Date().toISOString()
 
 		if (updateService.exitCode !== 0) {
-			this.logger.step('Service not found, creating new service...')
-			// Service doesn't exist — developer needs to create it with proper VPC/subnet/ALB config.
-			// We can't auto-create the full networking stack, so provide guidance.
-			this.logger.step(
-				`Task definition registered. Create the ECS service with:\n  aws ecs create-service \\\n    --cluster ${context.appName} \\\n    --service-name ${context.appName} \\\n    --task-definition ${context.appName} \\\n    --desired-count 1 \\\n    --launch-type FARGATE \\\n    --network-configuration "awsvpcConfiguration={subnets=[<subnet-id>],securityGroups=[<sg-id>],assignPublicIp=ENABLED}" \\\n    --region ${region}`,
-			)
+			// No service yet: the networking (VPC, subnets, security groups, load balancer) is the
+			// developer's, so the deploy stops here and says what is left. Nothing is live.
+			return {
+				deploymentId,
+				liveUrl: null,
+				syncUrl: null,
+				pendingSetup: `The image is pushed and the task definition is registered, but the ECS service "${context.appName}" does not exist yet, so nothing is running. Create it (once) with:\n  aws ecs create-service \\\n    --cluster ${context.appName} \\\n    --service-name ${context.appName} \\\n    --task-definition ${context.appName} \\\n    --desired-count 1 \\\n    --launch-type FARGATE \\\n    --network-configuration "awsvpcConfiguration={subnets=[<subnet-id>],securityGroups=[<sg-id>],assignPublicIp=ENABLED}" \\\n    --region ${region}\nThen run the deploy again.`,
+			}
 		}
 
+		const host = await this.loadBalancerHost(context.appName, region, context.projectRoot)
 		return {
 			deploymentId,
-			liveUrl: `https://${context.appName}.${region}.amazonaws.com`,
-			syncUrl: `wss://${context.appName}.${region}.amazonaws.com/kora-sync`,
+			liveUrl: host ? `https://${host}` : null,
+			syncUrl: host ? `wss://${host}/kora-sync` : null,
 		}
+	}
+
+	/**
+	 * The DNS name of the load balancer in front of the service, or null when it has none (the
+	 * address is then the task's, which changes with every deployment).
+	 */
+	private async loadBalancerHost(
+		appName: string,
+		region: string,
+		cwd: string,
+	): Promise<string | null> {
+		const text = async (args: string[]): Promise<string | null> => {
+			const result = await this.runner.run(
+				'aws',
+				[...args, '--region', region, '--output', 'text'],
+				cwd,
+			)
+			const value = result.stdout.trim().split(/\s+/)[0] ?? ''
+			return result.exitCode === 0 && value && value !== 'None' ? value : null
+		}
+		const targetGroup = await text([
+			'ecs',
+			'describe-services',
+			'--cluster',
+			appName,
+			'--services',
+			appName,
+			'--query',
+			'services[0].loadBalancers[0].targetGroupArn',
+		])
+		if (!targetGroup) return null
+		const loadBalancer = await text([
+			'elbv2',
+			'describe-target-groups',
+			'--target-group-arns',
+			targetGroup,
+			'--query',
+			'TargetGroups[0].LoadBalancerArns[0]',
+		])
+		if (!loadBalancer) return null
+		return text([
+			'elbv2',
+			'describe-load-balancers',
+			'--load-balancer-arns',
+			loadBalancer,
+			'--query',
+			'LoadBalancers[0].DNSName',
+		])
 	}
 
 	public async rollback(deploymentId: string): Promise<void> {
