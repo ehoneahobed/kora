@@ -12,11 +12,13 @@
  *    `<!-- docs-tutorial: insert <path> after <anchor> -->` block is inserted after the line
  *    containing `<anchor>`. Then builds again (`tsc` + `vite build`): version 2.
  * 4. In real Chromium (skipped with a notice when none is found; `--require-browser` fails
- *    instead): serves version 1 with createProductionServer, adds a todo, swaps in version 2 on
+ *    instead; `--no-browser` leaves this step to another job, saying so): serves version 1 with createProductionServer, adds a todo, swaps in version 2 on
  *    the same origin, reloads, and checks that the todo written before the migration shows the
  *    new field's default and that new todos work.
  *
- * Run after `pnpm build`: node scripts/docs/check-getting-started.mjs [--require-browser]
+ * Run after `pnpm build`: node scripts/docs/check-getting-started.mjs [--require-browser | --no-browser]
+ * CI: ci.yml runs it with --no-browser (no browser installed there) and e2e.yml, which installs
+ * Chromium, with --require-browser.
  * Chromium: PW_CHROMIUM_PATH, else /opt/pw-browsers/chromium-*\/chrome-linux/chrome, else the
  * browser `playwright install chromium` installed.
  */
@@ -40,6 +42,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const requireBrowser = process.argv.includes('--require-browser')
+const noBrowser = process.argv.includes('--no-browser')
+if (requireBrowser && noBrowser) {
+	console.error('check-getting-started: --require-browser and --no-browser contradict each other')
+	process.exit(2)
+}
 const page = readFileSync(join(repo, 'docs/getting-started.md'), 'utf8')
 const fixtureModules = join(repo, 'e2e/fixture-app/node_modules')
 
@@ -167,6 +174,11 @@ try {
 	check(existsSync(join(v2, 'index.html')), 'version 2: vite build')
 
 	// ------------------------------------------------------------ browser
+	if (noBrowser) {
+		console.log(
+			'NOTE getting-started: browser checks not run here (--no-browser); e2e.yml runs them with --require-browser',
+		)
+	}
 	const executablePath =
 		process.env.PW_CHROMIUM_PATH ??
 		(existsSync('/opt/pw-browsers')
@@ -178,11 +190,13 @@ try {
 	const require = createRequire(join(repo, 'e2e/package.json'))
 	const { chromium } = require('@playwright/test')
 	// Without an explicit binary, Playwright's own install (`playwright install chromium`).
-	browser = await chromium.launch(executablePath ? { executablePath } : {}).catch((error) => {
-		console.log(`SKIP getting-started: browser checks (${String(error).split('\n')[0]})`)
-		if (requireBrowser) failed++
-		return null
-	})
+	browser = noBrowser
+		? null
+		: await chromium.launch(executablePath ? { executablePath } : {}).catch((error) => {
+				console.log(`SKIP getting-started: browser checks (${String(error).split('\n')[0]})`)
+				if (requireBrowser) failed++
+				return null
+			})
 	if (browser) {
 		const { createProductionServer, MemoryServerStore } = await import(
 			pathToFileURL(join(repo, 'packages/server/dist/index.js')).href
