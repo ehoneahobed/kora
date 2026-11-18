@@ -341,8 +341,11 @@ export interface AuthenticationOptions {
 	rpId: string
 	/** Credential IDs to allow (limit to specific credentials) */
 	allowCredentialIds?: string[]
-	/** User verification requirement */
-	userVerification: 'preferred'
+	/**
+	 * User verification requirement: `'required'` unless the server verifies without it
+	 * (`requireUserVerification: false`), so the authenticator does what verification checks.
+	 */
+	userVerification: 'required' | 'preferred'
 	/** Timeout in milliseconds */
 	timeout: number
 }
@@ -358,6 +361,10 @@ export interface AuthenticationOptions {
  * @param params - Authentication parameters
  * @param params.rpId - Relying party ID (your domain)
  * @param params.allowCredentialIds - Base64url credential IDs to allow (optional)
+ * @param params.requireUserVerification - Whether {@link verifyAuthenticationResponse} will
+ *   require the User Verified flag (its default, true): the options then ask for
+ *   `'required'`, so a device verifies the user instead of being refused afterwards. Pass the
+ *   same value to both.
  * @returns Authentication options to send to the client
  *
  * @example
@@ -373,6 +380,7 @@ export interface AuthenticationOptions {
 export function generateAuthenticationOptions(params: {
 	rpId: string
 	allowCredentialIds?: string[]
+	requireUserVerification?: boolean
 }): AuthenticationOptions {
 	const challengeBytes = randomBytes(32)
 	const challenge = toBase64Url(
@@ -386,7 +394,7 @@ export function generateAuthenticationOptions(params: {
 		challenge,
 		rpId: params.rpId,
 		allowCredentialIds: params.allowCredentialIds,
-		userVerification: 'preferred',
+		userVerification: (params.requireUserVerification ?? true) ? 'required' : 'preferred',
 		timeout: 60000,
 	}
 }
@@ -455,8 +463,9 @@ export async function verifyAuthenticationResponse(params: {
 	publicKey: string
 	previousSignCount: number
 	/**
-	 * Require the User Verified (UV) flag. Kora's options request
-	 * `userVerification: 'required'`, so the assertion must honour it.
+	 * Require the User Verified (UV) flag. {@link generateAuthenticationOptions} asks for
+	 * `userVerification: 'required'` with the same default, so the assertion must honour it;
+	 * pass the same value to both.
 	 * @default true
 	 */
 	requireUserVerification?: boolean
