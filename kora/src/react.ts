@@ -1,40 +1,5 @@
 /**
- * React bindings — re-exported from `@korajs/react` for `import { ... } from 'korajs/react'`.
+ * React bindings: everything `@korajs/react` exports, for `import { ... } from 'korajs/react'`.
+ * A re-export of the whole package, so the two never drift (meta-exports.test.ts).
  */
-export type {
-	KoraAppLike,
-	KoraContextValue,
-	KoraProviderProps,
-	MutationRejection,
-	UseMutationOptions,
-	UseMutationResult,
-	UseQueryOptions,
-	UseQueryStateResult,
-	UseRichTextResult,
-	AccessorRecord,
-	AppCollectionName,
-	AppCollections,
-	AppRecord,
-	KoraHooks,
-} from '@korajs/react'
-
-export type { UseRichTextOptions } from '@korajs/react'
-
-export {
-	KoraProvider,
-	createKoraHooks,
-	useApp,
-	useCollection,
-	useMutation,
-	useOfflineKeep,
-	useOfflineReady,
-	useQuery,
-	useQueryState,
-	useRichText,
-	useSyncStatus,
-	useFormDraft,
-	usePresence,
-	useCollaborators,
-} from '@korajs/react'
-
-export type { UseFormDraftResult, UseOfflineKeepResult } from '@korajs/react'
+export * from '@korajs/react'
