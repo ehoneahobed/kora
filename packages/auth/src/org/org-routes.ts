@@ -316,9 +316,6 @@ export class OrgRoutes {
 	}
 
 	/**
-	 * List all organizations the authenticated user belongs to.
-	 */
-	/**
 	 * The caller's own membership (its role) in an organization: what `OrgClient.switchOrg`
 	 * reads. 404 for a non-member, like {@link getOrg}.
 	 */
@@ -338,6 +335,9 @@ export class OrgRoutes {
 		return this.removeMember(userId, orgId, userId)
 	}
 
+	/**
+	 * List all organizations the authenticated user belongs to.
+	 */
 	async listUserOrgs(userId: string): Promise<OrgRouteResponse<Organization[]>> {
 		const orgs = await this.store.listUserOrgs(userId)
 		return { status: 200, body: { data: orgs } }

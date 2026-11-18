@@ -1240,10 +1240,13 @@ app.all(['/auth/orgs*', '/auth/invitations*'], async (req, res) => {
 | Request | Handler | Who may call it |
 |---------|---------|-----------------|
 | `POST /orgs` (`{ name, slug?, metadata? }`), `GET /orgs` | `createOrg`, `listUserOrgs` | any signed-in user; the creator becomes the `owner` |
-| `GET /orgs/:orgId`, `PATCH /orgs/:orgId`, `DELETE /orgs/:orgId` | `getOrg`, `updateOrg`, `deleteOrg` | member, admin, owner |
+| `GET /orgs/:orgId` | `getOrg` | member |
+| `PATCH /orgs/:orgId` | `updateOrg` | admin |
+| `DELETE /orgs/:orgId` | `deleteOrg` | owner |
 | `GET /orgs/:orgId/membership` | `getMyMembership` (what `switchOrg` reads) | member |
 | `POST /orgs/:orgId/leave` | `leaveOrg` | member (the owner transfers ownership first) |
-| `GET /orgs/:orgId/members`, `POST /orgs/:orgId/members` (`{ userId, role }`) | `listMembers`, `addMember` | member, admin |
+| `GET /orgs/:orgId/members` | `listMembers` | member |
+| `POST /orgs/:orgId/members` (`{ userId, role }`) | `addMember` | admin; only the owner adds an admin |
 | `PATCH /orgs/:orgId/members/:userId/role` (`{ role }`), `DELETE /orgs/:orgId/members/:userId` | `updateMemberRole`, `removeMember` | admin; only the owner acts on an admin |
 | `POST /orgs/:orgId/transfer` (`{ newOwnerId }`) | `transferOwnership` | owner |
 | `GET /orgs/:orgId/invitations`, `POST /orgs/:orgId/invitations` (`{ email, role }`), `DELETE /orgs/:orgId/invitations/:invitationId` | `listPendingInvitations`, `createInvitation`, `revokeInvitation` | admin |
