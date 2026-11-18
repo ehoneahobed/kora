@@ -90,6 +90,45 @@ describe('IndexedDbPersistenceScheduler', () => {
 	})
 
 	describe('flushBarrier (RT-35 durability barrier)', () => {
+		test('relaxed snapshots that keep taking the slot do not fail the barrier; a strict one resolves it', async () => {
+			// Each relaxed snapshot schedules another write while it runs (a busy app), so the
+			// next relaxed snapshot starts at once: the barrier finds one in flight again and
+			// again. It must wait for a strict snapshot covering its writes, not give up.
+			let steals = 6
+			const kinds: string[] = []
+			let scheduler: IndexedDbPersistenceScheduler | null = null
+			const created = new IndexedDbPersistenceScheduler({
+				debounceMs: 0,
+				flush: async ({ strict }) => {
+					kinds.push(strict ? 'strict' : 'relaxed')
+					await new Promise((resolve) => setTimeout(resolve, 1))
+					if (!strict && steals > 0) {
+						steals -= 1
+						scheduler?.schedule()
+					}
+				},
+			})
+			scheduler = created
+			created.schedule() // a write: a relaxed snapshot starts (debounce 0)
+			await expect(created.flushBarrier()).resolves.toBeUndefined()
+			expect(kinds).toContain('strict')
+			created.dispose()
+		})
+
+		test('a barrier still rejects with the error when a snapshot really fails', async () => {
+			const error = new Error('quota exceeded')
+			const scheduler = new IndexedDbPersistenceScheduler({
+				debounceMs: 0,
+				flush: async () => {
+					throw error
+				},
+				onError: () => {},
+			})
+			scheduler.schedule()
+			await expect(scheduler.flushBarrier()).rejects.toBe(error)
+			scheduler.dispose()
+		})
+
 		test('resolves without writing when nothing was scheduled since the last snapshot', async () => {
 			const flush = vi.fn(async () => {})
 			const scheduler = new IndexedDbPersistenceScheduler({ debounceMs: 500, flush })
