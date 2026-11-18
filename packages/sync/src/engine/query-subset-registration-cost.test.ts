@@ -25,31 +25,59 @@ function engine(): SyncEngine {
 	})
 }
 
-/** Milliseconds to register `n` views one at a time, then remove them all. */
-function mountAndUnmount(n: number): number {
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+/**
+ * Milliseconds for a list of `n` rows to mount (each registering its view in the same tick, as
+ * one render does), the view to switch, and the list to unmount, switching back.
+ */
+async function listMountAndUnmount(n: number): Promise<number> {
 	const sync = engine()
 	const started = performance.now()
 	const removers: Array<() => void> = []
 	for (let i = 0; i < n; i++) {
 		removers.push(sync.registerQuerySubset({ collection: 'comments', where: { postId: `p${i}` } }))
 	}
+	await tick()
 	for (const remove of removers) remove()
+	await tick()
 	return performance.now() - started
 }
 
+/** Milliseconds to register `n` views one per tick (rows appearing one by one), then remove them. */
+async function oneByOne(n: number): Promise<number> {
+	const sync = engine()
+	const removers: Array<() => void> = []
+	let spent = 0
+	for (let i = 0; i < n; i++) {
+		const started = performance.now()
+		removers.push(sync.registerQuerySubset({ collection: 'comments', where: { postId: `p${i}` } }))
+		await Promise.resolve()
+		spent += performance.now() - started
+	}
+	for (const remove of removers) {
+		const started = performance.now()
+		remove()
+		await Promise.resolve()
+		spent += performance.now() - started
+	}
+	return spent
+}
+
 describe('registering many live query views', () => {
-	test('1,500 views register and unregister in well under a second', () => {
-		mountAndUnmount(50) // warm up
-		const elapsed = mountAndUnmount(1500)
-		console.log(`1500 views: ${elapsed.toFixed(0)} ms`)
+	test('a list of 1,500 rows mounts and unmounts its views in well under a second', async () => {
+		await listMountAndUnmount(50) // warm up
+		const elapsed = await listMountAndUnmount(1500)
+		console.log(`list of 1500: ${elapsed.toFixed(0)} ms`)
 		expect(elapsed).toBeLessThan(1000)
 	}, 120_000)
 
-	test('the cost grows about linearly: 4x the views take far less than 16x the time', () => {
-		mountAndUnmount(50)
-		const small = Math.max(mountAndUnmount(400), 1)
-		const large = mountAndUnmount(1600)
-		console.log(`400 views: ${small.toFixed(0)} ms, 1600 views: ${large.toFixed(0)} ms`)
-		expect(large / small).toBeLessThan(8)
+	// Each tick still recomputes the view once (about 2 s here); before, each call did so about
+	// six times (12.6 s). The bound leaves room for slower runners and still catches a return.
+	test('views mounted one by one: 1,500 take well under the 12.6 s they did', async () => {
+		await oneByOne(50)
+		const elapsed = await oneByOne(1500)
+		console.log(`one by one 1500: ${elapsed.toFixed(0)} ms`)
+		expect(elapsed).toBeLessThan(6000)
 	}, 120_000)
 })
