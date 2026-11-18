@@ -604,6 +604,94 @@ describe('commit outcome unknown (M2) when the log cannot be read at once', () =
 	})
 })
 
+/** A fault adapter that runs `before` inside the next transaction, ahead of the write's body. */
+class PreWriteAdapter extends FaultAdapter {
+	before: ((tx: Transaction) => Promise<void>) | null = null
+	override async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
+		const before = this.before
+		if (!before) return super.transaction(fn)
+		this.before = null
+		return super.transaction(async (tx) => {
+			await before(tx)
+			await fn(tx)
+		})
+	}
+}
+
+/** A gated adapter whose released commit lands but whose answer is lost, with an unreadable log. */
+class GatedLostReplyAdapter extends GatedAdapter {
+	lostReply = false
+	failLookups = false
+	override async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
+		await super.transaction(fn)
+		if (this.lostReply) {
+			this.lostReply = false
+			throw new Error('injected: reply lost')
+		}
+	}
+	override async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
+		if (this.failLookups && sql.includes('_kora_ops_')) throw new Error('injected: log unreadable')
+		return super.query<T>(sql, params)
+	}
+}
+
+describe('an unknown entry always becomes decidable', () => {
+	test('expired by the sweep, then its lost commit reply names the operation: a later read decides it', async () => {
+		let clock = 0
+		const adapter = new GatedLostReplyAdapter(':memory:')
+		const h = await make(adapter, {
+			now: () => clock,
+			pendingTtlMs: 1_000,
+			schedule: () => 0,
+			cancel: () => {},
+		})
+		adapter.gating = true
+		const write = h.store.collection('todos').insert({ title: 'late' })
+		await until(() => adapter.gates.length === 1)
+		clock = 1_000
+		h.controller.sweep()
+		expect(h.registry.list()[0]).toMatchObject({ state: 'unknown', lookupOperationId: null })
+		// The commit lands, its answer is lost, and the log cannot be read yet.
+		adapter.lostReply = true
+		adapter.failLookups = true
+		adapter.gates.shift()?.release()
+		await expect(write).rejects.toThrow()
+		await quiesce()
+		expect(h.registry.list()[0]?.lookupOperationId).not.toBeNull()
+		// The adapter answers again: the next successful read finds the operation.
+		adapter.failLookups = false
+		h.store
+			.collection('todos')
+			.where({ done: false })
+			.subscribe(() => {})
+		await until(() => h.registry.list().length === 0)
+		expect(labels(h.events)).toContain('store:write-settled:committed')
+		expect(titles(h.seen.rows)).toEqual(['late'])
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('a single write that wrote no operation and whose commit was not confirmed is taken back', async () => {
+		const adapter = new PreWriteAdapter(':memory:')
+		const h = await make(adapter)
+		const todo = await h.store.collection('todos').insert({ title: 'old' })
+		await until(() => h.registry.list().length === 0)
+		// The update is predicted against 'old'; by the time its transaction reads the row, the
+		// row already says 'new', so the commit writes no operation: nothing can witness it.
+		// Then the commit answer is lost.
+		adapter.before = (tx) => tx.execute('UPDATE todos SET title = ? WHERE id = ?', ['new', todo.id])
+		adapter.fault = { kind: 'commit-lost', error: new Error('injected: commit lost') }
+		await h.store
+			.collection('todos')
+			.update(String(todo.id), { title: 'new' })
+			.catch(() => undefined)
+		await quiesce()
+		// Not left unknown forever: it is taken back, and the display follows the store.
+		await until(() => h.registry.list().length === 0)
+		expect(h.registry.list()).toEqual([])
+		await expectDisplayedEqualsStored(h)
+	})
+})
+
 // --- same-record chains ---
 
 describe('same-record chains without awaits', () => {
