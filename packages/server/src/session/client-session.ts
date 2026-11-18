@@ -7469,7 +7469,7 @@ export class ClientSession {
 		if (!this.onYjsDocUpdate) return
 		// Bounded before anything costs a read or a fan-out. Live updates only: rich text also
 		// syncs as operations, so a dropped one loses nothing durable.
-		const bytes = Math.floor((msg.update.length * 3) / 4)
+		const bytes = decodedBase64Length(msg.update)
 		if (bytes > this.maxYjsUpdateBytes) {
 			this.sendError(
 				'YJS_UPDATE_TOO_LARGE',
@@ -7860,4 +7860,14 @@ function deliveryAnchorField(value: unknown): string | null {
  */
 function deliveryWatermarkField(value: unknown): number | null {
 	return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+/**
+ * The number of bytes a base64 string decodes to, without decoding it: trailing `=` padding is
+ * not payload (a 1,024-byte update encodes to 1,368 characters, two of them padding).
+ */
+function decodedBase64Length(encoded: string): number {
+	let end = encoded.length
+	while (end > 0 && end > encoded.length - 2 && encoded.charCodeAt(end - 1) === 61) end--
+	return Math.floor((end * 3) / 4)
 }
