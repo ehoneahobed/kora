@@ -59,7 +59,7 @@ configured.
 | `schemaVersion` | `schema.version` | The schema version sent in the handshake. |
 | `batchSize` | `100` | Operations per upload batch. |
 | `strictHandshake` | `false` | Wait for the server's acknowledgment of each handshake delta batch before streaming. |
-| `bulkReplication` | `true` | Apply a large first sync into a scratch in-memory database and merge it into yours once, instead of one journaled transaction per batch. Used only for a device's first sync of a view with at least 2000 server operations (`{ minOperations }` changes that), and only where the database can stage (browser OPFS, native SQLite). `false` applies the stream directly. Nothing of a staged stream is in your database, or counted in its sync watermark, until the merge: a reload mid-way starts the stream again. |
+| `bulkReplication` | on for browser OPFS | Apply a large first sync into a scratch in-memory database and merge it into yours once, instead of one journaled transaction per batch. Used only for a device's first sync of a view with at least 2000 server operations (`{ minOperations }` changes that), and only where the database can stage. A browser OPFS database stages by default. Node's native SQLite (`better-sqlite3`) has no per-batch journaling cost to avoid, so it stages only when you ask (`true` or an object). IndexedDB and Tauri databases never stage. `false` applies the stream directly. Nothing of a staged stream is in your database, or counted in its sync watermark, until the merge: a reload mid-way starts the stream again. |
 | `autoReconnect` | `true` | Reconnect after an unexpected disconnect. |
 | `reconnectInterval` | `1000` | First reconnect delay (ms). |
 | `maxReconnectInterval` | `30000` | Longest reconnect delay (ms). |

@@ -625,3 +625,14 @@ describe('TauriSqliteAdapter IPC marshaling', () => {
 		expect(sqls).toEqual(['BEGIN', 'ROLLBACK'])
 	})
 })
+
+describe('TauriSqliteAdapter and staged first syncs', () => {
+	test('has no scratch database, so a first sync never stages (the documented behaviour)', () => {
+		// docs/guide/sync-configuration.md (`bulkReplication`) states this.
+		const adapter = new TauriSqliteAdapter({
+			path: 'kora.db',
+			invoke: async () => undefined as never,
+		})
+		expect('createStagingAdapter' in adapter).toBe(false)
+	})
+})
