@@ -1,5 +1,5 @@
 import { type Operation, defineSchema, hashBlob, t } from '@korajs/core'
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { BlobAccessIndex } from './blob-access-index'
 
@@ -101,5 +101,43 @@ describe('BlobAccessIndex (RT-1)', () => {
 		const index = new BlobAccessIndex(store, async () => forged)
 		expect(await index.isReferenced(alice, 'c'.repeat(64))).toBe(false)
 		expect(await index.isReferenced(alice, chunkHashes[0] as string)).toBe(false)
+	})
+})
+
+describe('BlobAccessIndex scope sets stay bounded', () => {
+	afterEach(() => vi.useRealTimers())
+	const cached = (index: BlobAccessIndex) =>
+		(index as unknown as { byScope: Map<string, unknown> }).byScope
+	const scopeOf = (user: number) => ({ files: { owner: `u${user}` }, notes: { owner: `u${user}` } })
+
+	test('10,000 distinct scopes keep at most the cap of sets', async () => {
+		const { blobHash } = await chunked()
+		const store = await storeWith({ hash: blobHash, size: 16 })
+		const index = new BlobAccessIndex(store, null, 60_000, 500)
+		for (let user = 0; user < 10_000; user++) await index.isReferenced(scopeOf(user), blobHash)
+		expect(cached(index).size).toBeLessThanOrEqual(500)
+		// The most recent scope is still cached; the first was evicted.
+		expect(cached(index).has(JSON.stringify(scopeOf(0)))).toBe(false)
+	})
+
+	test('invalidating a collection drops the sets built from it at once', async () => {
+		const { blobHash } = await chunked()
+		const store = await storeWith({ hash: blobHash, size: 16 })
+		const index = new BlobAccessIndex(store, null, 60_000)
+		for (let user = 0; user < 100; user++) await index.isReferenced(scopeOf(user), blobHash)
+		expect(cached(index).size).toBe(100)
+		index.invalidate(['files'])
+		expect(cached(index).size).toBe(0)
+	})
+
+	test('expired sets are swept as new ones are cached', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		const { blobHash } = await chunked()
+		const store = await storeWith({ hash: blobHash, size: 16 })
+		const index = new BlobAccessIndex(store, null, 5_000)
+		for (let user = 0; user < 100; user++) await index.isReferenced(scopeOf(user), blobHash)
+		vi.setSystemTime(Date.now() + 10_000)
+		await index.isReferenced(scopeOf(1_000), blobHash)
+		expect(cached(index).size).toBe(1)
 	})
 })

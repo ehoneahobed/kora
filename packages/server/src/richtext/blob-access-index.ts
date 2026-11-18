@@ -9,6 +9,8 @@ import type { ResolveBlobChunk } from './blob-chunk-relay'
 
 /** How long a scope's referenced-hash set is reused before it is rebuilt. */
 export const DEFAULT_BLOB_ACCESS_CACHE_TTL_MS = 5_000
+/** Most scope sets kept (least recently used first out): one per distinct download scope. */
+const DEFAULT_MAX_SCOPE_SETS = 10_000
 /** Most chunk lists remembered from manifests. */
 const MAX_KNOWN_MANIFESTS = 10_000
 /** Most blob owners remembered when the store cannot persist them. */
@@ -92,6 +94,7 @@ export class BlobAccessIndex {
 		private readonly store: ServerStore,
 		private readonly resolveBlobChunk: ResolveBlobChunk | null,
 		private readonly ttlMs: number = DEFAULT_BLOB_ACCESS_CACHE_TTL_MS,
+		private readonly maxScopeSets: number = DEFAULT_MAX_SCOPE_SETS,
 	) {}
 
 	/**
@@ -111,6 +114,11 @@ export class BlobAccessIndex {
 				collection,
 				(this.collectionGeneration.get(collection) ?? 0) + 1,
 			)
+		}
+		// Sets built from those collections can never be used again: drop them now, not when
+		// (if ever) their scope is read again.
+		for (const [key, entry] of this.byScope) {
+			if (!this.isCurrent(entry.stamp)) this.byScope.delete(key)
 		}
 	}
 
@@ -282,8 +290,14 @@ export class BlobAccessIndex {
 		const partitionKey = scopes ? stableKey(scopes) : '*'
 		const collections = this.blobCollections(scopes)
 		const cached = this.byScope.get(partitionKey)
-		if (cached && this.isCurrent(cached.stamp) && Date.now() - cached.builtAtMs < this.ttlMs) {
-			return cached.direct
+		if (cached) {
+			if (this.isCurrent(cached.stamp) && Date.now() - cached.builtAtMs < this.ttlMs) {
+				// Most recently used last: the cap evicts from the front.
+				this.byScope.delete(partitionKey)
+				this.byScope.set(partitionKey, cached)
+				return cached.direct
+			}
+			this.byScope.delete(partitionKey)
 		}
 		const running = this.inflight.get(partitionKey)
 		if (running && this.isCurrent(running.stamp)) return running.promise
@@ -295,12 +309,32 @@ export class BlobAccessIndex {
 		try {
 			const direct = await promise
 			// Only cache a set nothing invalidated while it was being built.
-			if (this.isCurrent(stamp)) {
-				this.byScope.set(partitionKey, { direct, builtAtMs: Date.now(), stamp })
-			}
+			if (this.isCurrent(stamp))
+				this.remember(partitionKey, { direct, builtAtMs: Date.now(), stamp })
 			return direct
 		} finally {
 			if (this.inflight.get(partitionKey) === entry) this.inflight.delete(partitionKey)
+		}
+	}
+
+	/**
+	 * Cache a scope set: expired sets are swept first (a departed user's scope is never read
+	 * again), then the least recently used go past the cap.
+	 */
+	private remember(key: string, entry: ScopeEntry): void {
+		// From the least recently used end, until a fresh set: as much work as there is to drop
+		// (an expired set further in is still bounded by the cap).
+		const now = Date.now()
+		for (const [other, cached] of this.byScope) {
+			if (now - cached.builtAtMs < this.ttlMs) break
+			this.byScope.delete(other)
+		}
+		this.byScope.delete(key)
+		this.byScope.set(key, entry)
+		while (this.byScope.size > this.maxScopeSets) {
+			const oldest = this.byScope.keys().next().value
+			if (oldest === undefined) break
+			this.byScope.delete(oldest)
 		}
 	}
 
