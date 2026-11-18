@@ -13,7 +13,18 @@ const schema = defineSchema({
 	collections: { notes: { fields: { title: t.string() } } },
 })
 
-type Dropping = { simulateDisconnect(reason: string): void; simulateError(error: Error): void }
+type Dropping = {
+	simulateDisconnect(reason: string): void
+	simulateError(error: Error): void
+	disconnect(): Promise<void>
+}
+
+/** A network drop ends both sides: the server's session, then the client's transport. */
+async function drop(transport: Dropping, how: 'close' | 'error'): Promise<void> {
+	await transport.disconnect()
+	if (how === 'close') transport.simulateDisconnect('network lost')
+	else transport.simulateError(new Error('network lost'))
+}
 
 let network: TestNetwork | null = null
 afterEach(async () => {
@@ -55,8 +66,7 @@ describe('remote presence ends with the sync session', () => {
 			const { awarenessA, transportA } = await twoDevicesSeeingEachOther()
 			const changes: AwarenessChange[] = []
 			awarenessA.on('change', (change) => changes.push(change))
-			if (how === 'close') transportA.simulateDisconnect('network lost')
-			else transportA.simulateError(new Error('network lost'))
+			await drop(transportA, how)
 			await vi.waitFor(() => expect(names(awarenessA.getStates())).toEqual(['Ada']))
 			expect(changes.some((change) => change.removed.length === 1)).toBe(true)
 		})
@@ -64,7 +74,7 @@ describe('remote presence ends with the sync session', () => {
 
 	test('after reconnecting, the server catch-up shows the others again', async () => {
 		const { a, awarenessA, transportA } = await twoDevicesSeeingEachOther()
-		transportA.simulateDisconnect('network lost')
+		await drop(transportA, 'close')
 		await vi.waitFor(() => expect(names(awarenessA.getStates())).toEqual(['Ada']))
 		await a.disconnect()
 		await a.reconnect()
