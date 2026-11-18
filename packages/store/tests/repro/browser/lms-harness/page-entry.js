@@ -334,6 +334,47 @@ window.H = {
 		})
 	},
 	/**
+	 * A replace-mode importBackup that "crashes" right after its replace transaction commits
+	 * (the re-apply of this device's unsynced writes throws), on the IndexedDB adapter. The
+	 * store is left open, as a crashed page leaves it. `flush`: the committed replace reached
+	 * IndexedDB before the crash (the dangerous point); otherwise it had not.
+	 */
+	async restoreCrash(dbName, opts = {}) {
+		const adapter = new IndexedDbAdapter({
+			dbName,
+			workerUrl: '/kora-worker.js',
+			emitter,
+			persistenceDebounceMs: 0,
+		})
+		const store = new Store({ schema, adapter, dbName })
+		await store.open()
+		const notes = store.collection('notes')
+		await notes.insert({ title: 'in the backup' })
+		const backup = await store.exportBackup()
+		await notes.insert({ title: 'written after the backup' })
+		await adapter.flushPersistence()
+		let crashed = false
+		await store
+			.importBackup(backup, undefined, {
+				applyOperation: async () => {
+					crashed = true
+					throw new Error('crash before the kept writes were applied again')
+				},
+			})
+			.catch(() => undefined)
+		if (opts.flush) await adapter.flushPersistence()
+		return { crashed }
+	},
+	/** Open the store fresh (another page) and list its note titles. */
+	async restoreRead(dbName) {
+		const adapter = new IndexedDbAdapter({ dbName, workerUrl: '/kora-worker.js', emitter })
+		const store = new Store({ schema, adapter, dbName })
+		await store.open()
+		const titles = (await store.collection('notes').where({}).exec()).map((r) => r.title).sort()
+		await store.close()
+		return titles
+	},
+	/**
 	 * RT-65: open a real Store (SQLite WASM on OPFS, or the IndexedDB fallback), write
 	 * every poisoned string into every string-holding field kind, close, reopen, and
 	 * read the values back through findById, equality and $in filters, and the op log.

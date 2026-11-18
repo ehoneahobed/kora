@@ -938,6 +938,30 @@ const scenarios = {
 		}
 		await ctx.close()
 	},
+	async 'RESTORE-CRASH'() {
+		// A replace restore keeps this device's unsynced writes across a crash right after its
+		// replace transaction commits, on the IndexedDB adapter: with the replaced state already
+		// persisted, and before it was.
+		for (const flush of [true, false]) {
+			const ctx = await browser.newContext()
+			const dbName = `restore-crash-${flush ? 'flushed' : 'unflushed'}`
+			const writer = await tab(ctx)
+			const run = await writer.evaluate((o) => H.restoreCrash(o.dbName, { flush: o.flush }), {
+				dbName,
+				flush,
+			})
+			await writer.close()
+			const reader = await tab(ctx)
+			const titles = await reader.evaluate((name) => H.restoreRead(name), dbName)
+			check(
+				`RESTORE-CRASH-${flush ? 'flushed' : 'unflushed'}`,
+				`after a crash ${flush ? 'once the replace reached IndexedDB' : 'before the replace reached IndexedDB'}, the unsynced write is still there`,
+				run.crashed && J(titles) === J(['in the backup', 'written after the backup']),
+				`crashed=${run.crashed} titles=${J(titles)}`,
+			)
+			await ctx.close()
+		}
+	},
 	async 'LMS-MIG'() {
 		// Upgrade path: a database written by 1.0.0-beta.12 (one origin-wide 'kora-opfs'
 		// pool) survives the first open under per-database pools.
