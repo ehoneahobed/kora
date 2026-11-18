@@ -1686,6 +1686,44 @@ export class SyncEngine {
 	}
 
 	/**
+	 * An access narrowing the store could not apply blocks the delivery stream (the watermark
+	 * stays at the batch base until it applies): reported like a blocked operation, under the
+	 * id `access-narrowing:<collection>`, so status, events and logs show why sync stalls.
+	 */
+	private noteNarrowingFailure(collection: string, error: unknown, unsupported: boolean): void {
+		const id = `access-narrowing:${collection}`
+		const prior = this.blockedFailure
+		const message = unsupported
+			? `The sync store cannot apply access narrowing for "${collection}": delivery is paused until it can.`
+			: `Applying the access narrowing for "${collection}" failed: ${error instanceof Error ? error.message : String(error)}`
+		this.blockedFailure = {
+			operationId: id,
+			collection,
+			recordId: '',
+			code: unsupported ? 'ACCESS_NARROWING_UNSUPPORTED' : 'ACCESS_NARROWING_FAILED',
+			message,
+			retriable: !unsupported,
+			firstSeenAt: prior?.operationId === id ? prior.firstSeenAt : Date.now(),
+			retryCount: prior?.operationId === id ? prior.retryCount + 1 : 0,
+		}
+		console.error(`[kora] ${message}`)
+		this.emitEvent({
+			type: prior?.operationId === id ? 'sync:apply-retrying' : 'sync:apply-blocked',
+			failure: this.blockedFailure,
+		})
+		this.scheduleDeviceStatus()
+	}
+
+	/** A narrowing that applies clears the block it caused (see {@link noteNarrowingFailure}). */
+	private noteNarrowingApplied(collection: string): void {
+		const blocked = this.blockedFailure
+		if (blocked?.operationId !== `access-narrowing:${collection}`) return
+		this.blockedFailure = null
+		this.emitter?.emit({ type: 'sync:apply-recovered', failure: blocked })
+		this.scheduleDeviceStatus()
+	}
+
+	/**
 	 * Surface an inbound apply failure. `blocking` marks the stream as stalled on this op
 	 * (the watermark does not pass it); `quarantined` means the op is durably recorded and
 	 * the stream moves on, so it never marks the stream blocked, whatever `retriable` says
@@ -4280,9 +4318,11 @@ export class SyncEngine {
 		// with unsent local operations stay (their operations upload, and the server
 		// judges them).
 		for (const [collection, scope] of Object.entries(msg.accessNarrowing ?? {})) {
+			let unsupported = false
 			if (moved()) return stale()
 			try {
 				if (!this.store.applyCollectionNarrowing) {
+					unsupported = true
 					throw new SyncError('The configured sync store does not support access narrowing', {
 						collection,
 					})
@@ -4302,9 +4342,12 @@ export class SyncEngine {
 						quarantinedOperationIds: [],
 					})
 				}
-			} catch {
-				// Not applied: the watermark stays put and the batch is re-sent.
+				this.noteNarrowingApplied(collection)
+			} catch (error) {
+				// Not applied: the watermark stays put and the batch is re-sent. Never silently:
+				// the stream is blocked on it until it applies.
 				fullyApplied = false
+				this.noteNarrowingFailure(collection, error, unsupported)
 			}
 		}
 		// Apply what the server delivered, in stream order (SYNC-2, NEW-SYNC-3): the server
