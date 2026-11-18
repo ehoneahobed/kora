@@ -33,6 +33,16 @@ export {
 } from './composables/use-offline-keep'
 export { createOfflineReadyStore, useOfflineReady } from './composables/use-offline-ready'
 export { createSyncStatusStore, useSyncStatus } from './composables/use-sync-status'
+export { createSyncSummaryStore, useSyncSummary } from './composables/use-sync-summary'
+export { createKoraHooks } from './composables/create-kora-hooks'
+export type {
+	AccessorRecord,
+	AppCollectionName,
+	AppCollections,
+	AppRecord,
+	KoraHooks,
+} from './composables/create-kora-hooks'
+export type { SyncSummary } from '@korajs/sync/lite'
 export { useFormDraft } from './composables/use-form-draft'
 export type { FormDraftStore, SvelteFormDraftOptions } from './composables/use-form-draft'
 export { getApp, useApp } from './composables/use-app'

@@ -10,6 +10,9 @@ export {
 	OFFLINE_SYNC_STATUS,
 } from './reactivity/sync-status-controller'
 export type { SyncStatusController } from './reactivity/sync-status-controller'
+// The status summarized for an indicator (tone, title, detail), drawn at first paint.
+export { summarizeSyncStatus } from './status/summarize'
+export type { SummarizeSyncOptions, SyncSummary, SyncSummaryState } from './status/summarize'
 export { validateEncryptedRelations } from './encryption/encrypted-relations'
 export { isValidKeyringName } from './encryption/keyring-name'
 

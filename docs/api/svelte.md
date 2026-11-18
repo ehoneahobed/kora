@@ -171,9 +171,39 @@ Readable store of `SyncStatusInfo`. It updates only when the status changes, and
 
 ---
 
+## createSyncSummaryStore() / useSyncSummary()
+
+Readable store of `SyncSummary`, the status summarized for an indicator: `tone` (`ok`, `working` or `attention`), a short `title`, one line of `detail`, pending writes, and whether the first download is still running. It follows `createSyncStatusStore()` (see the [React reference](/api/react#usesyncsummary) for each field).
+
+```svelte
+<script lang="ts">
+  import { useSyncSummary } from '@korajs/svelte'
+  const sync = useSyncSummary()
+</script>
+
+<span class="chip {$sync.tone}" title={$sync.detail}>{$sync.title}</span>
+```
+
+---
+
 ## getApp() / getCollection()
 
 Context accessors. Must be called after `KoraProvider` has finished initializing (inside its child tree).
+
+## createKoraHooks()
+
+`createKoraHooks<typeof app>()` returns helpers typed for one app: `useCollection('todos')` (alias `getCollection`) accepts only the app's collection names and returns its typed accessor, so `insert`, `update`, `where` and the rows of `useQuery` follow the schema. Call it once next to `createApp`; nothing runs at call time, and the helpers read the app from `KoraProvider` during component initialization. It returns `useApp`/`getApp`, `useCollection`/`getCollection`, `useQuery`, `useQueryState`, `useMutation`, `useSyncStatus` and `useSyncSummary`.
+
+<!-- docs-check: skip imports an app module of the reader's project -->
+```typescript
+// kora.ts
+import { createApp } from 'korajs'
+import { createKoraHooks } from '@korajs/svelte'
+import schema from './schema'
+
+export const app = createApp({ schema })
+export const { useCollection, useQuery, useMutation } = createKoraHooks<typeof app>()
+```
 
 ---
 
