@@ -318,17 +318,18 @@ describe.each(STORE_KINDS)('spaces on the %s store', (kind) => {
 		expect((await h.call('ann', '/leave', { space: ['forms', 'f1'] })).status).toBe(200)
 	})
 
-	test('a space the server does not have yet, and a deleted one', async () => {
+	test('a space the server does not have yet gets the answer a stranger gets; a deleted one its owner hears about', async () => {
+		// The server cannot tell the creator of a space it has not received from a stranger, so
+		// both get the refusal that reveals nothing; its message says to retry once it syncs.
 		const h = await harness(kind)
-		expect(
-			codeOf(
-				await h.call('ann', '/invitations/create', {
-					space: ['forms', 'later'],
-					email: 'bob@example.com',
-					role: 'viewer',
-				}),
-			),
-		).toBe('SPACE_NOT_SYNCED')
+		const refused = await h.call('ann', '/invitations/create', {
+			space: ['forms', 'later'],
+			email: 'bob@example.com',
+			role: 'viewer',
+		})
+		expect(codeOf(refused)).toBe('FORBIDDEN')
+		expect(JSON.stringify(refused.body)).toContain('once it has synced')
+		// Its owner may know a space of hers was deleted.
 		await h.createForm('f1', 'ann')
 		await h.server.getKoraContext().apply({ collection: 'forms', type: 'delete', recordId: 'f1' })
 		expect(

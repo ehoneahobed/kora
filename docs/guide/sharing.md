@@ -193,12 +193,12 @@ Responses are `{ error: { code, message } }`; `message` is written for people.
 | Code | Status | Meaning |
 |---|---|---|
 | `UNAUTHENTICATED` | 401 | No signed-in user. |
-| `FORBIDDEN` | 403 | The caller's role does not allow this action on this target. |
+| `FORBIDDEN` | 403 | The caller's role does not allow this action on this target. Someone who cannot manage the space's members gets this whatever the space's state, before anything about the space or the target is checked, so the refusal reveals nothing about it. That includes the creator of a space the server does not have yet (created offline), whom the server cannot tell apart from a stranger: retry after it syncs. |
 | `ROLE_TOO_HIGH` | 403 | Granting a role at or above your own. |
 | `ROLE_NOT_ALLOWED` | 400 | Not a role, or the owner role (transfer instead). |
 | `ROLE_CHANGED` | 409 | The member's role is no longer the `from` you saw. |
-| `SPACE_NOT_SYNCED` | 409 | The server does not have the space yet (created offline); retry after it syncs. |
-| `SPACE_NOT_FOUND` | 404 | The space was deleted. |
+| `SPACE_NOT_SYNCED` | 409 | Accepting an invitation to a space the server does not have yet; retry after it syncs. |
+| `SPACE_NOT_FOUND` | 404 | The space was deleted (told to someone who held a role in it). |
 | `NOT_A_MEMBER`, `ALREADY_MEMBER`, `ALREADY_OWNER` | 404, 409, 409 | |
 | `CANNOT_CHANGE_OWNER`, `OWNER_CANNOT_LEAVE` | 409 | The owner changes only by transfer. |
 | `INVITATION_NOT_FOUND`, `INVITATION_EXPIRED` | 404, 410 | |

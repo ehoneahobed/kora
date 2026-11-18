@@ -42,6 +42,10 @@ import {
 } from './tokens'
 
 /** The signed-in caller of a spaces route, as the app's `identify` resolves it. */
+
+/** The refusal to anyone who cannot invite, whatever the space's state. */
+const INVITE_FORBIDDEN =
+	'Only the space’s managers can invite people. If you created this space offline, try again once it has synced.'
 export interface SpacesIdentity {
 	userId: string
 	/** The account's email address. Accepting an invitation requires it to be the invited one. */
@@ -398,27 +402,13 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 			const email = normalizeEmail(stringField(body, 'email', 254))
 			if (!isEmail(email)) throw new RouteRefusal('INVALID_REQUEST', 'Enter a valid email address.')
 			// Early, non-binding check (the transaction decides): refuse a caller who cannot
-			// invite before counting the request against the recipient's daily limit.
+			// invite before counting the request against the recipient's daily limit. Someone
+			// without a role gets one answer whether or not the space exists, so a refusal
+			// reveals nothing about it; that includes the creator of a space the server has not
+			// received yet, who cannot be told apart from a stranger.
 			const held = await request.access.roleOf(identity.userId, spaceKeyOf(space))
-			if (!held) {
-				const stored = await request.kora.query(space[0], {
-					where: { id: space[1] },
-					includeDeleted: true,
-					limit: 1,
-				})
-				const row = stored[0]
-				if (!row) {
-					throw new RouteRefusal(
-						'SPACE_NOT_SYNCED',
-						'The server does not have this space yet. If it was created offline, try again once it has synced.',
-					)
-				}
-				if (row._deleted === 1 || row._deleted === true) {
-					throw new RouteRefusal('SPACE_NOT_FOUND', 'This space was deleted.')
-				}
-			}
 			if (!held || sharing.rank(held.role) < sharing.rank(sharing.manageRole)) {
-				throw new RouteRefusal('FORBIDDEN', 'Only the space’s managers can invite people.')
+				throw new RouteRefusal('FORBIDDEN', INVITE_FORBIDDEN)
 			}
 			if (sharing.rank(role) >= sharing.rank(held.role)) {
 				throw new RouteRefusal(

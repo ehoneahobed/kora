@@ -44,6 +44,66 @@ function fakeClock(): { advance(ms: number): void } {
 const F1 = ['forms', 'f1'] as const
 
 describe.each(STORE_KINDS)('the spaces trust boundary on the %s store', (kind) => {
+	test('someone who cannot manage members learns nothing from the refusal (enumeration)', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		await h.join('ann', 'bob', 'f1', 'editor')
+		await h.join('ann', 'cat', 'f1', 'viewer')
+		await h.createForm('f2', 'ann')
+		await h.join('ann', 'bob', 'f2', 'editor')
+		await h.server.getKoraContext().apply({ collection: 'forms', type: 'delete', recordId: 'f2' })
+		const spaces = [
+			['forms', 'never-existed'],
+			['forms', 'f1'],
+			['forms', 'f2'],
+		]
+		const targets = ['cat', 'eve', 'ann']
+		const errorOf = (response: { body: unknown }) =>
+			JSON.stringify((response.body as { error?: unknown } | undefined)?.error ?? null)
+		// dan is a stranger; bob holds a role below the manager role.
+		for (const actor of ['dan', 'bob']) {
+			const answers: Record<string, Set<string>> = {
+				role: new Set(),
+				remove: new Set(),
+				invite: new Set(),
+				transfer: new Set(),
+			}
+			for (const space of spaces) {
+				for (const userId of targets) {
+					for (const from of [undefined, 'editor']) {
+						const stale = from === undefined ? {} : { from }
+						answers.role?.add(
+							errorOf(
+								await h.call(actor, '/members/role', { space, userId, role: 'viewer', ...stale }),
+							),
+						)
+						answers.remove?.add(
+							errorOf(await h.call(actor, '/members/remove', { space, userId, ...stale })),
+						)
+					}
+					answers.transfer?.add(
+						errorOf(await h.call(actor, '/transfer', { space, toUserId: userId })),
+					)
+				}
+				answers.invite?.add(
+					errorOf(
+						await h.call(actor, '/invitations/create', {
+							space,
+							email: 'x@example.com',
+							role: 'viewer',
+						}),
+					),
+				)
+			}
+			for (const [route, seen] of Object.entries(answers)) {
+				expect([...seen], `${actor} ${route}`).toHaveLength(1)
+				expect(JSON.parse([...seen][0] as string), `${actor} ${route}`).toMatchObject({
+					code: 'FORBIDDEN',
+				})
+			}
+		}
+	})
+
 	test('below the manager role nobody invites, changes roles or removes', async () => {
 		const h = await harness(kind)
 		await h.createForm('f1', 'ann')
