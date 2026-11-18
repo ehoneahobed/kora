@@ -4,14 +4,20 @@
  * a value or type that is missing here.
  */
 export type {
+	AccessorRecord,
+	AppCollectionName,
+	AppCollections,
+	AppRecord,
 	KoraAppHandle,
 	KoraAppLike,
 	KoraContextValue,
+	KoraHooks,
 	KoraProviderProps,
 	MutationRejection,
 	OfflineReason,
 	OfflineStatus,
 	QueryInput,
+	SyncSummary,
 	UseFormDraftResult,
 	UseMutationOptions,
 	UseMutationResult,
@@ -24,6 +30,7 @@ export type {
 
 export {
 	KoraProvider,
+	createKoraHooks,
 	installKora,
 	koraAppInjectionKey,
 	koraContextKey,
@@ -41,4 +48,5 @@ export {
 	useQueryState,
 	useRichText,
 	useSyncStatus,
+	useSyncSummary,
 } from '@korajs/vue'

@@ -173,10 +173,43 @@ const status = useSyncStatus()
 
 ---
 
+## useSyncSummary()
+
+A computed ref of `SyncSummary`, the status summarized for an indicator: `tone` (`ok`, `working` or `attention`), a short `title`, one line of `detail`, pending writes, and whether the first download is still running. It follows `useSyncStatus()` (see the [React reference](/api/react#usesyncsummary) for each field).
+
+```vue
+<script setup lang="ts">
+import { useSyncSummary } from '@korajs/vue'
+
+const sync = useSyncSummary()
+</script>
+
+<template>
+  <span :class="['chip', sync.tone]" :title="sync.detail">{{ sync.title }}</span>
+</template>
+```
+
+---
+
 ## useApp() / useCollection()
 
 - `useApp()`: returns the `KoraAppLike` instance from context.
 - `useCollection(name)`: the store's collection accessor (`insert`, `update`, `delete`, `findById`, `where`).
+
+## createKoraHooks()
+
+`createKoraHooks<typeof app>()` returns composables typed for one app: `useCollection('todos')` accepts only the app's collection names and returns its typed accessor, so `insert`, `update`, `where` and the rows of `useQuery` follow the schema. Call it once next to `createApp`; nothing runs at call time. It returns `useApp`, `useCollection`, `useQuery`, `useQueryState`, `useMutation`, `useSyncStatus` and `useSyncSummary`.
+
+<!-- docs-check: skip imports an app module of the reader's project -->
+```typescript
+// kora.ts
+import { createApp } from 'korajs'
+import { createKoraHooks } from '@korajs/vue'
+import schema from './schema'
+
+export const app = createApp({ schema })
+export const { useCollection, useQuery, useMutation } = createKoraHooks<typeof app>()
+```
 
 ---
 

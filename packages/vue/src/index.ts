@@ -21,6 +21,16 @@ export { useMutation } from './composables/use-mutation'
 export { useOfflineKeep } from './composables/use-offline-keep'
 export { useOfflineReady } from './composables/use-offline-ready'
 export { useSyncStatus } from './composables/use-sync-status'
+export { useSyncSummary } from './composables/use-sync-summary'
+export { createKoraHooks } from './composables/create-kora-hooks'
+export type {
+	AccessorRecord,
+	AppCollectionName,
+	AppCollections,
+	AppRecord,
+	KoraHooks,
+} from './composables/create-kora-hooks'
+export type { SyncSummary } from '@korajs/sync/lite'
 export { useFormDraft } from './composables/use-form-draft'
 export type { UseFormDraftResult, VueFormDraftOptions } from './composables/use-form-draft'
 export { useApp } from './composables/use-app'

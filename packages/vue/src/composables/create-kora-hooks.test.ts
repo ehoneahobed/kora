@@ -42,17 +42,18 @@ describe('createKoraHooks (Vue)', () => {
 			queryStoreCache: {} as KoraContextValue['queryStoreCache'],
 		})
 		const { useApp, useCollection } = createKoraHooks<App>()
-		let seen: { app: App; todos: TodosAccessor } | null = null
+		const seen: { app?: App; todos?: TodosAccessor } = {}
 		mount(
 			defineComponent({
 				setup() {
-					seen = { app: useApp(), todos: useCollection('todos') }
+					seen.app = useApp()
+					seen.todos = useCollection('todos')
 					return () => h('div')
 				},
 			}),
 			{ global: { provide: { [koraContextKey]: contextRef } } },
 		)
-		expect(seen?.app).toBe(app)
-		expect(seen?.todos).toBe(todos)
+		expect(seen.app).toBe(app)
+		expect(seen.todos).toBe(todos)
 	})
 })

@@ -4,10 +4,15 @@
  * a value or type that is missing here.
  */
 export type {
+	AccessorRecord,
+	AppCollectionName,
+	AppCollections,
+	AppRecord,
 	FormDraftStore,
 	KoraAppHandle,
 	KoraAppLike,
 	KoraContextValue,
+	KoraHooks,
 	MutationRejection,
 	OfflineKeepStore,
 	OfflineReason,
@@ -15,6 +20,7 @@ export type {
 	QueryInput,
 	QueryState,
 	SvelteFormDraftOptions,
+	SyncSummary,
 	UseMutationOptions,
 	UseMutationResult,
 	UseQueryOptions,
@@ -25,6 +31,7 @@ export type {
 export {
 	applyPresence,
 	createCollaboratorsStore,
+	createKoraHooks,
 	createMutation,
 	createOfflineKeepStore,
 	createOfflineReadyStore,
@@ -32,6 +39,7 @@ export {
 	createQueryStore,
 	createRichTextBinding,
 	createSyncStatusStore,
+	createSyncSummaryStore,
 	getApp,
 	getCollection,
 	getKoraApp,
@@ -51,4 +59,5 @@ export {
 	useQueryState,
 	useRichText,
 	useSyncStatus,
+	useSyncSummary,
 } from '@korajs/svelte'
