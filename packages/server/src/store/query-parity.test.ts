@@ -4,10 +4,11 @@
  *
  * - `where { field: value }` matches the stored value; a boolean matches as a boolean and
  *   `null` matches a field that is null or absent.
- * - `orderBy` puts nulls last in both directions; strings compare by code point.
+ * - `orderBy` puts nulls last in both directions; strings compare by code point of their stored
+ *   form: a string with U+0000, U+FFFF or a lone surrogate sorts by its escape (text-codec.ts).
  * - `id` breaks every tie and is the order when none is given, so limit/offset pages are stable.
  */
-import { defineSchema, t } from '@korajs/core'
+import { defineSchema, encodeStoredText, t } from '@korajs/core'
 import type { Operation, SchemaDefinition } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import fc from 'fast-check'
@@ -85,8 +86,8 @@ if (PG_URL) {
 
 function compareValues(a: unknown, b: unknown): number {
 	if (typeof a === 'string' && typeof b === 'string') {
-		const left = [...a].map((c) => c.codePointAt(0) as number)
-		const right = [...b].map((c) => c.codePointAt(0) as number)
+		const left = [...encodeStoredText(a)].map((c) => c.codePointAt(0) as number)
+		const right = [...encodeStoredText(b)].map((c) => c.codePointAt(0) as number)
 		for (let i = 0; i < Math.min(left.length, right.length); i++) {
 			if (left[i] !== right[i]) return (left[i] as number) - (right[i] as number)
 		}
@@ -125,7 +126,20 @@ function model(rows: Row[], query: CollectionQueryOptions): string[] {
 
 const rowArb = fc.record({
 	done: fc.boolean(),
-	who: fc.constantFrom<string | null>('ann', 'Bob', 'bob', 'Émile', null),
+	// The last six sort by their stored escape: after 'a\uFFFE', before an astral character.
+	who: fc.constantFrom<string | null>(
+		'ann',
+		'Bob',
+		'bob',
+		'Émile',
+		null,
+		'ab',
+		'a\u0000',
+		'a\uFFFF',
+		'a\uD800',
+		'a\uFFFE',
+		'a😀',
+	),
 	status: fc.constantFrom('draft', 'live', 'gone'),
 	at: fc.constantFrom<number | null>(1000, 2000, 2000, null),
 	score: fc.constantFrom(1, 2, 2, 3),
@@ -135,7 +149,7 @@ const queryArb: fc.Arbitrary<CollectionQueryOptions> = fc.record(
 		where: fc.record(
 			{
 				done: fc.boolean(),
-				who: fc.constantFrom<string | null>('ann', 'bob', null),
+				who: fc.constantFrom<string | null>('ann', 'bob', null, 'a\u0000', 'a\uD800'),
 				status: fc.constantFrom('draft', 'live'),
 				at: fc.constantFrom<number | null>(2000, null),
 			},
@@ -198,4 +212,45 @@ describe.each(makers)('%s server store: queries follow the shared contract', (_k
 			{ numRuns: PG_URL ? 30 : 60 },
 		)
 	}, 300_000)
+})
+
+describe.each(makers)('%s server store: escaped strings', (_kind, make) => {
+	// U+0000, U+FFFF and a lone surrogate are stored as U+FFFF plus '0', 'F' or 's' and hex, and
+	// every store orders them by that stored form: after U+FFFE, before an astral character.
+	test('order by their stored escape, in both directions, and match exactly', async () => {
+		const { store, end } = await make()
+		try {
+			await store.setSchema(schema)
+			const values = ['a😀', 'a\uD800', 'ab', 'a\uFFFF', 'a\u0000', 'a\uFFFE']
+			for (const [i, who] of values.entries()) {
+				const operation: Operation = {
+					id: `op-${i}`,
+					nodeId: 'device-a',
+					type: 'insert',
+					collection: 'items',
+					recordId: `r${i}`,
+					data: { who },
+					previousData: null,
+					timestamp: { wallTime: 1_790_000_000_000 + i, logical: 0, nodeId: 'device-a' },
+					sequenceNumber: i + 1,
+					causalDeps: [],
+					schemaVersion: 1,
+				}
+				expect(await store.applyRemoteOperation(operation)).toBe('applied')
+			}
+			const order = async (direction: 'asc' | 'desc') =>
+				(await store.queryCollection('items', { orderBy: 'who', orderDirection: direction })).map(
+					(row) => row.who,
+				)
+			const expected = ['ab', 'a\uFFFE', 'a\u0000', 'a\uFFFF', 'a\uD800', 'a😀']
+			expect(await order('asc')).toEqual(expected)
+			expect(await order('desc')).toEqual([...expected].reverse())
+			for (const who of values) {
+				const rows = await store.queryCollection('items', { where: { who } })
+				expect(rows.map((row) => row.who)).toEqual([who])
+			}
+		} finally {
+			await end()
+		}
+	})
 })
