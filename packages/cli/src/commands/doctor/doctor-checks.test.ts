@@ -49,6 +49,24 @@ describe('doctor checks', () => {
 		expect(toSyncStatusHttpBase('wss://sync.example.com/kora')).toBe('https://sync.example.com')
 	})
 
+	it('warns when a Tauri app still uses the shared template identifier com.kora.app', async () => {
+		const temp = await createTempDir()
+		temps.push(temp)
+		await writeFile(
+			join(temp.path, 'package.json'),
+			JSON.stringify({ name: 'desk', dependencies: { korajs: '1.0.0-beta.15' } }),
+		)
+		await mkdir(join(temp.path, 'src-tauri'), { recursive: true })
+		await writeFile(
+			join(temp.path, 'src-tauri', 'tauri.conf.json'),
+			JSON.stringify({ productName: 'kora-app', identifier: 'com.kora.app' }),
+		)
+		const results = await runDoctorChecks({ projectRoot: temp.path, skipNetwork: true })
+		const identity = results.find((r) => r.id === 'tauri-identifier')
+		expect(identity?.status).toBe('warn')
+		expect(identity?.message).toContain('com.kora.app')
+	})
+
 	it('reports missing schema as failure', async () => {
 		const temp = await createTempDir()
 		temps.push(temp)

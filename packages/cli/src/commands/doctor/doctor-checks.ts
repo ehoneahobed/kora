@@ -68,6 +68,9 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 		message: projectRoot,
 	})
 
+	const tauriIdentifier = await checkTauriIdentifier(projectRoot)
+	if (tauriIdentifier) results.push(tauriIdentifier)
+
 	const config = await loadKoraConfig(projectRoot)
 	if (!config) {
 		results.push({
@@ -270,6 +273,38 @@ async function resolveSchemaPath(
 		}
 	}
 	return findSchemaFile(projectRoot)
+}
+
+/**
+ * A Tauri app's identifier decides where its data lives: one still on the template's old
+ * shared `com.kora.app` opens the same database as every other app that kept it.
+ */
+async function checkTauriIdentifier(projectRoot: string): Promise<DoctorCheckResult | null> {
+	let identifier: unknown
+	try {
+		const config = JSON.parse(
+			await readFile(join(projectRoot, 'src-tauri', 'tauri.conf.json'), 'utf8'),
+		) as { identifier?: unknown }
+		identifier = config.identifier
+	} catch {
+		return null
+	}
+	if (identifier === 'com.kora.app') {
+		return {
+			id: 'tauri-identifier',
+			title: 'Tauri app identifier',
+			status: 'warn',
+			message:
+				'src-tauri/tauri.conf.json uses com.kora.app, the identifier every app from the old template shared: they all read and write the same database.',
+			fix: 'Set "identifier" to your own reverse-DNS id (for example com.yourcompany.yourapp) before you ship; once users have data, changing it leaves their data behind.',
+		}
+	}
+	return {
+		id: 'tauri-identifier',
+		title: 'Tauri app identifier',
+		status: 'pass',
+		message: `Data is kept under ${String(identifier)}.`,
+	}
 }
 
 async function checkWorkerFile(projectRoot: string): Promise<DoctorCheckResult> {

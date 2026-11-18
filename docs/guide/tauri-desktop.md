@@ -199,7 +199,7 @@ Edit `src-tauri/tauri.conf.json` to customize the window:
 
 ### App Identity
 
-Update the app identifier and product name:
+`create-kora-app` names the app after the project (`productName`) and gives it its own identifier, `com.<project-name>`. Set the identifier to your own reverse-DNS id before you ship:
 
 ```json
 {
@@ -207,6 +207,8 @@ Update the app identifier and product name:
   "identifier": "com.mycompany.myapp"
 }
 ```
+
+The identifier decides where the app keeps its data (on macOS, `~/Library/Application Support/<identifier>/`), including the local database. Two apps with the same identifier share one database, and changing it after release leaves your users' data behind under the old one. Apps scaffolded before 1.0.0-beta.15 all used `com.kora.app`: `kora doctor` warns about it.
 
 ### Capabilities
 

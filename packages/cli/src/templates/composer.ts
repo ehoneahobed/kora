@@ -3,6 +3,7 @@ import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/pro
 import { join, resolve } from 'node:path'
 import { resolveCliPackageRoot } from '../runtime/module-resolution'
 import type { TemplateContext, TemplateName } from '../types'
+import { tauriIdentifierFor } from './tauri-identifier'
 import { KORA_TAURI_TEMPLATE_VERSION } from './tauri-version'
 
 export type TemplateLayerCategory = 'base' | 'ui' | 'style' | 'sync' | 'db' | 'auth'
@@ -189,6 +190,7 @@ export async function composeTemplateLayers(
 		packageManager: context.packageManager,
 		koraVersion: context.koraVersion,
 		tauriVersion: context.tauriVersion ?? KORA_TAURI_TEMPLATE_VERSION,
+		tauriIdentifier: tauriIdentifierFor(context.projectName),
 		dbProvider: context.dbProvider ?? 'none',
 	}
 

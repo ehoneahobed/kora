@@ -67,6 +67,7 @@
     "@types/validate-npm-package-name": "^4.0.2",
     "@types/ws": "^8.5.13",
     "better-sqlite3": "^12.8.0",
+    "fast-check": "^4.6.0",
     "korajs": "workspace:*",
     "postgres": "^3.4.8",
     "rollup": "4.60.1",
