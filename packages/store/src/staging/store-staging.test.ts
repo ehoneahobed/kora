@@ -49,6 +49,11 @@ async function open(
 }
 
 describe('Store.beginStaging: when a database stages a first sync', () => {
+	test('the native SQLite adapter declares staging opt-in (the documented default)', () => {
+		// docs/guide/sync-configuration.md (`bulkReplication`) states this default.
+		expect(new BetterSqlite3Adapter(':memory:').prefersStaging).toBe(false)
+	})
+
 	test('native SQLite does not stage unless asked; asked, it does', async () => {
 		const store = await open()
 		expect(await store.beginStaging()).toBeNull()

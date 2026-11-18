@@ -365,8 +365,9 @@ export interface SyncOptions {
 	strictHandshake?: boolean
 	/**
 	 * Apply a large first sync into a scratch in-memory replica and merge it into the database
-	 * once, instead of one journaled transaction per batch (default on where the database can
-	 * stage: a durable browser or native SQLite database). `false` applies it directly;
+	 * once, instead of one journaled transaction per batch. On by default for a browser OPFS
+	 * database; Node's native SQLite (`better-sqlite3`) stages only when this is set (`true` or
+	 * an object); IndexedDB and Tauri databases never stage. `false` applies it directly;
 	 * `{ minOperations }` sets the smallest server log worth staging (default 2000).
 	 */
 	bulkReplication?: boolean | BulkReplicationConfig
