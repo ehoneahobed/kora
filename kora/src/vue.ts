@@ -1,5 +1,44 @@
 /**
- * Vue 3 bindings: everything `@korajs/vue` exports, for `import { ... } from 'korajs/vue'`.
- * A re-export of the whole package, so the two never drift (meta-exports.test.ts).
+ * Vue 3 bindings, re-exported from `@korajs/vue` for `import { ... } from 'korajs/vue'`.
+ * Every export is listed (no `export *`): meta-exports.test.ts fails when `@korajs/vue` gains
+ * a value or type that is missing here.
  */
-export * from '@korajs/vue'
+export type {
+	KoraAppHandle,
+	KoraAppLike,
+	KoraContextValue,
+	KoraProviderProps,
+	MutationRejection,
+	OfflineReason,
+	OfflineStatus,
+	QueryInput,
+	UseFormDraftResult,
+	UseMutationOptions,
+	UseMutationResult,
+	UseQueryOptions,
+	UseQueryStateResult,
+	UseRichTextOptions,
+	UseRichTextResult,
+	VueFormDraftOptions,
+} from '@korajs/vue'
+
+export {
+	KoraProvider,
+	installKora,
+	koraAppInjectionKey,
+	koraContextKey,
+	useApp,
+	useCollaborators,
+	useCollection,
+	useFormDraft,
+	useKoraApp,
+	useKoraContext,
+	useMutation,
+	useOfflineKeep,
+	useOfflineReady,
+	usePresence,
+	useQuery,
+	useQueryState,
+	useRichText,
+	useSyncStatus,
+} from '@korajs/vue'
