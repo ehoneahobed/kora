@@ -1,16 +1,30 @@
 import type { AwarenessState } from '@korajs/sync'
 import { subscribeRemoteAwarenessStates } from '@korajs/sync'
-import { type ShallowRef, onScopeDispose, shallowRef, watch, watchEffect } from 'vue'
+import {
+	type MaybeRefOrGetter,
+	type ShallowRef,
+	onScopeDispose,
+	shallowRef,
+	toValue,
+	watch,
+	watchEffect,
+} from 'vue'
 import { useKoraContextRef } from '../context'
 
 /**
- * Sets the local user's collaborative presence state.
+ * Sets the local user's collaborative presence state. `user` may be a ref, a getter or a
+ * reactive object: a change updates what collaborators see, and null clears it.
  */
-export function usePresence(user: { name: string; color: string; avatar?: string } | null): void {
+export function usePresence(
+	user: MaybeRefOrGetter<{ name: string; color: string; avatar?: string } | null>,
+): void {
 	const context = useKoraContextRef()
 
 	watch(
-		() => [context.value.syncEngine, user?.name, user?.color, user?.avatar] as const,
+		() => {
+			const current = toValue(user)
+			return [context.value.syncEngine, current?.name, current?.color, current?.avatar] as const
+		},
 		([engine, name, color, avatar], _prev, onCleanup) => {
 			if (!engine || !name || !color) return
 

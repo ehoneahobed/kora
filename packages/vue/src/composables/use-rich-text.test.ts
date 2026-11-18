@@ -1,7 +1,7 @@
 import type { CollectionAccessor, Store } from '@korajs/store'
 import { mount } from '@vue/test-utils'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { defineComponent, h } from 'vue'
+import { defineComponent, h, ref } from 'vue'
 import * as Y from 'yjs'
 import { KoraProvider } from '../components/kora-provider'
 import { useRichText } from './use-rich-text'
@@ -227,4 +227,45 @@ describe('useRichText', () => {
 
 		expect(() => wrapper.unmount()).not.toThrow()
 	})
+})
+
+describe('useRichText follows a record id that changes', () => {
+	function notesWith(bodies: Record<string, Uint8Array>) {
+		return {
+			findById: vi.fn(async (id: string) => ({ id, body: bodies[id] ?? null })),
+			update: vi.fn(),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([])),
+		} as unknown as CollectionAccessor
+	}
+
+	for (const kind of ['ref', 'getter'] as const) {
+		it(`rebinds to the new record when a ${kind} record id changes (a reused editor)`, async () => {
+			const notes = notesWith({ 'rec-1': encodeText('First'), 'rec-2': encodeText('Second') })
+			const store = createMockStore({ notes })
+			const recordId = ref('rec-1')
+			const Probe = defineComponent({
+				setup() {
+					const binding = useRichText(
+						'notes',
+						kind === 'ref' ? recordId : () => recordId.value,
+						'body',
+					)
+					return () =>
+						h(
+							'span',
+							{ 'data-testid': 'value' },
+							binding.ready ? binding.text.toString() : 'loading',
+						)
+				},
+			})
+			const wrapper = mount(
+				defineComponent({ setup: () => () => h(KoraProvider, { store }, () => h(Probe)) }),
+			)
+			await vi.waitFor(() => expect(wrapper.get('[data-testid="value"]').text()).toBe('First'))
+			recordId.value = 'rec-2'
+			await vi.waitFor(() => expect(wrapper.get('[data-testid="value"]').text()).toBe('Second'))
+		})
+	}
 })

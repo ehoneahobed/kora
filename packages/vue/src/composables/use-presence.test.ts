@@ -2,7 +2,7 @@ import type { AwarenessState } from '@korajs/sync'
 import type { SyncEngine } from '@korajs/sync'
 import { mount } from '@vue/test-utils'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { defineComponent, h, shallowRef } from 'vue'
+import { defineComponent, h, nextTick, ref, shallowRef } from 'vue'
 import { koraContextKey } from '../context'
 import type { KoraContextValue } from '../types'
 import { useCollaborators, usePresence } from './use-presence'
@@ -126,4 +126,34 @@ describe('useCollaborators', () => {
 		)
 		expect(wrapper.get('[data-testid="len"]').text()).toBe('0')
 	})
+})
+
+describe('usePresence follows a user that changes', () => {
+	for (const kind of ['ref', 'getter'] as const) {
+		it(`updates local awareness when a ${kind} user changes`, async () => {
+			const setLocalState = vi.fn()
+			const syncEngine = { getAwarenessManager: () => ({ setLocalState }) } as unknown as SyncEngine
+			const user = ref<{ name: string; color: string } | null>({ name: 'Ada', color: '#f00' })
+			mount(
+				defineComponent({
+					setup() {
+						usePresence(kind === 'ref' ? user : () => user.value)
+						return () => h('div')
+					},
+				}),
+				{ global: { provide: { [koraContextKey]: makeContext(syncEngine) } } },
+			)
+			expect(setLocalState).toHaveBeenLastCalledWith({
+				user: { name: 'Ada', color: '#f00', avatar: undefined },
+			})
+			user.value = { name: 'Grace', color: '#00f' }
+			await nextTick()
+			expect(setLocalState).toHaveBeenLastCalledWith({
+				user: { name: 'Grace', color: '#00f', avatar: undefined },
+			})
+			user.value = null
+			await nextTick()
+			expect(setLocalState).toHaveBeenLastCalledWith(null)
+		})
+	}
 })
