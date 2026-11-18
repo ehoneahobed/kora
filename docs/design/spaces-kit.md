@@ -218,8 +218,12 @@ or allowed domains).
   the owner), `useInvitations(space)` (pending and expired, managers only), and
   `useMyRole(space, userId)` (UI only; the server decides). Hooks re-render at the earliest
   expiry, and treat malformed expiries and unconfigured roles as granting nothing.
-- A manager inviting into a space created offline that has not reached the server yet gets
-  `SPACE_NOT_SYNCED`; a deleted space gives `SPACE_NOT_FOUND`.
+- Authority is checked before anything about the space or the target: someone who cannot
+  manage members (invite, change roles, remove, transfer) gets `FORBIDDEN` whatever the
+  space's state, so a refusal never reveals whether a space exists or who is in it. The creator
+  of a space created offline that has not reached the server yet cannot be told apart from a
+  stranger, so they get the same refusal; its message says to retry once it has synced. A
+  manager of a deleted space gets `SPACE_NOT_FOUND`.
 
 ## Key choices
 

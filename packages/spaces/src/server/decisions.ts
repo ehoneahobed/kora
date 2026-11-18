@@ -312,14 +312,18 @@ export async function decideCreateInvitation(
 	{ tx, sharing, now }: DecisionContext,
 	input: CreateInvitationInput & { invitationId: string },
 ): Promise<Decided<CreatedInvitation>> {
-	const live = await liveSpace(tx, input.space)
-	if ('refuse' in live) return live
+	// Authority first: someone who cannot invite learns nothing about the space.
 	const key = spaceKeyOf(input.space)
 	const actor = await authorityOf(tx, sharing, input.actorId, key)
 	const actorRank = actor ? sharing.rank(actor.role) : -1
 	if (!actor || actorRank < sharing.rank(sharing.manageRole)) {
-		return refuse('FORBIDDEN', 'Only the space’s managers can invite people.')
+		return refuse(
+			'FORBIDDEN',
+			'Only the space’s managers can invite people. If you created this space offline, try again once it has synced.',
+		)
 	}
+	const live = await liveSpace(tx, input.space)
+	if ('refuse' in live) return live
 	if (sharing.rank(input.role) >= actorRank) {
 		return refuse('ROLE_TOO_HIGH', 'You can only invite people to a role below your own.')
 	}
@@ -690,6 +694,22 @@ function mayActOn(sharing: Sharing, actorRole: string | null, targetRole: string
 }
 
 /**
+ * The actor's authority when it is at least the manager role, else null. Checked before
+ * anything about the space or the target is read, so a refusal tells someone who cannot
+ * manage members nothing: not whether the space exists, nor whether someone is in it.
+ */
+async function managerOf(
+	tx: RouteTransaction,
+	sharing: Sharing,
+	actorId: string,
+	key: string,
+): Promise<NonNullable<Awaited<ReturnType<typeof authorityOf>>> | null> {
+	const actor = await authorityOf(tx, sharing, actorId, key)
+	if (!actor || sharing.rank(actor.role) < sharing.rank(sharing.manageRole)) return null
+	return actor
+}
+
+/**
  * The expiry of `userId`'s membership of `key`: the latest of its rows' expiries, or
  * null when any row does not expire.
  */
@@ -731,9 +751,12 @@ export async function decideChangeRole(
 	{ tx, access, sharing }: DecisionContext,
 	input: ChangeRoleInput,
 ): Promise<Decided<MemberChange>> {
+	const forbidden = 'You can only change the role of members below you.'
+	const key = spaceKeyOf(input.space)
+	const actor = await managerOf(tx, sharing, input.actorId, key)
+	if (!actor) return refuse('FORBIDDEN', forbidden)
 	const live = await liveSpace(tx, input.space)
 	if ('refuse' in live) return live
-	const key = spaceKeyOf(input.space)
 	const target = await authorityOf(tx, sharing, input.userId, key)
 	if (!target) return refuse('NOT_A_MEMBER', 'This person is not in the space.')
 	if (target.source === 'owner') {
@@ -742,11 +765,10 @@ export async function decideChangeRole(
 	if (input.from !== undefined && input.from !== target.role && input.from !== target.stored) {
 		return refuse('ROLE_CHANGED', 'This member’s role changed meanwhile. Reload and try again.')
 	}
-	const actor = await authorityOf(tx, sharing, input.actorId, key)
-	if (!mayActOn(sharing, actor?.role ?? null, target.role)) {
-		return refuse('FORBIDDEN', 'You can only change the role of members below you.')
+	if (!mayActOn(sharing, actor.role, target.role)) {
+		return refuse('FORBIDDEN', forbidden)
 	}
-	if (sharing.rank(input.role) >= sharing.rank(actor?.role ?? '')) {
+	if (sharing.rank(input.role) >= sharing.rank(actor.role)) {
 		return refuse('ROLE_TOO_HIGH', 'You can only grant a role below your own.')
 	}
 	if (input.role === target.stored) {
@@ -792,9 +814,12 @@ export async function decideRemoveMember(
 	{ tx, access, sharing }: DecisionContext,
 	input: RemoveMemberInput,
 ): Promise<Decided<MemberChange>> {
+	const forbidden = 'You can only remove members below you.'
+	const key = spaceKeyOf(input.space)
+	const actor = await managerOf(tx, sharing, input.actorId, key)
+	if (!actor) return refuse('FORBIDDEN', forbidden)
 	const live = await liveSpace(tx, input.space)
 	if ('refuse' in live) return live
-	const key = spaceKeyOf(input.space)
 	const target = await authorityOf(tx, sharing, input.userId, key)
 	if (!target) return refuse('NOT_A_MEMBER', 'This person is not in the space.')
 	if (target.source === 'owner') {
@@ -806,9 +831,8 @@ export async function decideRemoveMember(
 	if (input.from !== undefined && input.from !== target.role && input.from !== target.stored) {
 		return refuse('ROLE_CHANGED', 'This member’s role changed meanwhile. Reload and try again.')
 	}
-	const actor = await authorityOf(tx, sharing, input.actorId, key)
-	if (!mayActOn(sharing, actor?.role ?? null, target.role)) {
-		return refuse('FORBIDDEN', 'You can only remove members below you.')
+	if (!mayActOn(sharing, actor.role, target.role)) {
+		return refuse('FORBIDDEN', forbidden)
 	}
 	const revoked = await deleteInvitationsOf(tx, key, input.userId)
 	const revoke = await access.prepareRevoke(tx, { userId: input.userId, group: key })
@@ -880,18 +904,23 @@ export async function decideTransfer(
 	{ tx, access, sharing }: DecisionContext,
 	input: TransferInput,
 ): Promise<Decided<TransferredSpace>> {
+	const key = spaceKeyOf(input.space)
+	// Authority first (a server-side transfer has no actor): someone who does not own the
+	// space learns nothing about it.
+	if (input.actorId !== null) {
+		const actor = await authorityOf(tx, sharing, input.actorId, key)
+		if (actor?.source !== 'owner') {
+			return refuse('FORBIDDEN', 'Only the owner can transfer the space.')
+		}
+	}
 	const live = await liveSpace(tx, input.space)
 	if ('refuse' in live) return live
 	const record = live.record
-	const key = spaceKeyOf(input.space)
 	const ownerField = sharing.groups[input.space[0]]?.owner ?? ''
 	const ownerValue = record[ownerField]
 	const ownerId = typeof ownerValue === 'string' && ownerValue.length > 0 ? ownerValue : null
-	if (input.actorId !== null) {
-		const actor = await authorityOf(tx, sharing, input.actorId, key)
-		if (ownerId !== input.actorId || actor?.source !== 'owner') {
-			return refuse('FORBIDDEN', 'Only the owner can transfer the space.')
-		}
+	if (input.actorId !== null && ownerId !== input.actorId) {
+		return refuse('FORBIDDEN', 'Only the owner can transfer the space.')
 	}
 	if (input.toUserId === ownerId)
 		return refuse('ALREADY_OWNER', 'This person already owns the space.')
