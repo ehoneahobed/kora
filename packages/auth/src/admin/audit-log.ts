@@ -53,6 +53,9 @@ const AUDIT_ACTIONS = [
 	'org.invitation_revoke',
 	// Admin
 	'admin.user_lookup',
+	'admin.user_list',
+	'admin.session_list',
+	'admin.stats',
 	'admin.impersonate',
 	'admin.config_change',
 ] as const

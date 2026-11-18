@@ -91,6 +91,20 @@ export class AdminUnauthorizedError extends AdminApiError {
 	}
 }
 
+/**
+ * Nothing can revoke a user's tokens: the user store has no token revocation store and no
+ * `revokeAllForUser` was configured. Refused before anything is deleted, so ending sessions
+ * never looks done while JWTs and refresh tokens stay valid.
+ */
+export class AdminRevocationUnavailableError extends AdminApiError {
+	constructor() {
+		super(
+			"Cannot revoke this user's tokens: the user store has no token revocation store. Pass `revokeAllForUser` to AdminApi (for example authServer.revokeAllForUser) or use a user store that provides getTokenRevocationStore().",
+			'ADMIN_REVOCATION_UNAVAILABLE',
+		)
+	}
+}
+
 // ============================================================================
 // AdminApi
 // ============================================================================
@@ -110,7 +124,7 @@ export class AdminUnauthorizedError extends AdminApiError {
  * })
  *
  * // List users
- * const { data, total } = await admin.listUsers({ limit: 20 })
+ * const { data, total } = await admin.listUsers('admin-user-id', { limit: 20 })
  *
  * // End every session of a user (sessions, JWTs and refresh tokens)
  * await admin.revokeUserSessions('admin-user-id', 'target-user-id')
@@ -138,13 +152,19 @@ export class AdminApi {
 		}
 	}
 
-	/** Kill every JWT and refresh token of a user, not just session rows (AUTH-7b/AUTH-14). */
-	private async revokeCredentials(userId: string): Promise<void> {
-		if (this.revokeAllForUserFn) {
-			await this.revokeAllForUserFn(userId)
-			return
-		}
-		await this.userStore.getTokenRevocationStore?.()?.revokeAllForUser(userId, Date.now())
+	/**
+	 * How this API kills every JWT and refresh token of a user, not just session rows
+	 * (AUTH-7b/AUTH-14). Resolved before anything is deleted: ending a user's sessions while
+	 * their tokens stay valid would look done and not be.
+	 *
+	 * @throws {AdminRevocationUnavailableError} When neither `revokeAllForUser` nor the user
+	 *   store's token revocation store is available
+	 */
+	private credentialRevoker(): (userId: string) => Promise<void> {
+		if (this.revokeAllForUserFn) return this.revokeAllForUserFn
+		const store = this.userStore.getTokenRevocationStore?.()
+		if (store) return (userId) => store.revokeAllForUser(userId, Date.now())
+		throw new AdminRevocationUnavailableError()
 	}
 
 	/**
@@ -165,7 +185,8 @@ export class AdminApi {
 	/**
 	 * List users with optional filtering and pagination.
 	 */
-	async listUsers(query: UserListQuery = {}): Promise<PaginatedResult<AuthUser>> {
+	async listUsers(adminId: string, query: UserListQuery = {}): Promise<PaginatedResult<AuthUser>> {
+		await this.authorize(adminId)
 		const limit = query.limit ?? 50
 		const offset = query.offset ?? 0
 
@@ -184,6 +205,8 @@ export class AdminApi {
 
 		const total = filtered.length
 		const data = filtered.slice(offset, offset + limit).map(toAuthUser)
+
+		await this.audit('admin.user_list', adminId, null, 'user', { query, returned: data.length })
 
 		return { data, total, limit, offset }
 	}
@@ -237,10 +260,11 @@ export class AdminApi {
 		}
 
 		// Revoke all sessions and credentials first
+		const revoke = this.credentialRevoker()
 		if (this.sessionStore) {
 			await this.sessionStore.deleteAllForUser(userId)
 		}
-		await this.revokeCredentials(userId)
+		await revoke(userId)
 
 		await this.userStore.delete(userId)
 
@@ -250,9 +274,11 @@ export class AdminApi {
 	/**
 	 * Get all active sessions for a user.
 	 */
-	async getUserSessions(userId: string): Promise<Session[]> {
-		if (!this.sessionStore) return []
-		return this.sessionStore.listByUserId(userId)
+	async getUserSessions(adminId: string, userId: string): Promise<Session[]> {
+		await this.authorize(adminId)
+		const sessions = this.sessionStore ? await this.sessionStore.listByUserId(userId) : []
+		await this.audit('admin.session_list', adminId, userId, 'user')
+		return sessions
 	}
 
 	/**
@@ -260,7 +286,7 @@ export class AdminApi {
 	 */
 	async revokeUserSessions(adminId: string, userId: string): Promise<number> {
 		await this.authorize(adminId)
-		await this.revokeCredentials(userId)
+		await this.credentialRevoker()(userId)
 		if (!this.sessionStore) return 0
 
 		const count = await this.sessionStore.deleteAllForUser(userId)
@@ -285,13 +311,15 @@ export class AdminApi {
 	/**
 	 * Get system statistics.
 	 */
-	async getStats(): Promise<{
+	async getStats(adminId: string): Promise<{
 		totalUsers: number
 		verifiedUsers: number
 		unverifiedUsers: number
 	}> {
+		await this.authorize(adminId)
 		const allUsers = await this.userStore.listAll()
 		const verified = allUsers.filter((u) => u.emailVerified).length
+		await this.audit('admin.stats', adminId, null, null)
 
 		return {
 			totalUsers: allUsers.length,
@@ -305,8 +333,8 @@ export class AdminApi {
 	private async audit(
 		action: AuditAction,
 		actorId: string,
-		targetId: string,
-		targetType: string,
+		targetId: string | null,
+		targetType: string | null,
 		metadata?: Record<string, unknown>,
 	): Promise<void> {
 		if (!this.auditLogger) return
@@ -314,8 +342,8 @@ export class AdminApi {
 			action,
 			actorId,
 			actorType: 'admin',
-			targetId,
-			targetType,
+			targetId: targetId ?? undefined,
+			targetType: targetType ?? undefined,
 			metadata,
 		})
 	}
