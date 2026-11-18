@@ -17,6 +17,7 @@ import {
 	isDatabaseValue,
 	isFrameworkValue,
 	isPlatformValue,
+	isSupportedWebFramework,
 } from './options'
 
 export interface CreateFlags {
@@ -145,9 +146,10 @@ export async function resolveCreatePreferencesFlow(params: {
 		}
 	} else {
 		if (flags.framework !== undefined) {
-			if (!isFrameworkValue(flags.framework)) {
+			// Only frameworks that ship templates (Solid has none yet).
+			if (!isFrameworkValue(flags.framework) || !isSupportedWebFramework(flags.framework)) {
 				throw new Error(
-					`Invalid --framework value "${flags.framework}". Expected one of: react, vue, svelte, solid.`,
+					`Invalid --framework value "${flags.framework}". Expected one of: react, vue, svelte.`,
 				)
 			}
 			effective.framework = flags.framework

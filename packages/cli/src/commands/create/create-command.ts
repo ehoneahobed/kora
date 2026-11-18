@@ -132,6 +132,18 @@ export const createCommand = defineCommand({
 				return
 			}
 
+			// A typo in --template or --pm must not quietly scaffold the default (with --yes).
+			if (typeof args.template === 'string' && !isValidTemplate(args.template)) {
+				throw new Error(
+					`Invalid --template value "${args.template}". Expected one of: ${TEMPLATES.join(', ')}.`,
+				)
+			}
+			if (typeof args.pm === 'string' && !isValidPackageManager(args.pm)) {
+				throw new Error(
+					`Invalid --pm value "${args.pm}". Expected one of: ${PACKAGE_MANAGERS.join(', ')}.`,
+				)
+			}
+
 			const preferenceFlags: CreateFlags = {
 				platform: typeof args.platform === 'string' ? args.platform : undefined,
 				framework: typeof args.framework === 'string' ? args.framework : undefined,
