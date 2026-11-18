@@ -78,6 +78,8 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `maxSyncQueries` | 1000 | Most query views one handshake may carry (`SYNC_QUERIES_LIMIT` above it; a malformed list is `INVALID_SYNC_QUERIES`). The client collapses its views to whole collections past 500, so a legitimate app never reaches it. |
 | `maxQueuedMessages` | 10000 | Most messages a session holds received but not yet handled (it handles them one at a time). Until a handshake is accepted only 16 may wait. Above it the session closes with the retriable `INBOUND_QUEUE_FULL`. |
 | `maxQueuedBytes` | 64 MiB | The same bound on the bytes of those frames. |
+| `maxYjsUpdatesPerMinute` | 1200 | Live rich-text updates (`yjs-doc-update`) one session may relay per minute; each costs a store read and a fan-out. Past it they are dropped with the retriable `YJS_UPDATE_THROTTLED` (rich text also syncs as operations). |
+| `maxYjsUpdateBytes` | 1 MiB | Largest live rich-text update relayed (`YJS_UPDATE_TOO_LARGE` above). |
 | `maxOperationBytes` | 256 KiB | Largest operation (`OPERATION_TOO_LARGE`, per operation). |
 | `maxOpsPerMinute` | 600 | Per device node (`RATE_LIMIT`, retriable). |
 | `maxOpsPerMinutePerUser` | 4 x `maxOpsPerMinute` | Per authenticated user across their devices; `0` disables. |

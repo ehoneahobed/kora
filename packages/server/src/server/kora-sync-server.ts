@@ -267,6 +267,8 @@ export class KoraSyncServer {
 	private readonly maxSyncQueries: number | undefined
 	private readonly maxQueuedMessages: number | undefined
 	private readonly maxQueuedBytes: number | undefined
+	private readonly maxYjsUpdatesPerMinute: number | undefined
+	private readonly maxYjsUpdateBytes: number | undefined
 	private readonly maxMessageBytes: number
 	private readonly heartbeatIntervalMs: number
 	private readonly appHeartbeatIntervalMs: number
@@ -555,6 +557,16 @@ export class KoraSyncServer {
 		}
 		this.maxQueuedMessages = config.maxQueuedMessages
 		this.maxQueuedBytes = config.maxQueuedBytes
+		for (const [name, value] of [
+			['maxYjsUpdatesPerMinute', config.maxYjsUpdatesPerMinute],
+			['maxYjsUpdateBytes', config.maxYjsUpdateBytes],
+		] as const) {
+			if (value !== undefined && (!Number.isInteger(value) || value < 1)) {
+				throw new SyncError(`${name} must be a positive integer`, { [name]: value })
+			}
+		}
+		this.maxYjsUpdatesPerMinute = config.maxYjsUpdatesPerMinute
+		this.maxYjsUpdateBytes = config.maxYjsUpdateBytes
 		this.validateOperation = config.validateOperation
 		// One trusted data-plane context, shared by custom HTTP routes (via
 		// production-server) and by the operation validator. It holds no per-request
@@ -1885,6 +1897,12 @@ export class KoraSyncServer {
 				? { maxQueuedMessages: this.maxQueuedMessages }
 				: {}),
 			...(this.maxQueuedBytes !== undefined ? { maxQueuedBytes: this.maxQueuedBytes } : {}),
+			...(this.maxYjsUpdatesPerMinute !== undefined
+				? { maxYjsUpdatesPerMinute: this.maxYjsUpdatesPerMinute }
+				: {}),
+			...(this.maxYjsUpdateBytes !== undefined
+				? { maxYjsUpdateBytes: this.maxYjsUpdateBytes }
+				: {}),
 			...(this.validateOperation
 				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
 				: {}),

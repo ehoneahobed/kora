@@ -330,6 +330,15 @@ export interface KoraSyncServerConfig {
 	/** Most bytes of received frames a session holds not yet handled. Defaults to 64 MiB. */
 	maxQueuedBytes?: number
 	/**
+	 * Live rich-text updates (`yjs-doc-update`) a session may relay per minute. Each costs a
+	 * store read and fans out to every peer in scope; past the budget an update is dropped with
+	 * the retriable `YJS_UPDATE_THROTTLED` (rich text also syncs as operations, so nothing
+	 * durable is lost). Defaults to 1200.
+	 */
+	maxYjsUpdatesPerMinute?: number
+	/** Largest live rich-text update relayed, in bytes (`YJS_UPDATE_TOO_LARGE` above). Defaults to 1 MiB. */
+	maxYjsUpdateBytes?: number
+	/**
 	 * Accept anonymous devices whose node claim predates confirmed claims (RT-21):
 	 * nodes whose operation history predates node claims (a database written by a
 	 * beta.12 or older server, which recorded no claims; RT-91), nodes held by the
