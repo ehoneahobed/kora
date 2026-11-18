@@ -130,11 +130,16 @@ Same inputs; the store holds `{ data, error, ready, source, complete }`. `error`
 ## KoraQuery
 
 Component for queries whose **descriptor** changes at runtime (reactive filters). Props: `query`,
-`enabled` (default `true`) and a `children` snippet that receives the rows.
+`enabled` (default `true`), `onError` and a `children` snippet that receives the rows and the full
+state (`{ data, error, ready, source, complete }`, as `createQueryStateStore`). When the query
+changes, the previous rows stay until the new query answers, and an equal query (a new builder
+with the same descriptor) keeps its subscription. A failed query reaches `onError` and the
+snippet's `state.error`; without `onError` it is logged.
 
 ```svelte
 <KoraQuery query={app.todos.where({ completed: showDone })}>
-  {#snippet children(data)}
+  {#snippet children(data, state)}
+    {#if state.error}<p role="alert">{state.error.message}</p>{/if}
     {#each data as todo}
       <p>{todo.title}</p>
     {/each}

@@ -46,23 +46,12 @@ function fakeQuery(key: string, rows: CollectionRecord[], answer = true) {
 }
 const rec = (id: string): CollectionRecord => ({ id, createdAt: 1, updatedAt: 1 })
 
-/** Renders the probe and records every frame the snippet shows (rows, error message). */
+/** Renders the probe; `shown()` reads what the snippet renders now. */
 function probe(query: QueryBuilder, onError?: (error: Error) => void) {
 	const result = render(KoraQueryProbe, { props: { query, onError } })
-	const frames: Array<{ rows: string; error: string }> = []
-	const read = () => ({
-		rows: result.container.querySelector('[data-testid="rows"]')?.textContent ?? '',
-		error: result.container.querySelector('[data-testid="error"]')?.textContent ?? '',
-	})
-	const record = () => {
-		const frame = read()
-		const last = frames.at(-1)
-		if (!last || last.rows !== frame.rows || last.error !== frame.error) frames.push(frame)
-	}
-	record()
-	const observer = new MutationObserver(record)
-	observer.observe(result.container, { subtree: true, childList: true, characterData: true })
-	return { frames, ...result }
+	const text = (id: string) =>
+		result.container.querySelector(`[data-testid="${id}"]`)?.textContent ?? ''
+	return { shown: () => ({ rows: text('rows'), error: text('error') }), ...result }
 }
 
 describe('KoraQuery', () => {
@@ -70,10 +59,12 @@ describe('KoraQuery', () => {
 		context.cache = new QueryStoreCache()
 		const fake = fakeQuery('failing', [rec('a')])
 		const onError = vi.fn()
-		const { frames } = probe(fake.query, onError)
+		const { shown } = probe(fake.query, onError)
+		await vi.waitFor(() => expect(shown().rows).toBe('a'))
 		const failure = new Error('query failed')
 		fake.fail(failure)
-		await vi.waitFor(() => expect(frames.at(-1)?.error).toBe('query failed'))
+		// The last rows stay readable next to the error.
+		await vi.waitFor(() => expect(shown()).toEqual({ rows: 'a', error: 'query failed' }))
 		expect(onError).toHaveBeenCalledWith(failure)
 	})
 
@@ -90,8 +81,9 @@ describe('KoraQuery', () => {
 		context.cache = new QueryStoreCache()
 		const open = fakeQuery('open', [rec('o')])
 		const done = fakeQuery('done', [rec('d')], false)
-		const { container, rerender } = probe(open.query)
-		const shown = () => container.querySelector('[data-testid="rows"]')?.textContent
+		const probed = probe(open.query)
+		const { rerender } = probed
+		const shown = () => probed.shown().rows
 		await vi.waitFor(() => expect(shown()).toBe('o'))
 		// The filter changes; the new query has not answered yet.
 		await rerender({ query: done.query })
@@ -107,11 +99,11 @@ describe('KoraQuery', () => {
 		const created = vi.spyOn(cache, 'getOrCreate')
 		const first = fakeQuery('same', [rec('s')])
 		const again = fakeQuery('same', [rec('s')])
-		const { frames, rerender } = probe(first.query)
-		await tick()
+		const { shown, rerender } = probe(first.query)
+		await vi.waitFor(() => expect(shown().rows).toBe('s'))
 		await rerender({ query: again.query })
 		await tick()
 		expect(created).toHaveBeenCalledTimes(1)
-		expect(frames.at(-1)?.rows).toBe('s')
+		expect(shown().rows).toBe('s')
 	})
 })
