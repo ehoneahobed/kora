@@ -1,7 +1,10 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+
+// Each test parses the whole sync engine into a syntax tree: seconds on a busy CI runner.
+vi.setConfig({ testTimeout: 30_000 })
 import { scanDeliveryPosition, tally } from './delivery-progress-scan'
 
 /**
