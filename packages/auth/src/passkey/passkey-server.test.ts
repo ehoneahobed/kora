@@ -181,8 +181,20 @@ describe('generateAuthenticationOptions', () => {
 		})
 
 		expect(options.rpId).toBe('example.com')
-		expect(options.userVerification).toBe('preferred')
+		// Verification requires the UV flag by default, so the options must ask for it.
+		expect(options.userVerification).toBe('required')
 		expect(options.timeout).toBe(60000)
+	})
+
+	test('asks for user verification only when verification will not require it', () => {
+		expect(
+			generateAuthenticationOptions({ rpId: 'example.com', requireUserVerification: true })
+				.userVerification,
+		).toBe('required')
+		expect(
+			generateAuthenticationOptions({ rpId: 'example.com', requireUserVerification: false })
+				.userVerification,
+		).toBe('preferred')
 	})
 
 	test('generates a challenge that is base64url-encoded', () => {
