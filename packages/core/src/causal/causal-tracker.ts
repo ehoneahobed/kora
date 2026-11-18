@@ -39,6 +39,23 @@ export class CausalTracker {
 	}
 
 	/**
+	 * Follow operations that were rewritten under new ids (a clock rebase): every head that
+	 * names an old id names its new one, so the next write depends on an operation that
+	 * still exists.
+	 *
+	 * @param idMapping - Old operation id to new operation id
+	 */
+	remapIds(idMapping: Readonly<Record<string, string>>): void {
+		for (const [collection, id] of this.lastOpIdByCollection) {
+			const next = idMapping[id]
+			if (next !== undefined) this.lastOpIdByCollection.set(collection, next)
+		}
+		if (this.lastTransactionOpId !== null) {
+			this.lastTransactionOpId = idMapping[this.lastTransactionOpId] ?? this.lastTransactionOpId
+		}
+	}
+
+	/**
 	 * Record an operation after it has been created and assigned an id.
 	 */
 	afterOperation(collection: string, operationId: string, inTransaction: boolean): void {

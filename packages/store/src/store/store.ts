@@ -4733,21 +4733,28 @@ export class Store implements OperationLog {
 		correctedNowMs: number,
 	): Promise<ClockRebaseResult> {
 		this.ensureOpen()
-		// Re-stamped operations order differently: their records are re-folded in the
-		// rewrite's transaction, so a crash never leaves the old stamps in a fold state.
-		const touched = new Map<string, Set<string>>()
-		const result = await rebaseUnsyncedOperationsInLog(
-			this.adapter,
-			this.schema,
-			unsyncedOpIds,
-			correctedNowMs,
-			{ inTransaction: this.refoldInRewrite(touched) },
-		)
-		if (result.newMaxTimestamp && this.clock) {
-			this.clock.advanceTo(result.newMaxTimestamp)
-		}
-		this.invalidateRefolded(touched)
-		return result
+		// Under the write gate, so a tab whose build was superseded cannot rewrite the log. The
+		// read phase and the rewrite share one transaction (rebaseUnsyncedOperationsInLog), so no
+		// local write lands between them.
+		return this.writeGate.run({ operation: 'rebase' }, async () => {
+			// Re-stamped operations order differently: their records are re-folded in the
+			// rewrite's transaction, so a crash never leaves the old stamps in a fold state.
+			const touched = new Map<string, Set<string>>()
+			const result = await rebaseUnsyncedOperationsInLog(
+				this.adapter,
+				this.schema,
+				unsyncedOpIds,
+				correctedNowMs,
+				{ inTransaction: this.refoldInRewrite(touched) },
+			)
+			if (result.newMaxTimestamp && this.clock) {
+				this.clock.advanceTo(result.newMaxTimestamp)
+			}
+			// The rewritten operations have new ids: the next local write must depend on those.
+			this.causalTracker?.remapIds(result.idMapping)
+			this.invalidateRefolded(touched)
+			return result
+		})
 	}
 
 	/**
