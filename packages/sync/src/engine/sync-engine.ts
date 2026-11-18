@@ -737,6 +737,21 @@ export class SyncEngine {
 
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
+	/** Bumped whenever an input of {@link getActiveQuerySubsets} changes (its memo key). */
+	private querySubsetsVersion = 0
+	private activeSubsetsMemo: { version: number; value: SyncQuerySubset[] } | null = null
+	private signatureMemo: {
+		version: number
+		scope: SyncScopeMap | undefined
+		value: string
+	} | null = null
+	/**
+	 * The view before a burst of live-query (un)registrations, switched from once on the next
+	 * timer turn (or at the next view read) instead of once per call: a list mounting a query
+	 * per row registers thousands across one render's microtasks.
+	 */
+	private pendingViewChange: { signature: string; effective: SyncQuerySubset[] } | null = null
+	private pendingViewTimer: ReturnType<typeof setTimeout> | null = null
 	private staticQuerySubsets: SyncQuerySubset[] = []
 	/** Subsets of `app.offline.keep()` pins (offline-readiness design 4.3). */
 	private pinQuerySubsets: SyncQuerySubset[] = []
@@ -1238,6 +1253,8 @@ export class SyncEngine {
 	}
 
 	private async stopInternal(): Promise<void> {
+		// A pending view switch (a burst of live-query changes) is settled, not dropped.
+		this.flushViewChange()
 		// Every timer goes first, before any early return (SYNC-10): an engine that is
 		// already disconnected (the server closed the session) still owns the awareness
 		// cleanup interval and a pending query-subset reconnect.
@@ -2044,19 +2061,70 @@ export class SyncEngine {
 	 * its own last position.
 	 */
 	private deliverySignature(): string {
+		// A burst of registrations switches the view once; anything reading the view first
+		// sees it switched.
+		this.flushViewChange()
 		return this.deliverySignatureFor(this.activeScope)
 	}
 
 	/** The view signature {@link deliverySignature} gives under `scope` and today's subsets. */
 	private deliverySignatureFor(scope: SyncScopeMap | undefined): string {
+		const memo = this.signatureMemo
+		if (memo && memo.version === this.querySubsetsVersion && memo.scope === scope) return memo.value
 		const subsets = this.getActiveQuerySubsets()
+		let value: string
 		if (!scope && subsets.length === 0) {
-			return '' // the default, unfiltered view (maps to the legacy watermark key)
+			value = '' // the default, unfiltered view (maps to the legacy watermark key)
+		} else {
+			const normalizedSubsets = subsets
+				.map((s) => `${s.collection}:${stableStringify(s.where)}`)
+				.sort()
+			value = stableStringify({ scope: scope ?? null, subsets: normalizedSubsets })
 		}
-		const normalizedSubsets = subsets
-			.map((s) => `${s.collection}:${stableStringify(s.where)}`)
-			.sort()
-		return stableStringify({ scope: scope ?? null, subsets: normalizedSubsets })
+		this.signatureMemo = { version: this.querySubsetsVersion, scope, value }
+		return value
+	}
+
+	/**
+	 * Change the live query subsets: the view before the first change of a burst is kept, and
+	 * the delivery view switches from it once (see {@link flushViewChange}).
+	 */
+	private changeQuerySubsets(change: () => void): void {
+		if (this.watermarksPending() && !this.pendingViewChange) {
+			// The start is still reading the stored watermarks and computes the view itself: no
+			// switch now or later (it would save 0 over a stored watermark), only the reconnect.
+			const before = this.deliverySignatureFor(this.activeScope)
+			change()
+			this.querySubsetsVersion++
+			if (this.deliverySignatureFor(this.activeScope) !== before)
+				this.scheduleQuerySubsetReconnect()
+			return
+		}
+		if (!this.pendingViewChange) {
+			this.pendingViewChange = {
+				signature: this.deliverySignatureFor(this.activeScope),
+				effective: this.getActiveQuerySubsets(),
+			}
+			this.pendingViewTimer = setTimeout(() => this.flushViewChange(), 0)
+		}
+		change()
+		this.querySubsetsVersion++
+		// A staged first sync is dropped by any view change at once (its position is no basis
+		// for the new view); it then ends, so the rest of a burst is still switched once.
+		if (this.staging !== null) this.flushViewChange()
+	}
+
+	/** Switch the delivery view once for the registrations since the last switch. */
+	private flushViewChange(): void {
+		const pending = this.pendingViewChange
+		if (!pending) return
+		this.pendingViewChange = null
+		if (this.pendingViewTimer) {
+			clearTimeout(this.pendingViewTimer)
+			this.pendingViewTimer = null
+		}
+		this.switchDeliveryViewWithInheritance(pending.signature, pending.effective)
+		if (this.deliverySignature() !== pending.signature) this.scheduleQuerySubsetReconnect()
 	}
 
 	/**
@@ -2225,21 +2293,12 @@ export class SyncEngine {
 	registerQuerySubset(subset: SyncQuerySubset): () => void {
 		if ((this.config.querySubsets?.mode ?? 'reactive') !== 'reactive') return () => {}
 		const id = `query-${nextQuerySubsetId++}`
-		const previousSignature = this.deliverySignature()
-		const previousEffective = this.getActiveQuerySubsets()
-		this.querySubsets.set(id, subset)
-		// Registering or unregistering a subset changes the sync view. Switch the watermark
-		// to the new view (resuming it if seen before, or resyncing it once if new); returning
-		// to a previously-synced view resumes instead of re-syncing. The debounce coalesces a
-		// burst of subscription changes into a single reconnect.
-		this.switchDeliveryViewWithInheritance(previousSignature, previousEffective)
-		if (this.deliverySignature() !== previousSignature) this.scheduleQuerySubsetReconnect()
+		// Registering or unregistering a subset changes the sync view. The watermark switches
+		// to the new view (resuming it if seen before, or resyncing it once if new) once per
+		// burst of changes; the debounce coalesces them into a single reconnect.
+		this.changeQuerySubsets(() => this.querySubsets.set(id, subset))
 		return () => {
-			const sigBeforeRemove = this.deliverySignature()
-			const effectiveBeforeRemove = this.getActiveQuerySubsets()
-			this.querySubsets.delete(id)
-			this.switchDeliveryViewWithInheritance(sigBeforeRemove, effectiveBeforeRemove)
-			if (this.deliverySignature() !== sigBeforeRemove) this.scheduleQuerySubsetReconnect()
+			this.changeQuerySubsets(() => this.querySubsets.delete(id))
 		}
 	}
 
@@ -2257,16 +2316,14 @@ export class SyncEngine {
 		if ((this.config.querySubsets?.mode ?? 'reactive') !== 'reactive') return () => {}
 		const id = `query-${nextQuerySubsetId++}`
 		this.querySubsets.set(id, subset)
+		this.querySubsetsVersion++
 		return () => {
 			if (this.deliveryViewsLoaded || this.state !== 'disconnected') {
-				const before = this.deliverySignature()
-				const effective = this.getActiveQuerySubsets()
-				this.querySubsets.delete(id)
-				this.switchDeliveryViewWithInheritance(before, effective)
-				if (this.deliverySignature() !== before) this.scheduleQuerySubsetReconnect()
+				this.changeQuerySubsets(() => this.querySubsets.delete(id))
 				return
 			}
 			this.querySubsets.delete(id)
+			this.querySubsetsVersion++
 		}
 	}
 
@@ -2298,6 +2355,7 @@ export class SyncEngine {
 		const previousSignature = this.deliverySignature()
 		const previousEffective = this.getActiveQuerySubsets()
 		this.staticQuerySubsets = dedupeQuerySubsets(subsets)
+		this.querySubsetsVersion++
 		this.switchDeliveryViewWithInheritance(previousSignature, previousEffective)
 		if (this.deliverySignature() !== previousSignature) this.scheduleQuerySubsetReconnect()
 	}
@@ -2315,6 +2373,7 @@ export class SyncEngine {
 		const previousSignature = this.deliverySignature()
 		const previousEffective = this.getActiveQuerySubsets()
 		this.pinQuerySubsets = dedupeQuerySubsets(subsets)
+		this.querySubsetsVersion++
 		this.switchDeliveryViewWithInheritance(previousSignature, previousEffective)
 		if (this.deliverySignature() !== previousSignature) this.scheduleQuerySubsetReconnect()
 		this.notifyStatusChange()
@@ -2325,6 +2384,14 @@ export class SyncEngine {
 	 * pins of collections those subscriptions restrict.
 	 */
 	getActiveQuerySubsets(): SyncQuerySubset[] {
+		const memo = this.activeSubsetsMemo
+		if (memo && memo.version === this.querySubsetsVersion) return [...memo.value]
+		const value = this.computeActiveQuerySubsets()
+		this.activeSubsetsMemo = { version: this.querySubsetsVersion, value }
+		return [...value]
+	}
+
+	private computeActiveQuerySubsets(): SyncQuerySubset[] {
 		const mode = this.config.querySubsets?.mode ?? 'reactive'
 		if (mode === 'disabled') return []
 		const base =
@@ -2477,6 +2544,8 @@ export class SyncEngine {
 	}
 
 	private async handleMessageAsync(message: SyncMessage, arrivalGeneration: number): Promise<void> {
+		// A message never sees a view a burst of live-query changes has not switched to yet.
+		this.flushViewChange()
 		switch (message.type) {
 			case 'handshake-response':
 				await this.handleHandshakeResponse(message)
