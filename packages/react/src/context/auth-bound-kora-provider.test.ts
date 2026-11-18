@@ -216,3 +216,110 @@ describe('AuthBoundKoraProvider', () => {
 		expect(lifecycle).toEqual(['create:u1'])
 	})
 })
+
+describe('AuthBoundKoraProvider never leaves a rejection unhandled', () => {
+	const unhandled: unknown[] = []
+	const record = (reason: unknown) => unhandled.push(reason)
+	const settle = () => new Promise((resolve) => setTimeout(resolve, 20))
+
+	test('a resolveSyncState that rejects after a failed open is logged, not unhandled', async () => {
+		unhandled.length = 0
+		process.on('unhandledRejection', record)
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+		try {
+			let calls = 0
+			const binding: AuthSyncBinding = {
+				auth: async () => ({ token: 't' }),
+				resolveSyncState: async () => {
+					calls += 1
+					if (calls === 1) return { state: 'authenticated', userId: 'a', token: 't' }
+					throw new Error('identity service down')
+				},
+				subscribe: () => () => {},
+			}
+			const createApp = vi.fn(() => ({
+				...mockApp('a', []),
+				ready: Promise.reject(new Error('open failed')),
+			}))
+			render(
+				createElement(
+					AuthBoundKoraProvider,
+					{ authClient: binding, createApp },
+					createElement('span', null, 'app'),
+				),
+			)
+			await waitFor(() => expect(calls).toBe(2))
+			await settle()
+			expect(unhandled).toEqual([])
+			expect(logged).toHaveBeenCalled()
+		} finally {
+			process.off('unhandledRejection', record)
+			logged.mockRestore()
+		}
+	})
+
+	test("the previous app's close() rejecting on unmount is logged, not unhandled", async () => {
+		unhandled.length = 0
+		process.on('unhandledRejection', record)
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+		try {
+			const auth = authController({ state: 'authenticated', userId: 'a', token: 't' })
+			const app = {
+				...mockApp('a', []),
+				close: async () => {
+					throw new Error('close failed')
+				},
+			}
+			const { unmount } = render(
+				createElement(
+					AuthBoundKoraProvider,
+					{ authClient: auth.binding, createApp: () => app },
+					createElement('span', null, 'private app'),
+				),
+			)
+			await screen.findByText('private app')
+			unmount()
+			await settle()
+			expect(unhandled).toEqual([])
+			expect(logged).toHaveBeenCalled()
+		} finally {
+			process.off('unhandledRejection', record)
+			logged.mockRestore()
+		}
+	})
+
+	test('an initialization error dropped because the user signed out meanwhile is logged', async () => {
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+		try {
+			let calls = 0
+			const binding: AuthSyncBinding = {
+				auth: async () => ({ token: 't' }),
+				resolveSyncState: async () => {
+					calls += 1
+					return calls === 1
+						? { state: 'authenticated', userId: 'a', token: 't' }
+						: { state: 'signed-out', mayConnectAnonymously: false }
+				},
+				subscribe: () => () => {},
+			}
+			const createApp = vi.fn(() => ({
+				...mockApp('a', []),
+				ready: Promise.reject(new Error('open failed while signing out')),
+			}))
+			render(
+				createElement(
+					AuthBoundKoraProvider,
+					{ authClient: binding, createApp },
+					createElement('span', null, 'app'),
+				),
+			)
+			await waitFor(() => expect(calls).toBe(2))
+			await settle()
+			expect(logged.mock.calls.map((call) => call.map(String).join(' ')).join('\n')).toContain(
+				'open failed while signing out',
+			)
+		} finally {
+			logged.mockRestore()
+		}
+	})
+})
