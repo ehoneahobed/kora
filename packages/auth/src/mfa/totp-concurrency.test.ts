@@ -67,7 +67,6 @@ async function enrolled(store: TotpStore) {
 const successes = (results: boolean[]) => results.filter(Boolean).length
 
 describe.each([
-	['a copying store', () => new CopyingStore()],
 	['a store with saveIf', () => new ConditionalStore()],
 	['InMemoryTotpStore', () => new InMemoryTotpStore()],
 ])('TOTP checks are atomic with %s', (_name, makeStore) => {
@@ -101,6 +100,13 @@ describe.each([
 		const after = await store.getByUserId('user-1')
 		expect(after?.failedAttempts).toBe(5)
 		expect(after?.lockedUntil).toBeGreaterThan(Date.now())
+	})
+})
+
+describe('a store without saveIf (review RT round 1)', () => {
+	test('two managers sharing it would race, so a manager refuses it', async () => {
+		const store = new CopyingStore()
+		expect(() => new TotpManager({ issuer: 'Test', store })).toThrow(/saveIf/)
 	})
 })
 

@@ -1749,7 +1749,7 @@ Device proof-of-possession challenges are:
 - [ ] Use a persistent user store (`createSqliteUserStore` / `createPostgresUserStore`; production refuses in-memory stores unless `allowInMemory`)
 - [ ] Use a persistent token revocation store (the SQLite and Postgres user stores include one)
 - [ ] Use a persistent session store (not `InMemorySessionStore`)
-- [ ] Use a persistent TOTP store (not `InMemoryTotpStore`)
+- [ ] Use a persistent TOTP store (not `InMemoryTotpStore`) whose `saveIf` is an atomic conditional update (`UPDATE ... WHERE user_id = ? AND revision = ?`, checking the affected row count)
 - [ ] Set `KORA_AUTH_SECRET` as an environment variable (at least 32 characters)
 - [ ] Set `trustProxy` on the production server when it runs behind a proxy
 - [ ] Configure `passwordReset` and `emailVerification` with your mailer, and wire the `AdminApi` `revokeAllForUser` (a password reset or change through `createKoraAuthServer` ends sessions on its own)

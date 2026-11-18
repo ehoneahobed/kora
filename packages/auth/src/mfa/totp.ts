@@ -79,11 +79,11 @@ export interface TotpStore {
 	 * `expectedRevision`, atomically (for SQL: `UPDATE ... WHERE user_id = ? AND revision = ?`
 	 * and check the affected row count). Returns whether it saved.
 	 *
-	 * Code checks are serialized per user inside one process. When several server processes
-	 * share the store, only this keeps one code from signing in twice, or two parallel wrong
-	 * guesses from being counted once: implement it for any shared store.
+	 * Required: it is what keeps one code from signing in twice, and two parallel wrong
+	 * guesses from being counted once, across every process that shares the store.
+	 * `TotpManager` refuses a store without it (`TOTP_STORE_NOT_ATOMIC`).
 	 */
-	saveIf?(secret: TotpSecret, expectedRevision: number): Promise<boolean>
+	saveIf(secret: TotpSecret, expectedRevision: number): Promise<boolean>
 	/** Get a TOTP secret by user ID */
 	getByUserId(userId: string): Promise<TotpSecret | null>
 	/** Delete TOTP secret for a user (disable MFA) */
@@ -237,6 +237,12 @@ export class TotpManager {
 	private readonly userQueues = new Map<string, Promise<unknown>>()
 
 	constructor(config: TotpConfig & { store: TotpStore }) {
+		if (typeof (config.store as Partial<TotpStore>).saveIf !== 'function') {
+			throw new TotpError(
+				'The TOTP store has no saveIf: without a conditional save, two requests can use one code, and parallel wrong guesses escape the lockout. Implement TotpStore.saveIf (an atomic UPDATE ... WHERE revision = ?).',
+				'TOTP_STORE_NOT_ATOMIC',
+			)
+		}
 		this.store = config.store
 		this.issuer = config.issuer
 		this.digits = config.digits ?? DEFAULT_DIGITS
@@ -472,7 +478,7 @@ export class TotpManager {
 
 	/**
 	 * Load the user's enrollment, decide, and write the decision, as one step: checks of one
-	 * user run one at a time in this process, and a store with `saveIf` makes the write
+	 * user run one at a time in this process, and the store's `saveIf` makes the write
 	 * conditional on nothing else having written since the load (another server), retrying
 	 * on a fresh load otherwise. A single-use code is consumed once, and every failure counts.
 	 */
@@ -488,11 +494,7 @@ export class TotpManager {
 				const { write, done } = await decide(structuredClone(stored))
 				if (write !== null) {
 					const next = { ...write, revision: base + 1 }
-					if (this.store.saveIf) {
-						if (!(await this.store.saveIf(next, base))) continue
-					} else {
-						await this.store.save(next)
-					}
+					if (!(await this.store.saveIf(next, base))) continue
 				}
 				return done()
 			}
