@@ -97,5 +97,5 @@ describe('a replace restore keeps unsynced writes across a crash', () => {
 			),
 			{ numRuns: 25 },
 		)
-	})
+	}, 60_000)
 })

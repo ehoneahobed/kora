@@ -51,6 +51,35 @@ describe('outbound queue order', () => {
 		expect(elapsed).toBeLessThan(1_000)
 	})
 
+	test('regression (CI seed -628581730): an operation later than the tail but not than the queue', async () => {
+		// o6 (wallTime 1064) is queued before o4 and o1 arrive; o5 (1063) is later than the tail
+		// then, but a full sort puts it before o6.
+		const t = (wallTime: number, logical: number, nodeId: string) => ({ wallTime, logical, nodeId })
+		const at = (id: string, ts: ReturnType<typeof t>, deps: string[]): Operation => ({
+			...op(id, ts.wallTime, deps, ts.nodeId, ts.logical),
+		})
+		const ops = [
+			at('o0', t(1033, 0, 'c'), []),
+			at('o1', t(1023, 1, 'c'), ['o0']),
+			at('o2', t(1070, 2, 'a'), ['o1']),
+			at('o3', t(1060, 3, 'a'), ['o2']),
+			at('o4', t(1049, 4, 'c'), ['o0']),
+			at('o5', t(1063, 5, 'c'), ['o4']),
+			at('o6', t(1064, 6, 'a'), ['o1']),
+			at('o7', t(1095, 7, 'b'), []),
+		]
+		const byId = new Map(ops.map((o) => [o.id, o]))
+		const arrival = ['o3', 'o0', 'o2', 'o6', 'o4', 'o1', 'o5', 'o7'].map(
+			(id) => byId.get(id) as Operation,
+		)
+		const queue = new OutboundQueue(new MemoryQueueStorage())
+		await queue.initialize()
+		const cut = Math.floor((arrival.length * 3) / 4)
+		for (const one of arrival.slice(0, cut)) await queue.enqueue(one)
+		await queue.enqueueMany(arrival.slice(cut))
+		expect(queued(queue).map((o) => o.id)).toEqual(topologicalSort(ops).map((o) => o.id))
+	})
+
 	test('property: any arrival order queues every operation once, in the canonical causal order', async () => {
 		// A random DAG: each operation may depend on earlier ones (by creation), from a few nodes.
 		const dagArb = fc
@@ -89,7 +118,7 @@ describe('outbound queue order', () => {
 					expect(queued(queue).map((o) => o.id)).toEqual(topologicalSort(ops).map((o) => o.id))
 				},
 			),
-			{ numRuns: 300 },
+			{ numRuns: 1000 },
 		)
 	})
 })

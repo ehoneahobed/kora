@@ -29,6 +29,11 @@ export class OutboundQueue {
 	 * holds operations (a stale entry only costs a full sort); cleared when it empties.
 	 */
 	private readonly awaited: Set<string> = new Set()
+	/**
+	 * The latest HLC timestamp of a queued operation (a higher stale value only makes `append`
+	 * fall back to a full sort). Null when nothing is queued.
+	 */
+	private latest: Operation['timestamp'] | null = null
 	private readonly inFlight: Map<string, Operation[]> = new Map()
 	/**
 	 * Ids of queued operations that were put on the wire at least once. Such an op may
@@ -87,11 +92,16 @@ export class OutboundQueue {
 	 * @returns Whether it was appended (otherwise it is queued and the caller re-sorts)
 	 */
 	private append(op: Operation): boolean {
-		const last = this.queue.at(-1)
+		// The queue's latest timestamp, not its last entry's: a causal order can put a later
+		// operation before an earlier one that waited for its dependencies.
+		const latest = this.latest
 		const fits =
 			!this.awaited.has(op.id) &&
-			(last === undefined || HybridLogicalClock.compare(last.timestamp, op.timestamp) < 0)
+			(latest === null || HybridLogicalClock.compare(latest, op.timestamp) < 0)
 		this.queue.push(op)
+		if (latest === null || HybridLogicalClock.compare(latest, op.timestamp) < 0) {
+			this.latest = op.timestamp
+		}
 		for (const dep of op.causalDeps) this.awaited.add(dep)
 		return fits
 	}
@@ -100,7 +110,13 @@ export class OutboundQueue {
 	private resort(): void {
 		if (this.queue.length > 1) this.queue = topologicalSort(this.queue)
 		this.awaited.clear()
-		for (const queued of this.queue) for (const dep of queued.causalDeps) this.awaited.add(dep)
+		this.latest = null
+		for (const queued of this.queue) {
+			for (const dep of queued.causalDeps) this.awaited.add(dep)
+			if (this.latest === null || HybridLogicalClock.compare(this.latest, queued.timestamp) < 0) {
+				this.latest = queued.timestamp
+			}
+		}
 	}
 
 	/**
@@ -144,7 +160,10 @@ export class OutboundQueue {
 			ops = this.queue.splice(0, batchSize)
 		}
 		// Nothing queued waits for anything: appending is safe again.
-		if (this.queue.length === 0) this.awaited.clear()
+		if (this.queue.length === 0) {
+			this.awaited.clear()
+			this.latest = null
+		}
 		const batchId = `batch-${this.nextBatchId++}`
 		this.inFlight.set(batchId, ops)
 
