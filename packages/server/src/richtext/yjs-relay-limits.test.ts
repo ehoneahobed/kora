@@ -83,4 +83,31 @@ describe('yjs-doc-update relays are bounded per session', () => {
 		expect(errors(writer.messages, 'YJS_UPDATE_TOO_LARGE')).toHaveLength(1)
 		await server.stop()
 	})
+
+	// The cap counts decoded bytes, inclusive: base64 padding is not payload. Sizes cover each
+	// padding case (no padding, one '=', two '=').
+	test.each([1023, 1024, 1022])(
+		'an update of exactly the cap (%i bytes) is relayed; one byte more is refused',
+		async (cap) => {
+			const server = new KoraSyncServer({
+				store: new MemoryServerStore('s'),
+				maxYjsUpdateBytes: cap,
+			})
+			const writer = connect(server, 'writer')
+			const peer = connect(server, 'peer')
+			await vi.waitFor(() => {
+				expect(writer.messages.some((m) => m.type === 'handshake-response')).toBe(true)
+				expect(peer.messages.some((m) => m.type === 'handshake-response')).toBe(true)
+			})
+			writer.pair.client.send(update(new Uint8Array(cap)))
+			writer.pair.client.send(update(new Uint8Array(cap + 1)))
+			writer.pair.client.send(update(new Uint8Array([7])))
+			await vi.waitFor(() => expect(relayed(peer.messages)).toBe(2))
+			expect(errors(writer.messages, 'YJS_UPDATE_TOO_LARGE')).toHaveLength(1)
+			expect(errors(writer.messages, 'YJS_UPDATE_TOO_LARGE')[0]).toMatchObject({
+				message: expect.stringContaining(`${String(cap + 1)} bytes`),
+			})
+			await server.stop()
+		},
+	)
 })
