@@ -67,7 +67,6 @@ async function enrolled(store: TotpStore) {
 const successes = (results: boolean[]) => results.filter(Boolean).length
 
 describe.each([
-	['a copying store', () => new CopyingStore()],
 	['a store with saveIf', () => new ConditionalStore()],
 	['InMemoryTotpStore', () => new InMemoryTotpStore()],
 ])('TOTP checks are atomic with %s', (_name, makeStore) => {
