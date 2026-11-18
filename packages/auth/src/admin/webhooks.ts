@@ -202,6 +202,8 @@ export class WebhookManager {
 	private readonly fetchFn: typeof globalThis.fetch
 	private readonly allowPrivateTargets: boolean
 	private readonly resolveHost: ((host: string) => Promise<string[]>) | null
+	/** Sends to the checked address; null with a custom `fetch` and no transport (not pinned). */
+	private readonly transport: WebhookTransport | null
 
 	/**
 	 * @param config.store - Endpoint and delivery storage
@@ -219,11 +221,13 @@ export class WebhookManager {
 		fetch?: typeof globalThis.fetch
 		allowPrivateTargets?: boolean
 		resolveHost?: (host: string) => Promise<string[]>
+		transport?: WebhookTransport
 	}) {
 		this.store = config.store
 		this.fetchFn = config.fetch ?? globalThis.fetch.bind(globalThis)
 		this.allowPrivateTargets = config.allowPrivateTargets === true
 		this.resolveHost = config.resolveHost ?? (config.fetch ? null : resolveWithNodeDns)
+		this.transport = config.transport ?? (config.fetch ? null : postToAddress)
 	}
 
 	/**
@@ -349,33 +353,42 @@ export class WebhookManager {
 			delivery.lastAttemptAt = Date.now()
 
 			try {
-				await this.assertDeliverable(endpoint.url)
+				const address = await this.vettedAddress(endpoint.url)
 				// Sign the timestamp together with the body, so a captured delivery
 				// cannot be replayed later (AUTH-14).
 				const timestamp = Math.floor(Date.now() / 1000)
 				const signature = await signPayload(`${timestamp}.${payloadJson}`, endpoint.secret)
-				const response = await this.fetchFn(endpoint.url, {
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-						'X-Webhook-Signature': `t=${timestamp},v1=${signature}`,
-						'X-Webhook-Timestamp': String(timestamp),
-						'X-Webhook-Event': event,
-						'X-Webhook-Delivery': delivery.id,
-					},
-					body: payloadJson,
-					redirect: 'manual',
-				})
+				const headers = {
+					'Content-Type': 'application/json',
+					'X-Webhook-Signature': `t=${timestamp},v1=${signature}`,
+					'X-Webhook-Timestamp': String(timestamp),
+					'X-Webhook-Event': event,
+					'X-Webhook-Delivery': delivery.id,
+				}
+				// To the address just checked: a second DNS answer (rebinding) is never used.
+				const status =
+					this.transport && address !== null
+						? (await this.transport({ url: endpoint.url, address, headers, body: payloadJson }))
+								.status
+						: (
+								await this.fetchFn(endpoint.url, {
+									method: 'POST',
+									headers,
+									body: payloadJson,
+									redirect: 'manual',
+								})
+							).status
+				const ok = status >= 200 && status < 300
 
-				delivery.responseStatus = response.status
-				delivery.success = response.ok
+				delivery.responseStatus = status
+				delivery.success = ok
 
-				if (response.ok) {
+				if (ok) {
 					await this.store.saveDelivery(delivery)
 					return
 				}
 
-				delivery.error = `HTTP ${response.status}`
+				delivery.error = `HTTP ${status}`
 			} catch (err) {
 				delivery.error = err instanceof Error ? err.message : 'Network error'
 			}
@@ -390,14 +403,21 @@ export class WebhookManager {
 		await this.store.saveDelivery(delivery)
 	}
 
-	private async assertDeliverable(url: string): Promise<void> {
+	/**
+	 * Check the URL and resolve its host once: the address delivery connects to, or null when
+	 * nothing resolves here (a custom `fetch` without `resolveHost`, which then resolves alone).
+	 * Every answer must be public (unless `allowPrivateTargets`).
+	 */
+	private async vettedAddress(url: string): Promise<string | null> {
 		assertSafeWebhookUrl(url, this.allowPrivateTargets)
-		if (this.allowPrivateTargets || !this.resolveHost) return
-		const host = new URL(url).hostname
+		if (!this.resolveHost) return null
+		const host = new URL(url).hostname.replace(/^\[|\]$/g, '')
 		const addresses = await this.resolveHost(host)
-		if (addresses.length === 0 || addresses.some(isPrivateAddress)) {
+		if (addresses.length === 0) throw new WebhookTargetError(url)
+		if (!this.allowPrivateTargets && addresses.some(isPrivateAddress)) {
 			throw new WebhookTargetError(url)
 		}
+		return addresses[0] as string
 	}
 }
 
@@ -432,7 +452,8 @@ function assertSafeWebhookUrl(url: string, allowPrivate: boolean): void {
 
 /**
  * True for loopback, private (RFC 1918 / ULA), link-local (incl. cloud metadata
- * 169.254.169.254), CGNAT, unspecified and IPv4-mapped private addresses.
+ * 169.254.169.254), CGNAT, unspecified, IPv4-compatible (::/96) and IPv4-mapped or NAT64
+ * (64:ff9b::/96) addresses carrying a private IPv4 address.
  * Non-IP strings return false (hostnames are checked after resolution).
  */
 function isPrivateAddress(address: string): boolean {
@@ -460,6 +481,21 @@ function isPrivateAddress(address: string): boolean {
 			a >= 224
 		)
 	}
+	// IPv4-compatible (::/96, deprecated, never routed): private. NAT64 (64:ff9b::/96): private
+	// when the IPv4 address it carries is.
+	const embedded =
+		/^(64:ff9b::|::)(?:([0-9a-f]{1,4}):([0-9a-f]{1,4})|(\d{1,3}(?:\.\d{1,3}){3}))$/.exec(host)
+	if (embedded) {
+		if (embedded[1] === '::') return true
+		const v4 =
+			embedded[4] ??
+			(() => {
+				const hi = Number.parseInt(embedded[2] as string, 16)
+				const lo = Number.parseInt(embedded[3] as string, 16)
+				return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`
+			})()
+		return isPrivateAddress(v4)
+	}
 	if (host.includes(':')) {
 		return (
 			host === '::' ||
@@ -474,6 +510,84 @@ function isPrivateAddress(address: string): boolean {
 		)
 	}
 	return false
+}
+
+/** A webhook request to send to one already-checked address. */
+export interface WebhookTransportRequest {
+	/** The endpoint URL: its host is the TLS server name and the Host header. */
+	url: string
+	/** The address to connect to (checked public); never resolved again. */
+	address: string
+	headers: Record<string, string>
+	body: string
+}
+
+/** Sends a webhook request to `request.address`; resolves with the response status. */
+export type WebhookTransport = (request: WebhookTransportRequest) => Promise<{ status: number }>
+
+const DELIVERY_TIMEOUT_MS = 10_000
+
+/**
+ * The default {@link WebhookTransport} (Node): an HTTPS (or, for allowPrivateTargets, HTTP)
+ * POST whose socket connects to `request.address`, with the URL's host as the TLS server name
+ * (so the certificate is still checked against it) and Host header. Redirects are not followed.
+ */
+export async function postToAddress(request: WebhookTransportRequest): Promise<{ status: number }> {
+	const url = new URL(request.url)
+	type Lookup = (
+		hostname: string,
+		options: { all?: boolean },
+		callback: (...args: unknown[]) => void,
+	) => void
+	type ClientRequest = {
+		on(event: 'error', listener: (error: Error) => void): void
+		setTimeout(ms: number, listener: () => void): void
+		destroy(error?: Error): void
+		end(body: string): void
+	}
+	type Transport = {
+		request(
+			options: Record<string, unknown>,
+			onResponse: (response: { statusCode?: number; resume(): void }) => void,
+		): ClientRequest
+	}
+	const secure = url.protocol === 'https:'
+	const transport = (await (secure
+		? import('node:https')
+		: import('node:http'))) as unknown as Transport
+	const family = request.address.includes(':') ? 6 : 4
+	const lookup: Lookup = (_hostname, options, callback) => {
+		if (options.all) callback(null, [{ address: request.address, family }])
+		else callback(null, request.address, family)
+	}
+	const hostname = url.hostname.replace(/^\[|\]$/g, '')
+	const isLiteral = /^[\d.]+$/.test(hostname) || hostname.includes(':')
+	return new Promise((resolve, reject) => {
+		const outgoing = transport.request(
+			{
+				protocol: url.protocol,
+				hostname,
+				port: url.port || (secure ? 443 : 80),
+				path: `${url.pathname}${url.search}`,
+				method: 'POST',
+				headers: {
+					...request.headers,
+					'Content-Length': new TextEncoder().encode(request.body).length,
+				},
+				lookup,
+				...(secure && !isLiteral ? { servername: hostname } : {}),
+			},
+			(response) => {
+				response.resume()
+				resolve({ status: response.statusCode ?? 0 })
+			},
+		)
+		outgoing.on('error', reject)
+		outgoing.setTimeout(DELIVERY_TIMEOUT_MS, () =>
+			outgoing.destroy(new Error('Webhook delivery timed out.')),
+		)
+		outgoing.end(request.body)
+	})
 }
 
 async function resolveWithNodeDns(host: string): Promise<string[]> {
