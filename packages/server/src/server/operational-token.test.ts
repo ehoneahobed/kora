@@ -43,7 +43,8 @@ describe('operational endpoints check the token in constant time', () => {
 		const spy = vi.mocked(crypto.timingSafeEqual)
 		spy.mockClear()
 		const status = async (token: string) =>
-			(await fetch(`${base}/metrics`, { headers: { authorization: `Bearer ${token}` } })).status
+			(await fetch(`${base}/__kora/metrics`, { headers: { authorization: `Bearer ${token}` } }))
+				.status
 		expect(await status('admin-token-123')).toBe(200)
 		expect(await status('admin-token-124')).toBe(401)
 		expect(await status('nope')).toBe(401)
