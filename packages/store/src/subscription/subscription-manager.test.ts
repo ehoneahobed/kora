@@ -58,6 +58,37 @@ describe('SubscriptionManager', () => {
 		expect(results[0]).toEqual(mockData)
 	})
 
+	test('a subscription whose post-query step throws gets an error; the others in the flush are delivered', async () => {
+		const failing = vi.fn()
+		const onError = vi.fn()
+		manager.register(
+			{ collection: 'todos', where: {}, orderBy: [] },
+			failing,
+			async () => [{ id: 'a', createdAt: 1, updatedAt: 1 }],
+			{
+				onError,
+				resultsEqual: () => {
+					throw new Error('comparator bug')
+				},
+			},
+		)
+		const healthy = vi.fn()
+		manager.register(
+			{ collection: 'todos', where: { done: true }, orderBy: [] },
+			healthy,
+			async () => [{ id: 'b', createdAt: 1, updatedAt: 1 }],
+		)
+		manager.notify('todos', makeOp('todos'))
+		await expect(manager.flush()).resolves.toBeUndefined()
+		expect(onError).toHaveBeenCalledWith(
+			expect.objectContaining({
+				phase: 'refresh',
+				error: expect.objectContaining({ message: 'comparator bug' }),
+			}),
+		)
+		expect(healthy).toHaveBeenCalledWith([{ id: 'b', createdAt: 1, updatedAt: 1 }])
+	})
+
 	test('does not call callback if results unchanged', async () => {
 		const callback = vi.fn()
 		const data: CollectionRecord[] = [

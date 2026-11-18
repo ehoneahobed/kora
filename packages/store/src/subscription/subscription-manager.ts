@@ -377,16 +377,25 @@ export class SubscriptionManager {
 		if (!this.isCurrent(sub, runNumber)) return
 		sub.lastAppliedRun = runNumber
 
-		// Overlay on: this SQL result is the new base, and pending writes it may not contain
-		// are applied on top (design 5.5). Overlay off: `shown` is `results`.
-		const shown = registry ? this.settleRun(sub, results, issuedAt, registry, seedStamp) : results
-		if (registry) this.onRead?.(sub.descriptor.collection)
+		// Settling, the read hook and the comparison run per subscription: a failure in one (an
+		// internal bug) is reported on it, and the rest of the flush is still delivered.
+		let shown: CollectionRecord[]
+		try {
+			// Overlay on: this SQL result is the new base, and pending writes it may not contain
+			// are applied on top (design 5.5). Overlay off: `shown` is `results`.
+			shown = registry ? this.settleRun(sub, results, issuedAt, registry, seedStamp) : results
+			if (registry) this.onRead?.(sub.descriptor.collection)
 
-		// After a failure, the next success is always delivered (even when equal to
-		// the last results) so bindings can leave their error state.
-		const equal = sub.resultsEqual ?? defaultResultsEqual
-		if (sub.delivered && !sub.errored && equal(sub.lastResults, shown)) {
-			timers?.add('diffNotify', performance.now() - rereadEndedAt)
+			// After a failure, the next success is always delivered (even when equal to
+			// the last results) so bindings can leave their error state.
+			const equal = sub.resultsEqual ?? defaultResultsEqual
+			if (sub.delivered && !sub.errored && equal(sub.lastResults, shown)) {
+				timers?.add('diffNotify', performance.now() - rereadEndedAt)
+				return
+			}
+		} catch (error) {
+			sub.errored = true
+			this.reportError(sub, error, sub.delivered ? 'refresh' : 'initial')
 			return
 		}
 
