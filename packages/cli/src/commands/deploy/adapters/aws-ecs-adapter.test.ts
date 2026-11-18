@@ -149,8 +149,9 @@ describe('AwsEcsAdapter', () => {
 			deployDirectory: '/tmp/test/.kora/deploy',
 		})
 
-		expect(result.liveUrl).toContain('my-app')
-		expect(result.syncUrl).toContain('kora-sync')
+		// The service exists but has no load balancer: deployed, with no URL claimed.
+		expect(result.liveUrl).toBeNull()
+		expect(result.pendingSetup).toBeUndefined()
 		expect(result.deploymentId).toBeTruthy()
 	})
 

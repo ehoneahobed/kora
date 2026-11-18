@@ -54,8 +54,15 @@ export interface BuildArtifacts {
 
 export interface DeployResult {
 	deploymentId: string
-	liveUrl: string
+	/** Where the app answers, when the platform says so; null when it is not known (or not live). */
+	liveUrl: string | null
 	syncUrl: string | null
+	/**
+	 * Set when the deploy stopped short of a running app and the developer must finish it (for
+	 * example the ECS service is not created yet): what to do next. The deploy is not reported
+	 * as completed.
+	 */
+	pendingSetup?: string
 }
 
 export interface LogOptions {

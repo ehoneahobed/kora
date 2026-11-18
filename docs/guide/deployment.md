@@ -468,13 +468,16 @@ kora deploy --platform=aws-ecs
 Or select "AWS ECS Fargate" when prompted interactively.
 
 Kora will:
-1. Create an ECR repository for your Docker image
-2. Create an ECS cluster and CloudWatch log group
-3. Build and push your Docker image to ECR
-4. Register an ECS task definition with health checks
-5. Update or create the ECS service
+1. Check that the `ecsTaskExecutionRole` IAM role exists (tasks need it to pull the image and write logs). If it does not, the deploy stops before building anything and prints the two commands that create it: `aws iam create-role` with an `ecs-tasks.amazonaws.com` trust policy, and `aws iam attach-role-policy` with `AmazonECSTaskExecutionRolePolicy`.
+2. Create an ECR repository for your Docker image
+3. Create an ECS cluster and CloudWatch log group
+4. Build and push your Docker image to ECR
+5. Register an ECS task definition with health checks
+6. Update the ECS service, if it exists
 
-**First-time setup note:** ECS Fargate requires networking configuration (VPC, subnets, security groups) that varies by AWS account. On the first deploy, if no service exists yet, Kora registers the task definition and provides the `aws ecs create-service` command you need to run with your specific VPC settings:
+The deploy reports only what happened. It names a live URL only when the service sits behind a load balancer, and then it is the load balancer's DNS name; without one, the address belongs to the task and changes on each deployment, so none is printed.
+
+**First-time setup note:** ECS Fargate requires networking configuration (VPC, subnets, security groups) that varies by AWS account, so Kora does not create the service. On the first deploy, when no service exists yet, Kora pushes the image and registers the task definition, then stops with "Not deployed yet" (nothing is running) and the `aws ecs create-service` command to run once with your VPC settings. Run the deploy again afterwards:
 
 ```bash
 aws ecs create-service \

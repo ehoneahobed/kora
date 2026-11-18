@@ -6,6 +6,7 @@ import { CliError, DeployPlatformUnavailableError, InvalidProjectError } from '.
 import { createPromptClient } from '../../prompts/prompt-client'
 import { findProjectRoot } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
+import type { DeployResult } from './adapters/adapter'
 import {
 	type ContextAwareDeployAdapter,
 	DEPLOY_PLATFORMS,
@@ -334,10 +335,7 @@ export const deployCommand = defineCommand({
 			})
 		}
 
-		logger.success(`Deployment completed: ${deployResult.liveUrl}`)
-		if (deployResult.syncUrl) {
-			logger.step(`Sync endpoint: ${deployResult.syncUrl}`)
-		}
+		reportDeployResult(logger, deployResult)
 	},
 })
 
@@ -478,4 +476,26 @@ function detectDeployTarget(projectRoot: string): ProjectConfig['deployTarget'] 
 
 function hasContextSetter(adapter: DeployAdapter): adapter is ContextAwareDeployAdapter {
 	return typeof (adapter as ContextAwareDeployAdapter).setContext === 'function'
+}
+
+/**
+ * Say what the deploy did, and only that: "completed" when the platform runs the app, the
+ * remaining setup when it stopped short, and a URL only when one is known.
+ */
+export function reportDeployResult(
+	logger: Pick<ReturnType<typeof createLogger>, 'success' | 'warn' | 'step'>,
+	result: DeployResult,
+): void {
+	if (result.pendingSetup) {
+		logger.warn(`Not deployed yet: ${result.pendingSetup}`)
+		return
+	}
+	logger.success(
+		result.liveUrl
+			? `Deployment completed: ${result.liveUrl}`
+			: 'Deployment completed. The platform did not report a public URL for it.',
+	)
+	if (result.syncUrl) {
+		logger.step(`Sync endpoint: ${result.syncUrl}`)
+	}
 }
