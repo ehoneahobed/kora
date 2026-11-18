@@ -144,6 +144,21 @@ describe('QueryBuilder', () => {
 			const count = await createBuilder().count()
 			expect(count).toBe(1)
 		})
+
+		test('counts what exec() returns: limit and offset apply', async () => {
+			for (const title of ['A', 'B', 'C', 'D', 'E']) await collection.insert({ title })
+			const cases: Array<[QueryBuilder<Record<string, unknown>>, number]> = [
+				[createBuilder().limit(2), 2],
+				[createBuilder().offset(3), 2],
+				[createBuilder().limit(2).offset(4), 1],
+				[createBuilder().offset(9), 0],
+				[createBuilder().where({ completed: false }).orderBy('title').limit(10), 5],
+			]
+			for (const [query, expected] of cases) {
+				expect(await query.count()).toBe(expected)
+				expect(await query.count()).toBe((await query.exec()).length)
+			}
+		})
 	})
 
 	describe('subscribe', () => {

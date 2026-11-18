@@ -143,7 +143,8 @@ export class QueryBuilder<T = CollectionRecord> {
 	}
 
 	/**
-	 * Execute a COUNT query and return the count.
+	 * Count the records this query matches: the length `exec()` would return, so `limit` and
+	 * `offset` apply.
 	 */
 	async count(): Promise<number> {
 		const { sql, params } = buildCountQuery(this.descriptor, this.definition.fields)

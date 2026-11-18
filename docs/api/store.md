@@ -115,7 +115,7 @@ in any order before `exec()`, `count()` or `subscribe()`.
 | `limit(n)` / `offset(n)` | Non-negative safe integers (otherwise `QueryError`), bound as SQL parameters. |
 | `include(...targets)` | Adds related records (see below). |
 | `exec()` | `Promise<Record[]>`. |
-| `count()` | `Promise<number>`. |
+| `count()` | `Promise<number>`: how many records `exec()` would return, so `limit` and `offset` apply (`where(f).limit(10).count()` is at most 10). For every match, count without them. |
 | `subscribe(callback, { onError? })` | Live results; returns an unsubscribe function. |
 
 ```typescript

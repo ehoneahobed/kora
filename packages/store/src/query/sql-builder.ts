@@ -47,8 +47,21 @@ export function buildSelectQuery(
 		parts.push(`ORDER BY ${orderParts.join(', ')}`)
 	}
 
-	// SEC-7: LIMIT / OFFSET are bound as parameters after a safe-integer check, so a
-	// value that only claims to be a number can never become SQL text.
+	appendLimitOffset(descriptor, parts, params)
+	return { sql: parts.join(' '), params }
+}
+
+/**
+ * Append the descriptor's LIMIT / OFFSET. SEC-7: both are bound as parameters after a
+ * safe-integer check, so a value that only claims to be a number can never become SQL text.
+ *
+ * @returns Whether either was appended
+ */
+function appendLimitOffset(
+	descriptor: QueryDescriptor,
+	parts: string[],
+	params: unknown[],
+): boolean {
 	const limit = descriptor.limit !== undefined ? assertQueryCount(descriptor.limit, 'limit') : null
 	const offset =
 		descriptor.offset !== undefined ? assertQueryCount(descriptor.offset, 'offset') : null
@@ -62,13 +75,13 @@ export function buildSelectQuery(
 		parts.push('OFFSET ?')
 		params.push(offset)
 	}
-
-	return { sql: parts.join(' '), params }
+	return limit !== null || offset !== null
 }
 
 /**
- * Build a COUNT query from a QueryDescriptor.
- * Automatically adds `WHERE _deleted = 0`.
+ * Build a COUNT query from a QueryDescriptor: the number of records `buildSelectQuery` would
+ * return, so `limit` and `offset` apply (over a limited subquery). `orderBy` does not change a
+ * count and is left out. Automatically adds `WHERE _deleted = 0`.
  *
  * @param descriptor - The query descriptor
  * @param fields - The field descriptors from the collection schema
@@ -79,7 +92,7 @@ export function buildCountQuery(
 	fields: Record<string, FieldDescriptor>,
 ): SqlQuery {
 	const params: unknown[] = []
-	const parts = [`SELECT COUNT(*) as count FROM ${quoteIdent(descriptor.collection)}`]
+	const parts = [`FROM ${quoteIdent(descriptor.collection)}`]
 
 	const whereClause = buildWhereClauseParts(descriptor.where, fields, params)
 	const deletedFilter = '_deleted = 0'
@@ -89,7 +102,10 @@ export function buildCountQuery(
 		parts.push(`WHERE ${deletedFilter}`)
 	}
 
-	return { sql: parts.join(' '), params }
+	if (appendLimitOffset(descriptor, parts, params)) {
+		return { sql: `SELECT COUNT(*) as count FROM (SELECT 1 ${parts.join(' ')})`, params }
+	}
+	return { sql: `SELECT COUNT(*) as count ${parts.join(' ')}`, params }
 }
 
 /**
