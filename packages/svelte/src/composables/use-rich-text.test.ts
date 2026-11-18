@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as Y from 'yjs'
 import EarlyRichTextBindingFlow from '../../tests/fixtures/EarlyRichTextBindingFlow.svelte'
+import EarlyRichTextCursorsFlow from '../../tests/fixtures/EarlyRichTextCursorsFlow.svelte'
 import RichTextBindingFlow from '../../tests/fixtures/RichTextBindingFlow.svelte'
 import RichTextControlsFlow from '../../tests/fixtures/RichTextControlsFlow.svelte'
 import type { KoraAppLike } from '../types'
@@ -167,5 +168,59 @@ describe('createRichTextBinding before the store opens', () => {
 			expect(getByTestId('value').textContent).toBe('Hello')
 		})
 		expect(early.findById).not.toHaveBeenCalled()
+	})
+})
+
+describe('createRichTextBinding created before the store opens, then the sync engine arrives', () => {
+	it("shows a collaborator's cursor on the record once app.ready resolves", async () => {
+		// The awareness of the sync engine that exists only after app.ready.
+		type State = { user: { name: string; color: string }; cursor?: Record<string, unknown> }
+		const states = new Map<number, State>()
+		const listeners = new Set<() => void>()
+		const awareness = {
+			clientId: 1,
+			getStates: () => states,
+			getLocalState: () => null,
+			setLocalState: vi.fn(),
+			on: (_event: string, listener: () => void) => {
+				listeners.add(listener)
+				return () => listeners.delete(listener)
+			},
+		}
+		const engine = { getAwarenessManager: () => awareness }
+		const notes = {
+			findById: vi.fn(async () => ({ id: 'rec-1', body: null })),
+			update: vi.fn(),
+			insert: vi.fn(),
+			delete: vi.fn(),
+			where: vi.fn(() => createQueryBuilderMock([{ id: 'rec-1', body: null }])),
+		} as unknown as CollectionAccessor
+		let open = (): void => {}
+		let isOpen = false
+		const ready = new Promise<void>((resolve) => {
+			open = () => {
+				isOpen = true
+				resolve()
+			}
+		})
+		const app = {
+			ready,
+			getStore: () => createMockStore({ notes }),
+			getSyncEngine: () => (isOpen ? engine : null),
+			collections: { notes },
+		} as unknown as KoraAppLike
+
+		const { getByTestId } = render(EarlyRichTextCursorsFlow, { props: { app } })
+		open()
+		await ready
+		// A collaborator puts a cursor on this record.
+		states.set(2, {
+			user: { name: 'Grace', color: '#00f' },
+			cursor: { collection: 'notes', recordId: 'rec-1', field: 'body', anchor: 0, head: 0 },
+		})
+		for (const listener of listeners) listener()
+		await waitFor(() => {
+			expect(getByTestId('cursors').textContent).toBe('Grace')
+		})
 	})
 })
