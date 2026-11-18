@@ -1,3 +1,4 @@
+import fc from 'fast-check'
 import { describe, expect, test, vi } from 'vitest'
 import type { CollectionRecord } from '../types'
 import { type OverlayEvent, PendingWrites, type PendingWritesOptions } from './pending-writes'
@@ -721,5 +722,54 @@ describe('remote-apply activity is scoped to the collection', () => {
 		expect(registry.foreignSince(added.entry)).toBe(true)
 		batch.end()
 		batch.end()
+	})
+})
+
+describe('PendingWrites: an unknown entry stays decidable', () => {
+	type Step =
+		| { kind: 'sweep' }
+		| { kind: 'unknown'; entry: number; id: string | null }
+		| { kind: 'commit'; entry: number }
+		| { kind: 'rollback'; entry: number }
+	const step: fc.Arbitrary<Step> = fc.oneof(
+		fc.constant<Step>({ kind: 'sweep' }),
+		fc.record({
+			kind: fc.constant('unknown' as const),
+			entry: fc.integer({ min: 0, max: 2 }),
+			id: fc.constantFrom<string | null>(null, 'op-a', 'op-b'),
+		}),
+		fc.record({ kind: fc.constant('commit' as const), entry: fc.integer({ min: 0, max: 2 }) }),
+		fc.record({ kind: fc.constant('rollback' as const), entry: fc.integer({ min: 0, max: 2 }) }),
+	)
+
+	test('property: once an outcome names a witness, the entry keeps one until it is decided', () => {
+		fc.assert(
+			fc.property(fc.array(step, { maxLength: 25 }), (steps) => {
+				const { registry, advance } = make({ pendingTtlMs: 10 })
+				const entries = ['a', 'b', 'c'].map((id) => added(registry, change('insert', id)))
+				const witnessed = new Set<string>()
+				for (const one of steps) {
+					advance(5)
+					if (one.kind === 'sweep') registry.sweep()
+					else {
+						const writeId = entries[one.entry]?.writeId as string
+						if (one.kind === 'unknown') {
+							const state = registry.get(writeId)?.state
+							registry.markUnknown(writeId, one.id)
+							if (one.id !== null && (state === 'pending' || state === 'unknown')) {
+								witnessed.add(writeId)
+							}
+						} else if (one.kind === 'commit') registry.commit(writeId)
+						else registry.rollback(writeId)
+					}
+					for (const entry of registry.list()) {
+						if (entry.state === 'unknown' && witnessed.has(entry.writeId)) {
+							expect(entry.lookupOperationId).not.toBeNull()
+						}
+					}
+				}
+			}),
+			{ numRuns: 500 },
+		)
 	})
 })

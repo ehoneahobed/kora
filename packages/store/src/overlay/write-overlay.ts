@@ -330,6 +330,13 @@ function track(
 		},
 		unknown(lookupOperationId) {
 			if (done) return
+			// Without a witness nothing can decide it later, and a write that produced no
+			// operation changed nothing: taking its prediction back is exact (as for a
+			// transaction).
+			if (lookupOperationId === null) {
+				this.failed(new Error('The write produced no operation and its commit was not confirmed.'))
+				return
+			}
 			done = true
 			try {
 				for (const entry of entries) overlay.registry.markUnknown(entry.writeId, lookupOperationId)
