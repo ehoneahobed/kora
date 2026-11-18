@@ -715,4 +715,24 @@ describe('state rechecks after every await', () => {
 		expect(locks.heldNames().some((name) => name.includes('"tabId":"tab"'))).toBe(true)
 		tab.close()
 	})
+
+	test('open(): a failure after the tab lock (a lock query rejected) releases it, and a retry opens', async () => {
+		const control = controllableLocks(locks)
+		const tab = gate('A', 'tab', {
+			runtime: {
+				browser: true,
+				locks: control.locks,
+				createChannel: (name) => new MockBroadcastChannel(name, 'tab'),
+			},
+		})
+		control.failNextQuery()
+		await expect(tab.open()).rejects.toThrow('lock query failed')
+		// No tab waits on a tab that never opened storage.
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"tab"'))).toBe(false)
+		expect(tab.getState()).not.toBe('open')
+		// The failure is not cached: opening again works.
+		await expect(tab.open()).resolves.toBeUndefined()
+		expect(tab.getState()).toBe('open')
+		tab.close()
+	})
 })

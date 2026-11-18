@@ -938,6 +938,33 @@ const scenarios = {
 		}
 		await ctx.close()
 	},
+	// A lock query that fails after the version gate took its tab lock must not leave the lock
+	// held (a newer-build tab would wait on a tab that never opened), and opening again works.
+	async 'GATE-LOCK-RELEASE'() {
+		const ctx = await browser.newContext()
+		const page = await tab(ctx)
+		const db = 'gate-lock-release'
+		await page.evaluate((name) => H.failNextGateQuery(name), db)
+		const failed = await page.evaluate((name) => H.open('first', name), db)
+		check(
+			'GATE-LOCK-RELEASE',
+			'open rejects when the lock query fails',
+			failed.ok === false,
+			J(failed),
+		)
+		const locks = await page.evaluate(() => H.locks())
+		const heldTabLock = locks.held.some((name) => name.includes(db) && name.includes('"tabId"'))
+		check(
+			'GATE-LOCK-RELEASE',
+			'no tab lock of the failed open is left held',
+			!heldTabLock,
+			J(locks),
+		)
+		const retried = await page.evaluate((name) => H.open('second', name), db)
+		check('GATE-LOCK-RELEASE', 'opening again succeeds', retried.ok === true, J(retried))
+		await ctx.close()
+	},
+
 	async 'RESTORE-CRASH'() {
 		// A replace restore keeps this device's unsynced writes across a crash right after its
 		// replace transaction commits, on the IndexedDB adapter: with the replaced state already

@@ -557,7 +557,14 @@ export class VersionGate {
 	 * {@link TabCoordinationUnavailableError} in a browser without Web Locks.
 	 */
 	open(): Promise<void> {
-		if (!this.openPromise) this.openPromise = this.doOpen()
+		if (!this.openPromise) {
+			const opening = this.doOpen()
+			this.openPromise = opening
+			// A failed open is not cached: the next open() tries again.
+			opening.catch(() => {
+				if (this.openPromise === opening) this.openPromise = null
+			})
+		}
 		return this.openPromise
 	}
 
@@ -606,18 +613,31 @@ export class VersionGate {
 		this.identity = { build: this.build, format: this.format, openSeq, tabId: this.tabId }
 		this.openedAt = Date.now()
 		this.tabLock = await this.acquire(tabLockName(this.dbName, this.identity))
-		this.throwIfStopped()
-		if (this.currentMode === 'exclusive') {
-			await this.acquireExclusive()
+		try {
 			this.throwIfStopped()
-			this.setState('open')
-			return
+			if (this.currentMode === 'exclusive') {
+				await this.acquireExclusive()
+				this.throwIfStopped()
+				this.setState('open')
+				return
+			}
+			this.startChannel()
+			this.postHello()
+			await this.settle()
+			// Never `open` over a gate that closed or started retiring during the last await.
+			this.throwIfStopped()
+		} catch (error) {
+			// Closed or superseded: those paths release their own locks.
+			if (!(error instanceof BuildSupersededError || error instanceof VersionGateClosedError)) {
+				// Any other failure (a lock query rejected): never hold the tab lock without a
+				// storage worker, or a newer build waits on a tab that never opened. As resume().
+				this.stopWaitingTimers()
+				this.stopChannel()
+				this.releaseHeldLocks()
+				if (this.getState() !== 'closed') this.setState('idle')
+			}
+			throw error
 		}
-		this.startChannel()
-		this.postHello()
-		await this.settle()
-		// Never `open` over a gate that closed or started retiring during the last await.
-		this.throwIfStopped()
 		this.setState('open')
 	}
 
