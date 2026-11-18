@@ -1,5 +1,6 @@
 import { KoraError, type SchemaInput, finalizeSchema, registerAccessCompiler } from '@korajs/core'
 import type { SimpleEventEmitter } from '@korajs/core/internal'
+import { AppNotReadyError } from '@korajs/core/lite'
 import type { QueryDescriptor, Store, VersionGate } from '@korajs/store'
 import { type QueryStoreCache, StoragePersistence } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
@@ -290,7 +291,9 @@ export function createRuntimeApp(
 	}
 	const requireBlobApi = (): BlobApi => {
 		if (!blobApi) {
-			throw new Error('Blob subsystem not initialized. Await app.ready before using app.blobs.')
+			throw new AppNotReadyError(
+				'Blob subsystem not initialized. Await app.ready before using app.blobs.',
+			)
 		}
 		return blobApi
 	}
@@ -388,7 +391,9 @@ export function createRuntimeApp(
 		},
 		getStore(): Store {
 			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before accessing the store.')
+				throw new AppNotReadyError(
+					'Store not initialized. Await app.ready before accessing the store.',
+				)
 			}
 			return store
 		},
@@ -473,28 +478,36 @@ export function createRuntimeApp(
 		async exportBackup(options) {
 			await ready
 			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before exporting backup.')
+				throw new AppNotReadyError(
+					'Store not initialized. Await app.ready before exporting backup.',
+				)
 			}
 			return store.exportBackup(options)
 		},
 		async importBackup(data, options) {
 			await ready
 			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before importing backup.')
+				throw new AppNotReadyError(
+					'Store not initialized. Await app.ready before importing backup.',
+				)
 			}
 			return importBackupIntoApp(store, applyPipeline, config, syncState, data, options)
 		},
 		async replayTo(operationId) {
 			await ready
 			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before replaying operations.')
+				throw new AppNotReadyError(
+					'Store not initialized. Await app.ready before replaying operations.',
+				)
 			}
 			return store.replayTo(operationId)
 		},
 		async exportAudit(options) {
 			await ready
 			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before exporting audit data.')
+				throw new AppNotReadyError(
+					'Store not initialized. Await app.ready before exporting audit data.',
+				)
 			}
 			return store.exportAudit(options)
 		},

@@ -118,7 +118,12 @@ export type {
 export { HybridLogicalClock } from '@korajs/core'
 export { generateUUIDv7 } from '@korajs/core'
 export { createOperation } from '@korajs/core'
-export { AppNotReadyError, KoraError } from '@korajs/core/lite'
+export {
+	AppNotReadyError,
+	AppOpenFailedError,
+	BlobPullUnavailableError,
+	KoraError,
+} from '@korajs/core/lite'
 export { OfflineKeepError, OFFLINE_PIN_LIMIT } from '@korajs/core'
 export { op } from '@korajs/core'
 export type {

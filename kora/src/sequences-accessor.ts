@@ -1,3 +1,4 @@
+import { AppNotReadyError } from '@korajs/core/lite'
 import type { Store } from '@korajs/store'
 import type { SequenceAccessor } from './types'
 
@@ -12,7 +13,7 @@ export function createSequencesAccessor(
 		await ready
 		const store = getStore()
 		if (!store) {
-			throw new Error('Store not initialized. Await app.ready before using sequences.')
+			throw new AppNotReadyError('Store not initialized. Await app.ready before using sequences.')
 		}
 		return store
 	}

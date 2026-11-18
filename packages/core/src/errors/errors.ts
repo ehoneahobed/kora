@@ -118,6 +118,29 @@ export class AppNotReadyError extends KoraError {
 }
 
 /**
+ * The local store did not open, so something that needs it cannot run (a query built before
+ * `app.ready`, a call that waited for the store). The cause is the `app.ready` rejection.
+ */
+export class AppOpenFailedError extends KoraError {
+	constructor(detail: string) {
+		super(detail, 'APP_OPEN_FAILED', {
+			fix: 'The store did not open: see the error app.ready rejected with.',
+		})
+		this.name = 'AppOpenFailedError'
+	}
+}
+
+/** `app.blobs.pull()` needs a sync connection to fetch bytes from peers, and there is none. */
+export class BlobPullUnavailableError extends KoraError {
+	constructor() {
+		super('Cannot pull blob bytes without an active sync connection.', 'BLOB_SYNC_UNAVAILABLE', {
+			fix: 'Configure sync on createApp and wait until the app is connected before calling app.blobs.pull(). Local blobs (put, get) work without sync.',
+		})
+		this.name = 'BlobPullUnavailableError'
+	}
+}
+
+/**
  * Thrown when the HLC detects excessive clock drift.
  * Drift > 60s: warning. Drift > 5min: this error is thrown, refusing to generate timestamps.
  */
