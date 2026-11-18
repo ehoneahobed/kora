@@ -1,41 +1,5 @@
 /**
- * Vue 3 bindings — re-exported from `@korajs/vue` for `import { ... } from 'korajs/vue'`.
+ * Vue 3 bindings: everything `@korajs/vue` exports, for `import { ... } from 'korajs/vue'`.
+ * A re-export of the whole package, so the two never drift (meta-exports.test.ts).
  */
-export type {
-	KoraAppHandle,
-	KoraAppLike,
-	KoraContextValue,
-	KoraProviderProps,
-	MutationRejection,
-	UseMutationOptions,
-	UseMutationResult,
-	UseQueryOptions,
-	UseQueryStateResult,
-	UseRichTextResult,
-	QueryInput,
-} from '@korajs/vue'
-
-export type { UseRichTextOptions } from '@korajs/vue'
-
-export {
-	KoraProvider,
-	installKora,
-	koraAppInjectionKey,
-	koraContextKey,
-	useApp,
-	useCollection,
-	useKoraApp,
-	useKoraContext,
-	useMutation,
-	useOfflineKeep,
-	useOfflineReady,
-	useQuery,
-	useQueryState,
-	useRichText,
-	useSyncStatus,
-	useFormDraft,
-	usePresence,
-	useCollaborators,
-} from '@korajs/vue'
-
-export type { UseFormDraftResult, VueFormDraftOptions } from '@korajs/vue'
+export * from '@korajs/vue'
