@@ -560,11 +560,17 @@ Check that Vite is running on port 5173. Tauri's dev config expects the frontend
 
 ### Database location
 
-In development, the database is stored in Tauri's app data directory:
+The database is stored in Tauri's app data directory, named after the `identifier` in
+`src-tauri/tauri.conf.json` (the template derives it from your project name):
 
-- **macOS**: `~/Library/Application Support/com.kora.app/`
-- **Windows**: `%APPDATA%/com.kora.app/`
-- **Linux**: `~/.local/share/com.kora.app/`
+- **macOS**: `~/Library/Application Support/<identifier>/`
+- **Windows**: `%APPDATA%/<identifier>/`
+- **Linux**: `~/.local/share/<identifier>/`
+
+`TauriSqliteAdapter({ path })` takes a file name inside that directory, such as `kora.db` or
+`user/kora.db`. The plugin refuses a parent (`..`), absolute or empty path, and it refuses
+`ATTACH` and `VACUUM INTO`, so even a compromised webview cannot open or write a database file
+elsewhere on disk.
 
 ## What's Next
 

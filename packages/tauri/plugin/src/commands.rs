@@ -196,11 +196,14 @@ pub fn open<R: Runtime>(
     Ok(())
 }
 
-/// The file `open` uses for `path`: `:memory:` as is, anything else in the app's data directory.
+/// The file `open` uses for `path`: `:memory:` as is, otherwise a name inside the app's data
+/// directory. A parent, absolute or empty path is refused ([`validate_database_path`]), as for
+/// `inspect` and `delete`: `PathBuf::join` would follow it out of the directory.
 pub fn resolve_open_path(data_dir: &std::path::Path, path: &str) -> Result<String, Error> {
     if path == ":memory:" {
         return Ok(path.to_string());
     }
+    validate_database_path(path)?;
     Ok(data_dir.join(path).to_string_lossy().into_owned())
 }
 
@@ -211,6 +214,10 @@ pub fn configure_connection(conn: &Connection) -> Result<(), Error> {
     // A resolved write is a durability promise, including across power loss.
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "busy_timeout", "5000")?;
+    // No other database may be attached: `ATTACH` (and `VACUUM INTO`, which attaches its
+    // target) would read or write any file the process can reach, outside the data directory.
+    // Kora never attaches one.
+    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED, 0);
     Ok(())
 }
 
