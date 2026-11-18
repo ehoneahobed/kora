@@ -3,42 +3,40 @@ import type { CollectionRecord, QueryBuilder } from '@korajs/store'
 </script>
 
 <script lang="ts" generics="T extends CollectionRecord = CollectionRecord">
-	import { assertQueryReady } from '@korajs/store/lite'
+	import { writable } from 'svelte/store'
 	import { getKoraContext } from '../context'
+	import { createQueryStateStore } from '../stores/query-store'
+	import type { QueryState } from '../types'
 
 	interface Props {
 		query: QueryBuilder<T>
 		enabled?: boolean
-		children?: import('svelte').Snippet<[readonly T[]]>
+		/** A failed query; without it the failure is logged (it is also in the snippet's state). */
+		onError?: (error: Error) => void
+		/** The rows, and the full state: `{ data, error, ready, source, complete }`. */
+		children?: import('svelte').Snippet<[readonly T[], QueryState<T>]>
 	}
 
-	let { query, enabled = true, children }: Props = $props()
+	let { query, enabled = true, onError, children }: Props = $props()
 
 	getKoraContext()
 
-	let data = $state<readonly T[]>([])
+	// The same machinery as createQueryStateStore: one ref-counted store per descriptor, so an
+	// equal query keeps its store, and a new query shows the previous rows until it answers.
+	// Filled by the effect below, which also follows every later query and `enabled`.
+	const input = writable<QueryBuilder<T> | null>(null)
+	const queryState = createQueryStateStore<T>(input, {
+		onError: (failure) => {
+			if (onError) onError(failure)
+			else console.error('[Kora] KoraQuery failed:', failure)
+		},
+	})
 
 	$effect(() => {
-		if (!enabled) {
-			data = []
-			return
-		}
-
-		const { queryStoreCache } = getKoraContext()
-		assertQueryReady(query as QueryBuilder<unknown>)
-		const queryStore = queryStoreCache.getOrCreate(query)
-		const unsubscribe = queryStore.subscribe(() => {
-			data = queryStore.getSnapshot()
-		})
-		data = queryStore.getSnapshot()
-
-		return () => {
-			unsubscribe()
-			queryStoreCache.release(query as QueryBuilder<unknown>)
-		}
+		input.set(enabled ? query : null)
 	})
 </script>
 
 {#if children}
-	{@render children(data)}
+	{@render children($queryState.data, $queryState)}
 {/if}
