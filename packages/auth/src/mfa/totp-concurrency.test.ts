@@ -104,6 +104,13 @@ describe.each([
 	})
 })
 
+describe('a store without saveIf (review RT round 1)', () => {
+	test('two managers sharing it would race, so a manager refuses it', async () => {
+		const store = new CopyingStore()
+		expect(() => new TotpManager({ issuer: 'Test', store })).toThrow(/saveIf/)
+	})
+})
+
 describe('several servers sharing one store (saveIf)', () => {
 	test('property: any number of concurrent attempts with one code, across servers, sign in once', async () => {
 		await fc.assert(
