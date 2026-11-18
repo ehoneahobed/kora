@@ -849,7 +849,7 @@ const showMs = (value: number): string =>
 const showValue = (metric: ParityMetric, value: number): string =>
 	metric === 'P9' ? (Number.isFinite(value) ? `${Math.round(value)} KiB` : 'n/a') : showMs(value)
 const pair = (metric: ParityMetric, s: Summary): string =>
-	`${showValue(metric, s.median)} / ${showValue(metric, s.p95)}`
+	`${showValue(metric, s.median)} / ${showValue(metric, s.tail)}`
 
 interface CellRow {
 	key: string
@@ -888,7 +888,7 @@ function contractRows(report: Report): CellRow[] {
 					first.cpu,
 				)
 				const overP50 = verdict.kora.median - verdict.limitP50
-				const overP95 = verdict.kora.p95 - verdict.limitP95
+				const overP95 = verdict.kora.tail - verdict.limitP95
 				const over = (value: number): string =>
 					Number.isFinite(value)
 						? `${value > 0 ? '+' : ''}${metric === 'P9' ? `${Math.round(value)} KiB` : showMs(value)}`

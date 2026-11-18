@@ -67,17 +67,20 @@ Every time is measured in Chromium from navigation start, never from `connect()`
 - **Temperature.** `cold` is a new browser context. `warm` is the same context reopened after the
   first session. `warm-stale` is a warm device whose server log grew by 10,000 operations.
 - **CPU.** 1x and 4x (`Emulation.setCPUThrottlingRate(4)`, a mid-range phone) are both gated.
-- **Runs.** The two apps alternate per run. Each cell reports the median and nearest-rank p95.
+- **Runs.** The two apps alternate per run. Each cell reports the median and the tail: the
+  second-slowest run below 20 runs (the nightly runs 5, and one shared-runner spike must not
+  decide a cell), the nearest-rank p95 from 20 runs up.
 
 ### 2.4 Pass rule
 
 ```
 kora.p50 <= baseline.p50 + max(0.10 * baseline.p50, 100 ms) + allowance
-kora.p95 <= baseline.p95 + max(0.15 * baseline.p95, 150 ms) + allowance
+kora.tail <= baseline.tail + max(0.15 * baseline.tail, 150 ms) + allowance
 ```
 
 P8 uses a flat +50 ms instead of the percentage margin, and P9 uses a byte allowance. A step that
-timed out counts as infinitely slow. A cell passes only if both quantiles pass. The floors
+timed out counts as infinitely slow, and any timed-out run fails the cell (the tail ignores one
+outlier, never a timeout). A cell passes only if both quantiles pass. The floors
 (100 ms, 150 ms) exist because a worker-backed store pays a message round trip per query (30 to
 60 ms) where an in-memory cache answers in a few milliseconds, and 100 ms is below what users
 perceive. For the same reason, warm visits get the same margin as cold ones instead of having to

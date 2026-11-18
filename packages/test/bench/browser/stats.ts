@@ -3,6 +3,12 @@ export interface Summary {
 	n: number
 	median: number
 	p95: number
+	/**
+	 * The tail a gate compares: the second-slowest value below 20 samples (one outlier on a
+	 * shared runner does not decide it), the nearest-rank p95 from 20 up. Infinite (a timeout)
+	 * when two or more values are.
+	 */
+	tail: number
 	min: number
 	max: number
 }
@@ -29,6 +35,12 @@ export function summarize(values: readonly number[]): Summary {
 		n,
 		median,
 		p95: percentile(sorted, 0.95),
+		tail:
+			n === 0
+				? Number.NaN
+				: n < 20
+					? (sorted[Math.max(0, n - 2)] as number)
+					: percentile(sorted, 0.95),
 		min: sorted[0] ?? Number.NaN,
 		max: sorted[n - 1] ?? Number.NaN,
 	}

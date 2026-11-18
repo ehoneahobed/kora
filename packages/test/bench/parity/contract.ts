@@ -81,24 +81,26 @@ export function evaluateCell(
 		// Total blocking time: +50 ms (section 2.4).
 		const extra = cpuAllowanceMs(metric, temperature, cpu)
 		limitP50 = baseline.median + 50 + extra
-		limitP95 = baseline.p95 + 50 + extra
+		limitP95 = baseline.tail + 50 + extra
 	} else if (metric === 'P9') {
 		// Bytes: a ratchet. The original +20 KiB is not reachable: the critical path is about 12
 		// modules of 1 to 3 KiB each and no safe cut closes the last 9 KiB (measured +29 KiB). It
 		// only goes down, in a commit that says why.
 		limitP50 = baseline.median + P9_ALLOWANCE_KIB
-		limitP95 = baseline.p95 + P9_ALLOWANCE_KIB
+		limitP95 = baseline.tail + P9_ALLOWANCE_KIB
 	} else {
 		const extra = cpuAllowanceMs(metric, temperature, cpu)
 		limitP50 = baseline.median + Math.max(0.1 * baseline.median, 100) + extra
-		limitP95 = baseline.p95 + Math.max(0.15 * baseline.p95, 150) + extra
+		limitP95 = baseline.tail + Math.max(0.15 * baseline.tail, 150) + extra
 	}
 	const pass =
 		kora.n > 0 &&
 		baseline.n > 0 &&
 		Number.isFinite(limitP50) &&
 		kora.median <= limitP50 &&
-		kora.p95 <= limitP95
+		kora.tail <= limitP95 &&
+		// A run that timed out fails the cell, even though the tail ignores one outlier.
+		kora.max !== Number.POSITIVE_INFINITY
 	return { baseline, kora, limitP50, limitP95, pass }
 }
 
