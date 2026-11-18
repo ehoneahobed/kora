@@ -6,6 +6,7 @@ import type {
 	Operation,
 	VersionVector,
 } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import { describe, expect, test, vi } from 'vitest'
 import type { OperationBatchMessage, SerializedOperation, SyncMessage } from '../protocol/messages'
 import { JsonMessageSerializer } from '../protocol/serializer'
@@ -150,6 +151,7 @@ async function run(
 	store: SyncStore = createStore(),
 	config: Partial<SyncConfig> = {},
 	handshake: Record<string, unknown> = {},
+	emitter?: SimpleEventEmitter,
 ): Promise<Running> {
 	const { client, server } = createMemoryTransportPair()
 	const sent: SyncMessage[] = []
@@ -172,6 +174,7 @@ async function run(
 		store,
 		config: { url: 'ws://test', ...config },
 		syncState: state,
+		...(emitter ? { emitter } : {}),
 	})
 	await engine.start()
 	await vi.waitFor(() => expect(engine.getState()).toBe('syncing'))
@@ -616,5 +619,65 @@ describe('pins in the sync view (app.offline.keep)', () => {
 			subset('todos', { list: 'c' }),
 		])
 		expect(widened.getOfflineData().state).toBe('incomplete')
+	})
+})
+
+describe('an access narrowing that cannot be applied is surfaced, never swallowed', () => {
+	const narrowing = (id: string) =>
+		batch(id, [], 4, 8, true, { accessNarrowing: { todos: { where: { owner: 'x' } } } } as never)
+
+	async function primed(store: SyncStore) {
+		const state = createState()
+		const first = await run(state)
+		first.server.send(batch('b1', [makeOp('o1', 1)], 0, 4, true))
+		await settled(first.engine, 4)
+		await first.engine.stop()
+		const emitter = new SimpleEventEmitter()
+		const events: Array<{ type: string; failure?: { code: string; collection: string } }> = []
+		for (const type of ['sync:apply-blocked', 'sync:apply-retrying', 'sync:apply-recovered']) {
+			emitter.on(type as never, (event: never) => events.push(event))
+		}
+		const running = await run(state, store, {}, {}, emitter)
+		return { ...running, events }
+	}
+
+	test('a narrowing that throws blocks the stream visibly, retries, and recovers', async () => {
+		const store = createStore()
+		let failing = true
+		store.applyCollectionNarrowing = async () => {
+			if (failing) throw new Error('disk full')
+			return []
+		}
+		const { engine, server, events } = await primed(store)
+		server.send(narrowing('n1'))
+		await vi.waitFor(() => expect(events.map((e) => e.type)).toContain('sync:apply-blocked'))
+		expect(events[0]?.failure).toMatchObject({
+			code: 'ACCESS_NARROWING_FAILED',
+			collection: 'todos',
+		})
+		expect(engine.getStatus().blockedFailure).toMatchObject({ code: 'ACCESS_NARROWING_FAILED' })
+		expect(engine.getStatus().deliveryWatermark).toBe(4)
+
+		server.send(narrowing('n2'))
+		await vi.waitFor(() => expect(events.map((e) => e.type)).toContain('sync:apply-retrying'))
+
+		failing = false
+		server.send(narrowing('n3'))
+		await vi.waitFor(() => expect(events.map((e) => e.type)).toContain('sync:apply-recovered'))
+		await settled(engine, 8)
+		expect(engine.getStatus().blockedFailure).toBeNull()
+		await engine.stop()
+	})
+
+	test('a store without narrowing support blocks the stream visibly', async () => {
+		const { engine, server, events } = await primed(createStore())
+		server.send(narrowing('n1'))
+		await vi.waitFor(() => expect(events.map((e) => e.type)).toContain('sync:apply-blocked'))
+		expect(events[0]?.failure).toMatchObject({
+			code: 'ACCESS_NARROWING_UNSUPPORTED',
+			collection: 'todos',
+		})
+		expect(engine.getStatus().deliveryWatermark).toBe(4)
+		await engine.stop()
 	})
 })
