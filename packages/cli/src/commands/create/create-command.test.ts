@@ -307,3 +307,57 @@ describe('create command flow', () => {
 		}
 	}, 15_000)
 })
+
+describe('create refuses unknown flag values instead of falling back', () => {
+	const cases: Array<[string, Record<string, unknown>, string]> = [
+		[
+			'--template',
+			{ template: 'react-sycn' },
+			'Invalid --template value "react-sycn". Expected one of:',
+		],
+		['--pm', { pm: 'pnmp' }, 'Invalid --pm value "pnmp". Expected one of: pnpm, npm, yarn, bun.'],
+		[
+			'--framework',
+			{ framework: 'solid' },
+			'Invalid --framework value "solid". Expected one of: react, vue, svelte.',
+		],
+	]
+	test.each(cases)(
+		'%s with an unknown value exits 1, says what is valid, creates nothing',
+		async (_flag, flagArgs, message) => {
+			const cwdSpy = vi.spyOn(process, 'cwd')
+			const originalExitCode = process.exitCode
+			const tempRoot = await mkdtemp(join(tmpdir(), 'kora-create-test-'))
+			cwdSpy.mockReturnValue(tempRoot)
+			const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+			try {
+				await createCommand.run({
+					args: {
+						_: [],
+						name: 'typo-app',
+						pm: 'pnpm',
+						'skip-install': true,
+						yes: true,
+						...flagArgs,
+					},
+					rawArgs: [],
+					cmd: createCommand,
+				})
+				expect(process.exitCode).toBe(1)
+				const printed = [...errorSpy.mock.calls, ...logSpy.mock.calls]
+					.map((call) => call.map(String).join(' '))
+					.join('\n')
+				expect(printed).toContain(message)
+				await expect(
+					readFile(join(tempRoot, 'typo-app', 'package.json'), 'utf-8'),
+				).rejects.toThrow()
+			} finally {
+				process.exitCode = originalExitCode
+				cwdSpy.mockRestore()
+				logSpy.mockRestore()
+				errorSpy.mockRestore()
+			}
+		},
+	)
+})
