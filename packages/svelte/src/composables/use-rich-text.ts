@@ -3,7 +3,7 @@ import { asRichTextSyncEngine, createRichTextController } from '@korajs/store'
 import type { CollectionAccessor } from '@korajs/store'
 import type { AwarenessUser } from '@korajs/sync'
 import { onDestroy } from 'svelte'
-import { type Readable, get, readable } from 'svelte/store'
+import { type Readable, get, readable, writable } from 'svelte/store'
 import { getKoraContext } from '../context'
 import type { UseRichTextResult } from '../types'
 
@@ -16,7 +16,10 @@ export interface UseRichTextOptions {
  * Binds a richtext field to a shared Yjs document for editor integration.
  *
  * Must be called during component initialization. For reactive target changes,
- * use {@link KoraRichText} instead.
+ * use {@link KoraRichText} instead. Under a provider that renders before the store opens, the
+ * binding is rebuilt once `app.ready` resolves, so it gets the sync engine (collaborators'
+ * cursors, the live document channel); `doc` and `text` then refer to the new document, and the
+ * store returned here emits it.
  */
 export function createRichTextBinding(
 	collectionName: string,
@@ -24,43 +27,72 @@ export function createRichTextBinding(
 	fieldName: string,
 	options?: UseRichTextOptions,
 ): UseRichTextResult & { subscribe: Readable<UseRichTextResult>['subscribe'] } {
-	const { app, store, syncEngine } = getKoraContext()
+	// Live: the provider's context swaps the pending store for the open one (and its engine).
+	const context = getKoraContext()
+	const create = (): ReturnType<typeof createRichTextController> => {
+		const { app, store, syncEngine } = context
+		return createRichTextController({
+			collection:
+				isPendingStore(store) && app
+					? collectionWhenReady(app, store.collection(collectionName), collectionName)
+					: store.collection(collectionName),
+			collectionName,
+			recordId,
+			fieldName,
+			store,
+			syncEngine: asRichTextSyncEngine(syncEngine),
+			useDocChannel: options?.useDocChannel,
+			user: options?.user,
+		})
+	}
 
-	const controller = createRichTextController({
-		collection:
-			isPendingStore(store) && app
-				? collectionWhenReady(app, store.collection(collectionName), collectionName)
-				: store.collection(collectionName),
-		collectionName,
-		recordId,
-		fieldName,
-		store,
-		syncEngine: asRichTextSyncEngine(syncEngine),
-		useDocChannel: options?.useDocChannel,
-		user: options?.user,
-	})
+	const current = writable(create())
+	let destroyed = false
+	if (isPendingStore(context.store) && context.app) {
+		// The provider rendered before the store opened: no sync engine yet. Rebuild once it is
+		// open (the provider's own `then` ran first, so the context holds the engine now).
+		context.app.ready.then(
+			() => {
+				if (destroyed) return
+				const previous = get(current)
+				current.set(create())
+				previous.destroy()
+			},
+			() => {},
+		)
+	}
 
 	onDestroy(() => {
-		controller.destroy()
+		destroyed = true
+		get(current).destroy()
 	})
 
-	const resultStore = readable<UseRichTextResult>(buildResult(controller), (set) => {
-		const sync = (): void => {
-			set(buildResult(controller))
+	const resultStore = readable<UseRichTextResult>(buildResult(get(current)), (set) => {
+		let stopController = (): void => {}
+		const stopCurrent = current.subscribe((controller) => {
+			stopController()
+			const sync = (): void => {
+				set(buildResult(controller))
+			}
+			sync()
+			stopController = controller.subscribe(sync)
+		})
+		return () => {
+			stopController()
+			stopCurrent()
 		}
-		sync()
-		return controller.subscribe(sync)
 	})
+	const controller = (): ReturnType<typeof createRichTextController> => get(current)
 
 	return {
 		get doc() {
-			return controller.doc
+			return controller().doc
 		},
 		get text() {
-			return controller.text
+			return controller().text
 		},
-		undo: () => controller.undo(),
-		redo: () => controller.redo(),
+		undo: () => controller().undo(),
+		redo: () => controller().redo(),
 		get ready() {
 			return get(resultStore).ready
 		},
@@ -76,13 +108,13 @@ export function createRichTextBinding(
 		get cursors() {
 			return get(resultStore).cursors
 		},
-		setCursor: (anchor: number, head: number) => controller.setCursor(anchor, head),
-		clearCursor: () => controller.clearCursor(),
+		setCursor: (anchor: number, head: number) => controller().setCursor(anchor, head),
+		clearCursor: () => controller().clearCursor(),
 		get hasUnsavedChanges() {
 			return get(resultStore).hasUnsavedChanges
 		},
-		retrySave: () => controller.retrySave(),
-		getUnsavedState: () => controller.getUnsavedState(),
+		retrySave: () => controller().retrySave(),
+		getUnsavedState: () => controller().getUnsavedState(),
 		subscribe: resultStore.subscribe,
 	}
 }
