@@ -59,6 +59,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `allowedOrigins` | | Other origins whose pages may call `httpRoutes` and `/health` from a browser engine. Always allowed: native app shells (Tauri's `tauri://localhost`, `http(s)://tauri.localhost`), the comma-separated `KORA_ALLOWED_ORIGINS`, and, outside production, `http://localhost` on any port. Never with credentials. |
 | `trustProxy` | `KORA_TRUST_PROXY` | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list; the variable takes the same, comma-separated); `request.ip` uses it. |
 | `maxRequestBodyBytes` | 1 MiB | Larger bodies of custom routes get `413` before they are buffered. |
+| `maxConcurrentRequestBodies` | 128 | Custom route bodies read at once; past it a request with a body gets `503` with `Retry-After`. Each body must also arrive at a minimum rate (2 s plus 1 s per KiB, at most 30 s), or it gets `408` and the connection is closed. |
 | `maxBackupBytes` | 256 MiB | Largest backup import. |
 | `crossOriginEmbedderPolicy` | `'credentialless'` | COEP header for the served app. |
 

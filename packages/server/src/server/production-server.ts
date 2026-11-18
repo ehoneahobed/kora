@@ -10,7 +10,7 @@ import {
 import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
 import { addressBucket } from '../read/address-bucket'
-import { readBodyDeadlineMs } from '../read/read-body-deadline'
+import { readBodyDeadlineMs, routeBodyDeadlineMs } from '../read/read-body-deadline'
 import type { BlobChunkRelayStats } from '../richtext/blob-chunk-relay'
 import { BackupIntegrityError } from '../store/server-backup'
 import type { FullResyncTarget, ServerStore } from '../store/server-store'
@@ -110,6 +110,14 @@ export interface ProductionServerConfig {
 	 * Defaults to 1 MiB.
 	 */
 	maxRequestBodyBytes?: number
+	/**
+	 * Most custom route bodies (`httpRoutes`) read at once. Past it a request with a body is
+	 * answered 503 with `Retry-After`, so slow uploads cannot pile up. Each body must also
+	 * arrive at a minimum rate (2 s plus 1 s per KiB, at most 30 s), or it is answered 408 and
+	 * the connection is closed.
+	 * @default 128
+	 */
+	maxConcurrentRequestBodies?: number
 	/**
 	 * Largest backup accepted by `/__kora/backup/import`, in bytes. Defaults to 256 MiB.
 	 */
@@ -564,6 +572,8 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 	}
 
 	const maxRequestBodyBytes = config.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+	const maxConcurrentRequestBodies = config.maxConcurrentRequestBodies ?? 128
+	let routeBodiesInFlight = 0
 	const maxBackupBytes = config.maxBackupBytes ?? DEFAULT_MAX_BACKUP_BYTES
 
 	/**
@@ -1225,7 +1235,48 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 
 				// ── Custom HTTP routes (auth, webhooks, app APIs) ─────────────
 				if (customRoute) {
-					const parsed = await readJsonBody(req)
+					const hasBody =
+						req.headers['transfer-encoding'] !== undefined ||
+						Number(req.headers['content-length'] ?? 0) > 0
+					if (hasBody && routeBodiesInFlight >= maxConcurrentRequestBodies) {
+						res.writeHead(503, {
+							'Content-Type': 'application/json',
+							'Retry-After': '1',
+							Connection: 'close',
+						})
+						res.end(JSON.stringify({ error: 'Too many requests in progress. Retry shortly.' }))
+						req.resume()
+						return
+					}
+					let parsed: Awaited<ReturnType<typeof readJsonBody>> | 'timeout'
+					if (hasBody) {
+						routeBodiesInFlight += 1
+						let timer: ReturnType<typeof setTimeout> | undefined
+						try {
+							parsed = await Promise.race([
+								readJsonBody(req),
+								new Promise<'timeout'>((resolve) => {
+									timer = setTimeout(
+										() => resolve('timeout'),
+										routeBodyDeadlineMs(Number(req.headers['content-length'])),
+									)
+								}),
+							])
+						} finally {
+							clearTimeout(timer)
+							routeBodiesInFlight -= 1
+						}
+					} else {
+						parsed = await readJsonBody(req)
+					}
+					if (parsed === 'timeout') {
+						// Too slow: answer, then close the connection (the rest is not waited for).
+						res.writeHead(408, { 'Content-Type': 'application/json', Connection: 'close' })
+						res.end(JSON.stringify({ error: 'The request body was not received in time.' }), () =>
+							req.destroy(),
+						)
+						return
+					}
 					if (parsed.tooLarge) {
 						rejectTooLarge(req, res, maxRequestBodyBytes)
 						return

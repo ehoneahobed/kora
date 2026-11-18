@@ -17,3 +17,22 @@ export function readBodyDeadlineMs(contentLength: number): number {
 	if (!Number.isFinite(contentLength) || contentLength < 0) return READ_BODY_TIMEOUT_MS
 	return Math.min(READ_BODY_TIMEOUT_MS, READ_BODY_GRACE_MS + Math.ceil(contentLength / 1024) * 1000)
 }
+
+/** The longest a custom route (auth, webhooks, app APIs) may take to deliver its body. */
+export const ROUTE_BODY_TIMEOUT_MS = 30_000
+
+/**
+ * {@link readBodyDeadlineMs} for custom route bodies, which may be larger (up to
+ * `maxRequestBodyBytes`): the same grace and minimum rate, never more than
+ * {@link ROUTE_BODY_TIMEOUT_MS}.
+ *
+ * @param contentLength - The parsed `Content-Length` header, if any
+ * @returns Milliseconds
+ */
+export function routeBodyDeadlineMs(contentLength: number): number {
+	if (!Number.isFinite(contentLength) || contentLength < 0) return ROUTE_BODY_TIMEOUT_MS
+	return Math.min(
+		ROUTE_BODY_TIMEOUT_MS,
+		READ_BODY_GRACE_MS + Math.ceil(contentLength / 1024) * 1000,
+	)
+}

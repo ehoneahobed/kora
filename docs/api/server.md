@@ -52,6 +52,7 @@ const url = await server.start()
 | `crossOriginEmbedderPolicy` | `'credentialless'` |
 | `trustProxy` | `KORA_TRUST_PROXY`, else off: `request.ip` is the socket address unless the proxy is trusted |
 | `maxRequestBodyBytes` | 1 MiB for `httpRoutes` bodies (larger requests get 413) |
+| `maxConcurrentRequestBodies` | 128 `httpRoutes` bodies read at once (more get 503 with `Retry-After`); each must arrive at 2 s plus 1 s per KiB, at most 30 s (slower gets 408 and the connection closes) |
 | `maxBackupBytes` | 256 MiB for `/__kora/backup/import` |
 
 The handle (`ProductionServer`) has `start()` (resolves to the URL), `stop()`, `kora` (the
