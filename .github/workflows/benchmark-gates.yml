@@ -58,6 +58,9 @@ jobs:
           pnpm turbo run build --filter=@korajs/store...
           echo "dir=../kora-base" >> "$GITHUB_OUTPUT"
 
+      - name: Head-vs-base decision tests
+        run: pnpm test:scripts
+
       - name: Head vs base regression check (fails above 10%)
         if: steps.base.outputs.dir != ''
         run: node scripts/bench/ab-regression.mjs --base ${{ steps.base.outputs.dir }} --head . --runs 5
