@@ -27,3 +27,30 @@ describe('parity contract: the tail gate', () => {
 		expect(evaluateCell('P6', 'cold', baseline, [200, 210, 220, 230, 240]).pass).toBe(false)
 	})
 })
+
+/**
+ * A returning device shows first data once SQLite WASM has loaded and its database is open
+ * (design doc, Known limits). Nightly 44343962064 on main measured these cells; the allowance
+ * covers them until a local snapshot of the first screen removes the wait.
+ */
+describe('parity contract: warm first data allowance', () => {
+	const cells: Array<[string, number, number[], number[]]> = [
+		['broadband 1x', 1, [168, 170, 171, 172, 176], [470, 475, 478, 480, 485]],
+		['4g 4x', 4, [475, 477, 478, 479, 479], [1060, 1065, 1067, 1070, 1077]],
+		['broadband 4x', 4, [368, 370, 371, 372, 375], [976, 979, 981, 983, 985]],
+	]
+	test.each(cells)('the measured %s cell passes', (_name, cpu, baselineRuns, koraRuns) => {
+		for (const metric of ['P2', 'P3'] as const) {
+			expect(evaluateCell(metric, 'warm', baselineRuns, koraRuns, cpu).pass).toBe(true)
+		}
+	})
+
+	test('a warm start clearly slower than that still fails', () => {
+		expect(
+			evaluateCell('P2', 'warm', [368, 370, 371, 372, 375], [1300, 1310, 1320, 1330, 1340], 4).pass,
+		).toBe(false)
+		expect(
+			evaluateCell('P2', 'warm', [168, 170, 171, 172, 176], [600, 610, 620, 630, 640], 1).pass,
+		).toBe(false)
+	})
+})
