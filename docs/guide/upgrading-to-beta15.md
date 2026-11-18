@@ -92,8 +92,23 @@ Nothing about the startup *re-fold* changes for a beta.14 database. If you are u
 next start will rebuild, `kora doctor --db` prints the estimate before you deploy
 ([Startup re-materialization](/guide/production-server#startup-re-materialization-upgrading-from-beta-12-or-changing-merge-rules)).
 
-A server restored or rolled back to beta.14 after beta.15 has run on the same database is **not
-tested**. Back up before the upgrade, as above.
+### Rolling back
+
+Rolling back to beta.14 on a database beta.15 has used is **not supported**, on the server or on
+devices:
+
+- **Server.** beta.15 adds the tables and columns above, and beta.14 has never been tested on a
+  database that holds them. To go back, restore the backup taken before the upgrade, and accept
+  that operations uploaded since are lost from the server (devices that still hold them unsynced
+  upload them again).
+- **Devices.** beta.15 introduces the storage-format guard (`StorageFormatAheadError`,
+  `store:format-ahead`): from now on, older code refuses a browser database a newer format wrote
+  ([App updates](/guide/app-updates)). beta.14 predates the guard, so a beta.14 build reopened on
+  a database beta.15 migrated would open it without that check. Do not redeploy a beta.14 build of
+  the app once beta.15 has shipped to users; fix forward instead.
+
+Rolling back between later releases (beta.15 onward) is covered by the guard: a release that does
+not change the storage format can be rolled back by redeploying the previous build.
 
 ### Scopes that name fields the schema does not declare
 

@@ -925,6 +925,49 @@ the upgrade.
   node ids (`SELECT DISTINCT node_id FROM operations` lists them) before they
   reconnect, accepting that the first principal to present a released node id gets it.
 
+## The delivery visibility index
+
+The server files each operation under the fields that scopes and access rules read, so a
+handshake, a resume and live delivery read only what a session can see instead of scanning the
+whole log. The index only narrows what is read: the session's filter stays the only authority on
+what a device receives, so a field missing from the index costs speed, never correctness.
+
+Fields are included automatically from the schema's `scope` and `sync` declarations and from every
+field an access read rule names. A `TokenAuthProvider` scope is an arbitrary map the server cannot
+infer, so declare the fields it grants on with `deliveryPartitions` (collection name to field
+names):
+
+<!-- docs-check-prelude
+import type { AuthProvider } from '@korajs/server'
+declare const auth: AuthProvider
+-->
+
+```typescript
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+
+const server = createProductionServer({
+  store: createSqliteServerStore({ filename: './.kora/kora-server.db' }),
+  syncOptions: {
+    auth,
+    deliveryPartitions: { lessons: ['schoolId'] },
+  },
+})
+```
+
+- **A scope on a field outside the index** is read collection by collection and logged once per
+  collection and field as `delivery.partition_miss` (`details: { collection, field }`). Add the
+  field to `deliveryPartitions` to get the fast path.
+- **Building and rebuilding.** A database without the index (one upgraded from beta.14), or one
+  whose fields changed (a schema change, an access-rules deploy, a different `deliveryPartitions`),
+  is indexed in the background in chunks of 5,000 operations. Until it is complete, sessions use
+  the global scan, so delivery is correct throughout, only slower on a large log.
+- **The list is remembered.** The store records the `deliveryPartitions` it was last given, so a
+  restart, or a script that opens the store without being told the list, keeps the index instead of
+  rebuilding it.
+- **Wide grants.** A read with more than 256 sources (partition keys, collections and nodes
+  together) collapses `$in` grants to their collection and, if that is still too many, uses the
+  global scan.
+
 ## Gap-free delivery and the delivery-sequence migration
 
 The server guarantees that once an operation is in its log, it reaches every client whose scope includes it and is never silently skipped, across dropped messages, reconnects, client restarts, and scoped sync. This is driven by a server-assigned delivery sequence and a per-client delivery watermark, and it needs no configuration. The guarantee and its client-side behavior are described in [Sync configuration: delivery guarantees](./sync-configuration.md#delivery-guarantees), and the wire fields in [Sync Protocol](./sync-protocol.md#delivery-watermark).
