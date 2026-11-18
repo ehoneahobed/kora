@@ -4,8 +4,9 @@ import { describe, expect, test } from 'vitest'
 
 /**
  * Repository-wide documentation checks: every published package ships a README, and every
- * error code a Kora error is constructed with is listed in docs/api/errors.md (the page the
- * `fix` hints and the troubleshooting guide point at).
+ * error code in the source is listed in docs/api/errors.md (the page the `fix` hints and the
+ * troubleshooting guide point at). Codes are read from KoraError constructions and, in files
+ * that define a KoraError subclass, from `code: 'LITERAL'` sites (event and result codes too).
  */
 const root = resolve(__dirname, '../..')
 
@@ -42,13 +43,22 @@ function argumentText(source: string, open: number): string {
 }
 
 /** Codes passed to KoraError: `super(message, 'CODE', ...)` in a subclass, or `new KoraError(...)`. */
-export function koraErrorCodes(source: string): string[] {
+function koraErrorCodes(source: string): string[] {
 	if (!source.includes('KoraError')) return []
 	const codes: string[] = []
 	for (const match of source.matchAll(/\b(?:super|new KoraError)\s*\(/g)) {
 		const args = argumentText(source, (match.index ?? 0) + match[0].length - 1)
 		const code = /^[\s\S]*?,\s*'([A-Z][A-Z0-9_]{2,})'/.exec(args)?.[1]
 		if (code) codes.push(code)
+	}
+	// A subclass that takes its code as a parameter typed by a literal union
+	// (`code: 'STAMP_USER_UNKNOWN' | 'STAMP_MISMATCH'`).
+	if (/extends KoraError\b/.test(source)) {
+		for (const match of source.matchAll(/\bcode\??:\s*((?:'[A-Z][A-Z0-9_]{2,}'\s*\|?\s*)+)/g)) {
+			for (const literal of (match[1] ?? '').matchAll(/'([A-Z][A-Z0-9_]{2,})'/g)) {
+				if (literal[1]) codes.push(literal[1])
+			}
+		}
 	}
 	return codes
 }
@@ -62,7 +72,7 @@ describe('repository documentation', () => {
 		expect(missing).toEqual([])
 	})
 
-	test('every KoraError code in the source is listed in docs/api/errors.md', () => {
+	test('every error code in the source is listed in docs/api/errors.md', () => {
 		const docs = readFileSync(join(root, 'docs/api/errors.md'), 'utf8')
 		const missing = new Set<string>()
 		for (const dir of packageDirs()) {
@@ -87,7 +97,12 @@ describe('repository documentation', () => {
 				)
 			}
 		}
-		throw new KoraError('Plain', 'OTHER_CODE')`
-		expect(koraErrorCodes(source)).toEqual(['SOME_CODE', 'OTHER_CODE'])
+		throw new KoraError('Plain', 'OTHER_CODE')
+		class B extends KoraError {
+			constructor(message: string, code: 'FIRST_CODE' | 'SECOND_CODE') {
+				super(message, code)
+			}
+		}`
+		expect(koraErrorCodes(source)).toEqual(['SOME_CODE', 'OTHER_CODE', 'FIRST_CODE', 'SECOND_CODE'])
 	})
 })

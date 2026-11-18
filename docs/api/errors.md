@@ -5,8 +5,8 @@ description: "Every Kora.js error code: the error class, what causes it, and how
 
 # Error Codes
 
-Every error Kora throws extends `KoraError` (from `@korajs/core`), except `BlobIntegrityError`,
-`TauriAdapterError` and `TauriStoreNotOpenError` (plain `Error` subclasses), and carries a stable `code` and a
+Every error Kora throws extends `KoraError` (from `@korajs/core`), except `BlobIntegrityError`
+(a plain `Error` subclass), and carries a stable `code` and a
 `context` object with the details (collection, field, record id, ...). Match on `code`, not on the
 message.
 
@@ -55,6 +55,19 @@ example `HELD_ASSIGN_NO_USER`). Codes that reach the app as events (`sync:operat
 | `MIGRATION_ROLLBACK` | `MigrationRollbackError` | A migration step has no automatic inverse (`removeField` without a builder, `backfill` without a reverse transform). | Add `.down(...)`, the old field builder, or a reverse transform. |
 | `STORAGE_ERROR`, `SYNC_ERROR` | `StorageError`, `SyncError` | Generic storage or sync failures; see `message` and `context.code`. | Depends on `context.code` (below). |
 | `MERGE_CONFLICT`, `CLOCK_DRIFT` | `MergeConflictError`, `ClockDriftError` | Defined but not thrown in 1.0.0-beta.13: merges never fail, and a drifting clock is reported (`onDriftWarning`, `sync:clock-skew`) instead of blocking writes. | |
+| `ACCESS_NOT_LOADED` | `AccessNotLoadedError` | `schema.access` read before the runtime loaded: production browser builds compile access rules when the runtime loads. | Read it after `await app.ready`. |
+| `APP_CLOSED` | `KoraError` | The app was closed while the runtime was still loading (a reload for new build files was pending). | None; open the app again. |
+| `RUNTIME_LOAD_FAILED` | `KoraError` | The Kora runtime chunk could not be loaded, usually because the app was redeployed and this tab holds the old build's files. | Reload the page. |
+| `AUTH_CLIENT_LOAD_FAILED` | `AuthClientLoadError` | The lazily loaded sign-in client (`lazyAuthSync`) failed to load. | Reload; check the network and that the build includes `@korajs/auth`. |
+| `SYNC_NOT_CONFIGURED` | `KoraError` | A sync call on an app created without `sync`. | Pass `sync: { url }` to `createApp`. |
+| `INVALID_SYNC_URL`, `INVALID_SYNC_CONFIG`, `INVALID_ENCRYPTION_CONFIG`, `MISSING_WORKER_URL` | `KoraError` | `createApp` config validation: an empty or malformed `sync.url`, an unknown `sync.unassignedWrites`, an invalid `sync.encryption.keyring` name (1 to 128 characters of `[A-Za-z0-9._:-]`), or browser storage without `store.workerUrl`. | See `error.fix`. |
+| `ENCRYPTION_DISABLED` | `KoraError` | An `app.encryption` call on an app without `sync.encryption`. | Configure [sync encryption](/guide/sync-encryption). |
+| `STORAGE_UNSUPPORTED` | `KoraError` | `app.storage.deleteDatabase()` on a server or Node store, which are files you manage. | Delete the file directly. |
+| `WRITE_NOT_APPLIED` | `KoraError` | A write made before `app.ready` could not be applied once the app opened (the message says why, for example the store failed to open). | See the cause; write again after `app.ready`. |
+| `JOURNAL_TIMEOUT`, `JOURNAL_DELETE_BLOCKED` | `JournalTimeoutError`, `KoraError` | The pre-ready write journal could not be read or written in time, or could not be deleted because another tab keeps it open. | Close other tabs of the app and retry. |
+| `OFFLINE_PIN_RELEASED` | `KoraError` | A pin's completion promise, when the pin was released before it completed. | None; keep the collection again if needed. |
+| `KORA_NOT_PROVIDED` | `KoraError` | A Kora hook or component used outside `KoraProvider`, or a provider given neither `app` nor `store`. | Wrap the tree in `KoraProvider` with `app={app}`. |
+| `RICHTEXT_NOT_BOUND` | `KoraError` | Vue `useRichText()` used after its component scope was disposed. | Call it in a live component's `setup`. |
 
 ## Store {#store}
 
@@ -87,6 +100,21 @@ example `HELD_ASSIGN_NO_USER`). Codes that reach the app as events (`sync:operat
 | `BLOB_CHUNK_UNAVAILABLE` | `BlobTransferError` | No reachable peer or server holds the chunk, or may share it with this device. | Pull again when the author's device is online, or enable server blob storage (`resolveBlobChunk` / `persistBlobChunk`). |
 | `BLOB_CHUNK_CANCELLED` | `BlobTransferError` | The app (or the chunk provider) closed while a pull waited. | Pull again after reopening. |
 | `NODE_OWNED_BY_ANOTHER_USER` | `NodeOwnedByAnotherUserError` | A local write while the store's pinned node (the auth device id) belongs to another user than the one signed in, on a browser two users share, or after the sync server refused the pinned node as another user's. It would upload as the device owner's, so it is refused (F9). | Sign in as the device's owner, or use the account on its own device. |
+| `STORE_READ_ONLY` | `StoreReadOnlyError` | A write while the app is read-only: the app called `app.setReadOnly(reason)`, and `context.reason` holds that reason. | Call `app.setReadOnly(null)` to allow writes again. |
+| `LOCAL_DATABASE_NOT_FOUND` | `LocalDatabaseNotFoundError` | `app.storage` opened a database by name that does not exist on this origin. | Check the name with `app.storage.listDatabases()`. |
+| `STAMP_MISMATCH`, `STAMP_USER_UNKNOWN` | `StampedFieldError` | An insert names another user in a `.stamp('userId')` field, or the device does not know who is signed in yet. | Leave stamped fields out; configure `sync.authClient`. See [access rules](/guide/access-rules). |
+| `OVERLAY_DIVERGED` | `OverlayDivergedError` | Test builds only (`NODE_ENV=test`): an instant update predicted a record differently from what the database stored, so a prediction bug fails the app's own tests. Production builds emit `store:overlay-diverged` and show the database's value. | Report it with the collection and fields it names. |
+| `REMOTE_BATCH_READ_ONLY` | `KoraError` | A remote batch handler wrote through its read view. | Write through the batch. |
+| `TRANSACTION_COMMITTED`, `TRANSACTION_ROLLED_BACK` | `KoraError` | A transaction used after it committed, or committed after it rolled back. | Keep writes inside the transaction callback. |
+| `JOURNAL_ALREADY_APPLIED` | `KoraError` | A journaled write was applied by another tab first. | None; the write is in the database. |
+| `MIGRATION_UNKNOWN_COLLECTION`, `MIGRATION_UNKNOWN_FIELD` | `KoraError` | A migration backfill names a collection the schema lacks, or returns a field it lacks. | Fix the migration. |
+| `NODE_ID_PINNED`, `NODE_ID_UNKNOWN`, `TIMESTAMP_TAKEN`, `NODE_REPAIR_IN_PROGRESS` | `KoraError` | Node repair: the sync server refused the node id (`NODE_ID_CLAIMED`) but it is pinned (`StoreConfig.nodeId` or per-tab isolation) so it cannot move to a fresh one; the node to re-author is not a local node of this database; a re-authored timestamp is taken; or another tab is repairing the node. | Pinned: give each copy of the database its own node id. In progress: close other tabs. Otherwise report it. |
+| `BLOB_MANIFEST_MISSING`, `BLOB_CHUNK_MISSING`, `INVALID_BLOB_MANIFEST`, `INVALID_CHUNK_SIZE` | `KoraError` | Blob transfer: a reference without a manifest, a manifest whose chunk is not stored, a malformed manifest, or `chunkBlob` with a non-positive size. | Store blobs with `app.blobs.put`; pull again. |
+| `OPFS_UNAVAILABLE` | `KoraError` | The OPFS blob store outside a browser with Origin Private File System support. | Use `MemoryBlobStore` or a server-side store. |
+| `OBJECT_STORE_ERROR` | `ObjectStoreError` | An S3-compatible blob store request failed (`status` holds the HTTP status). | Check the bucket, credentials and endpoint. |
+| `INVALID_AUDIT_EXPORT`, `INVALID_RICHTEXT_VALUE` | `KoraError` | An audit import without its manifest, or a rich-text value that is not a string, bytes, `null` or `undefined`. | Import an unmodified export; pass a supported value. |
+| `DELIVERY_BATCH_WRITE_FAILED`, `STAGING_UNAVAILABLE`, `STAGING_CLOCK_NOT_ADOPTED`, `SEED_PURGE_FAILED`, `SEED_ORPHANED` | `store:persistence-error` | A delivered batch failed to write in the shared write buffer (it is retried); the staging database did not open (sync applies directly); the clock did not adopt the newest staged time; seeded records could not be cleared; seeded records have no server history and keep their snapshot. | Check storage health if it repeats. |
+| `STALE_STORE_WRITE`, `WRITE_INCOMPLETE`, `SEQUENCE_RESERVATION_FAILED`, `STAGING_UNMERGEABLE` | `KoraError` | Internal: rolls back a write whose delivery position moved, a write transaction without a result, a failed sequence reservation, a staged replica that cannot merge (sync then replicates directly). | None; report one that reaches your code. |
 
 ## Sync client {#sync}
 
@@ -149,6 +177,7 @@ validator that throws is reported as a retriable `VALIDATION_ERROR`.
 | `PLAINTEXT_REJECTED` | A plaintext operation where the server requires encryption. | Enable `sync.encryption` on the client. |
 | `SCHEMA_TRANSFORM_UNAVAILABLE`, `SCHEMA_TRANSFORM_INVALID` | No transform from the operation's schema version, or a transform broke its contract. | Register the transform on the server. |
 | `BLOB_REFERENCE_FORBIDDEN`, `BLOB_QUOTA_EXCEEDED`, `BLOB_CHUNK_TOO_LARGE` | A `t.blob()` reference to content the user may not read, or over the blob limits. | Upload the bytes first; check `blobLimits`. |
+| `ACCESS_DENIED`, `SERVER_OWNED`, `IMMUTABLE_ACCESS_FIELD`, `GROUP_EXISTS`, `STAMP_REQUIRED`, `STAMP_MISMATCH` | The schema's [access rules](/guide/access-rules#refusals) refuse the write. | See the access-rules table. |
 | your codes | `validateOperation` returned `{ action: 'reject', code }`. | App-defined. |
 
 Route writes report the same codes in `{ ok: false, code }`; `applyConditional` adds
@@ -191,6 +220,17 @@ Sent before closing or refusing a session (`sync:disconnected`, `sync:auth-faile
 | `ACCESS_INDEX_NOT_READY` | `SyncError` (code in `context.code`) | `server.access.roleOf` or `tx.roleOf` while the membership index is rebuilt (a schema install, a transform change or a restore, on any instance) or after a rebuild failed part-way. Retriable. | Try again shortly; after a failure, complete the restore or restart the server with the schema. |
 | `INVALID_DIAGNOSTIC_OPTIONS` | `InvalidDiagnosticOptionsError` | `findJsonStringValues` got a `pageSize` that is not a positive integer or a `sampleSize` that is not a non-negative one. | Pass whole numbers (`pageSize` at least 1). |
 | `IN_MEMORY_AUTH_STORE` | `InMemoryAuthStoreError` (`@korajs/auth/server`) | `createKoraAuthServer` with in-memory user or revocation stores under `NODE_ENV=production`. | Use `createSqliteUserStore` / `createPostgresUserStore`, or `allowInMemory: true` deliberately. |
+| `SERVER_STORE_UNAVAILABLE` | `ServerStoreUnavailableError` | The PostgreSQL server store could not start (the connection string is redacted in the message). | Check the database is reachable and the credentials. |
+| `TRANSACTION_CONFLICT` | `TransactionConflictError` | Another connection kept writing to the SQLite server database; the transaction was retried without committing. | Retry, or run one server process per database file. |
+| `ROUTE_TRANSACTION_REENTRY` | `RouteTransactionReentryError` | A write started inside `kora.transaction()`. | Return mutations from the decision (`prepareGrant`, `prepareRevoke`). |
+| `ACCESS_API_ERROR` | `AccessApiError` | A `server.access` call names something the schema does not declare. | Use the schema's access names. |
+| `INVALID_REFRESH_SCOPES_USER`, `INVALID_RESYNC_TARGET`, `INVALID_TERMINATE_FILTER` | `KoraError` | `refreshScopes` without a user id; `forceFullResync` or `terminateSessions` without a user or device (it refuses to act on every device). | See `error.fix`. |
+| `FULL_RESYNC_UNSUPPORTED` | `KoraError` | `forceFullResync` on a server store that lacks the methods it needs. | Use the SQLite or PostgreSQL server store. |
+| `REFOLD_INCOMPLETE` | `KoraError` | Some records written under an older fold plan could not be re-folded; the server keeps retrying. | Check the server log for the record ids. |
+| `READ_AUTH_TIMEOUT` | `ReadAuthTimeoutError` | The auth provider did not answer a read-through request in time. | Check the auth provider's latency. |
+| `DEVICE_STATUS_WRITE_FAILED` | `store:persistence-error` (server) | Recording a device's sync status failed. | Check the server store's health. |
+| `NOT_EXPIRED`, `DELIVERY_STREAM_INTERRUPTED` | | Internal: an expiry sweep found a membership extended meanwhile (it stays); a delivery pass stopped for a retransmission. | None. |
+| `SPACES_CONFIG_INVALID` | `SpacesConfigError` (`@korajs/spaces`) | `spacesCollections` got a configuration it cannot share safely. | See the message. |
 
 ## Auth {#auth}
 
@@ -230,6 +270,12 @@ client's flow; `OAUTH_CODE_EXCHANGE_FAILED`; `OAUTH_USER_INFO_FAILED`; `OAUTH_PR
 `ADMIN_UNAUTHORIZED`, `WEBHOOK_ENDPOINT_NOT_FOUND`, `WEBHOOK_TARGET_REFUSED`: the webhook URL is not
 public `https`). See the [Auth API reference](/api/auth#errors).
 
+More auth codes: `ADMIN_REVOCATION_UNAVAILABLE` (`AdminRevocationUnavailableError`: `AdminApi` cannot
+revoke tokens because the user store has no revocation store; pass `revokeAllForUser`),
+`APP_SIGNER_INVALID` (`AppSignerError`: a mistake in the app's signer setup, never a visitor's token),
+and the route codes `UNAUTHENTICATED` (sending a verification email while signed out) and
+`USER_NOT_FOUND` (a verification email for a user that no longer exists).
+
 ## CLI and Tauri {#cli}
 
 | Code | Class | Cause | Fix |
@@ -242,3 +288,7 @@ public `https`). See the [Auth API reference](/api/auth#errors).
 | `CLI_ERROR` | `CliError` | Other CLI failures. | See the message. |
 | `TAURI_ADAPTER_ERROR`, `STORE_NOT_OPEN` | `TauriAdapterError`, `TauriStoreNotOpenError` | The Tauri SQLite plugin failed or the database is not open. | Check the `kora-sqlite:default` capability and the plugin build. |
 | `TAURI_DATABASE_IN_USE` | `TauriDatabaseInUseError` | `deleteTauriDatabase` was called while the app has that database open. | Close the app's store first, or use `app.storage.deleteDatabase()`. |
+| `DATA_TRANSFER_ERROR` | `DataTransferError` | `kora export` or `kora import` met a damaged file or a bundle the destination refused. | Follow the message. |
+| `DOCTOR_DATABASE_ERROR` | `DoctorDatabaseError` | `kora doctor` could not use the database URL (unknown scheme, missing file, missing driver). | Check the URL; install the driver it names. |
+| `KORA_CLOUD_SIGN_IN_REQUIRED` | `KoraCloudSignInRequiredError` | Not signed in to Kora Cloud, or the sign-in ended. | Run `kora login`, or set `KORA_CLOUD_TOKEN` in CI. |
+| `KORA_CLOUD_ERROR` | `KoraCloudError` | Kora Cloud refused a request or could not be reached (`cloudCode` and `status` hold its answer). | Follow the platform's message. |

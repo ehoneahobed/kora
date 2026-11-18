@@ -10,46 +10,53 @@ pnpm add korajs@beta @korajs/svelte@beta
 
 ## Setup
 
-Create the Kora app at module scope, connect sync after `ready`, then mount a root layout with provider components (matches the CLI `svelte-sync` template):
+Create the Kora app at module scope, connect sync, then mount a root component with `KoraProvider`. This follows the CLI `svelte-tailwind-sync` template:
 
-<!-- docs-check: skip template excerpt: imports the project's own auth and schema modules -->
+<!-- docs-check: skip template excerpt: imports the project's own auth, schema and component modules -->
 ```typescript
 // main.ts
-import { createKoraAuthSync } from '@korajs/auth'
-import { createApp as createKoraApp } from 'korajs'
+import { createApp as createKoraApp, lazyAuthSync } from 'korajs'
 import { mount } from 'svelte'
 import Root from './Root.svelte'
-import { authClient } from './auth'
 import schema from './schema'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
 
 const kora = createKoraApp({
   schema,
-  sync: { url: 'ws://localhost:3001/kora-sync', authClient: createKoraAuthSync({ authClient, schema }) },
+  sync: {
+    url: import.meta.env.VITE_SYNC_URL,
+    // The sign-in client loads after the first paint; sync waits for it, the screen does not.
+    authClient: lazyAuthSync(() => import('./auth').then((m) => m.authSync)),
+  },
   store: { workerUrl: koraWorkerUrl },
 })
 
-kora.ready.then(() => kora.sync?.connect())
+void kora.sync?.connect()
 
-mount(Root, { target: document.getElementById('app')!, props: { kora, authClient } })
+mount(Root, { target: document.getElementById('app')!, props: { kora } })
 ```
 
 ```svelte
 <!-- Root.svelte -->
 <script lang="ts">
-  import AuthProvider from '@korajs/auth/svelte/AuthProvider.svelte'
+  import type { KoraAppLike } from '@korajs/svelte'
   import KoraProvider from '@korajs/svelte/KoraProvider.svelte'
   import App from './App.svelte'
 
-  let { kora, authClient } = $props()
+  const { kora }: { kora: KoraAppLike } = $props()
+  // The sign-in UI is not on the first paint's path: the screen renders from the local database.
+  const authBridge = import('./AuthBridge.svelte')
 </script>
 
-<AuthProvider client={authClient}>
-  <KoraProvider app={kora}>
-    <App />
-  </KoraProvider>
-</AuthProvider>
+<KoraProvider app={kora}>
+  <App />
+  {#await authBridge then bridge}
+    <bridge.default />
+  {/await}
+</KoraProvider>
 ```
+
+`./auth` exports `authSync = createKoraAuthSync({ authClient, schema })`. `AuthBridge.svelte` wraps the sign-in UI in `AuthProvider` (`@korajs/auth/svelte/AuthProvider.svelte`). `connect()` can be called at once: the request is remembered, and the socket opens while the local store does, once the sign-in client has loaded.
 
 Precompiled component JS is also published under `dist/components/` for non-Vite bundlers; the `svelte` export condition still resolves to source for Vite/SvelteKit.
 

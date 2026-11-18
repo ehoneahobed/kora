@@ -10,44 +10,45 @@ pnpm add korajs@beta @korajs/vue@beta
 
 ## Setup
 
-Create the Kora app once at module scope, connect sync after `ready`, then wrap your tree with providers (matches the CLI `vue-tailwind-sync` template):
+Create the Kora app once at module scope, connect sync, then wrap your tree in `KoraProvider`. This follows the CLI `vue-tailwind-sync` template:
 
-<!-- docs-check: skip template excerpt: imports the project's own auth and schema modules -->
+<!-- docs-check: skip template excerpt: imports the project's own auth, schema and component modules -->
 ```typescript
-import { createKoraAuthSync } from '@korajs/auth'
-import { AuthProvider } from '@korajs/auth/vue'
 import { KoraProvider } from '@korajs/vue'
-import { createApp as createKoraApp } from 'korajs'
-import { createApp, h } from 'vue'
+import { createApp as createKoraApp, lazyAuthSync } from 'korajs'
+import { createApp, defineAsyncComponent, h } from 'vue'
 import App from './App.vue'
-import { authClient } from './auth'
 import schema from './schema'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
 
+// The sign-in UI is not on the first paint's path: the screen renders from the local database.
+const AuthBridge = defineAsyncComponent(() => import('./AuthBridge'))
+
 const kora = createKoraApp({
   schema,
-  sync: { url: 'ws://localhost:3001/kora-sync', authClient: createKoraAuthSync({ authClient, schema }) },
+  sync: {
+    url: import.meta.env.VITE_SYNC_URL,
+    // The sign-in client loads after the first paint; sync waits for it, the screen does not.
+    authClient: lazyAuthSync(() => import('./auth').then((m) => m.authSync)),
+  },
   store: { workerUrl: koraWorkerUrl },
 })
 
-kora.ready.then(() => kora.sync?.connect())
+void kora.sync?.connect()
 
 createApp({
-  render: () =>
-    h(AuthProvider, { client: authClient }, () =>
-      h(KoraProvider, { app: kora }, () => h(App)),
-    ),
+  render: () => h(KoraProvider, { app: kora }, { default: () => [h(App), h(AuthBridge)] }),
 }).mount('#app')
 ```
 
-Or use SFC wrappers:
+`./auth` exports `authSync = createKoraAuthSync({ authClient, schema })`. `AuthBridge` mounts `AuthProvider` from `@korajs/auth/vue` around the sign-in UI. `connect()` can be called at once: the request is remembered, and the socket opens while the local store does, once the sign-in client has loaded.
+
+In an SFC:
 
 ```vue
-<AuthProvider :client="authClient">
-  <KoraProvider :app="kora">
-    <TodoList />
-  </KoraProvider>
-</AuthProvider>
+<KoraProvider :app="kora">
+  <TodoList />
+</KoraProvider>
 ```
 
 ## Composables
