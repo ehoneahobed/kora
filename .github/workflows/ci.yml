@@ -39,8 +39,10 @@ jobs:
       - name: Docs code blocks typecheck (DX-3)
         run: pnpm docs:check-code
 
+      # Scaffold, type-check and build both tutorial versions. The browser half (migration in
+      # real Chromium) runs in e2e.yml, which installs Chromium and passes --require-browser.
       - name: Getting Started tutorial against a scaffolded app (DX-3)
-        run: pnpm docs:check-tutorial
+        run: pnpm docs:check-tutorial --no-browser
 
       - name: Benchmark gates
         # Gates within the runner's speed variance only warn on shared runners; the
