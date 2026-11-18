@@ -53,8 +53,12 @@ Import the package once in your entry file. The import puts the adapter in the a
 
 ```typescript
 import '@korajs/tauri'
-import { createApp } from 'korajs'
-import schema from './schema'
+import { createApp, defineSchema, t } from 'korajs'
+
+const schema = defineSchema({
+  version: 1,
+  collections: { todos: { fields: { title: t.string() } } },
+})
 
 const app = createApp({ schema })
 ```
