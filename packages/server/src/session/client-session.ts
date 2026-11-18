@@ -189,6 +189,10 @@ import {
 import { DEFAULT_MAX_SYNC_QUERIES, checkSyncQueries } from './sync-queries-validation'
 
 /** Default of KoraSyncServerConfig.maxQueuedMessages. */
+/** Default of KoraSyncServerConfig.maxYjsUpdatesPerMinute. */
+export const DEFAULT_MAX_YJS_UPDATES_PER_MINUTE = 1200
+/** Default of KoraSyncServerConfig.maxYjsUpdateBytes. */
+export const DEFAULT_MAX_YJS_UPDATE_BYTES = 1024 * 1024
 export const DEFAULT_MAX_QUEUED_MESSAGES = 10_000
 /** Default of KoraSyncServerConfig.maxQueuedBytes. */
 export const DEFAULT_MAX_QUEUED_BYTES = 64 * 1024 * 1024
@@ -638,6 +642,12 @@ export interface ClientSessionOptions {
 	maxQueuedMessages?: number
 	/** Most bytes of frames held received but not handled (KoraSyncServerConfig.maxQueuedBytes). */
 	maxQueuedBytes?: number
+	/** Live rich-text updates relayed per minute (KoraSyncServerConfig.maxYjsUpdatesPerMinute). */
+	maxYjsUpdatesPerMinute?: number
+	/** Largest live rich-text update relayed (KoraSyncServerConfig.maxYjsUpdateBytes). */
+	maxYjsUpdateBytes?: number
+	/** The yjs budget's window (one minute; shorter only in tests). */
+	yjsUpdateWindowMs?: number
 	/**
 	 * Adjudicate untrusted client operations before materialization. When present,
 	 * each incoming operation is passed to this validator; a `reject` decision
@@ -1050,6 +1060,10 @@ export class ClientSession {
 	private rateLimiter: IngestRateLimiter
 	/** Separate budget for blob chunk requests (RT-24). */
 	private readonly blobRateLimiter: SessionRateLimiter
+	private readonly yjsRateLimiter: SessionRateLimiter
+	private readonly maxYjsUpdateBytes: number
+	/** Whether the client was told it is over its yjs budget since the budget last allowed one. */
+	private yjsThrottleNotified = false
 	/** Operations refused by the rate limiter (RT-6), for diagnostics. */
 	private rateLimitedOperations = 0
 	/** Batches refused whole for exceeding {@link maxOpsPerBatch} (RT-6). */
@@ -1131,6 +1145,11 @@ export class ClientSession {
 		}
 		this.maxOpsPerMinute = options.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE
 		this.rateLimiter = new SessionRateLimiter(this.maxOpsPerMinute)
+		this.yjsRateLimiter = new SessionRateLimiter(
+			options.maxYjsUpdatesPerMinute ?? DEFAULT_MAX_YJS_UPDATES_PER_MINUTE,
+			options.yjsUpdateWindowMs ?? 60_000,
+		)
+		this.maxYjsUpdateBytes = options.maxYjsUpdateBytes ?? DEFAULT_MAX_YJS_UPDATE_BYTES
 		this.blobRateLimiter = new SessionRateLimiter(
 			options.maxBlobRequestsPerMinute ?? DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
 			options.blobRequestWindowMs ?? 60_000,
@@ -7448,6 +7467,29 @@ export class ClientSession {
 	 */
 	private async handleYjsDocUpdate(msg: YjsDocUpdateMessage): Promise<void> {
 		if (!this.onYjsDocUpdate) return
+		// Bounded before anything costs a read or a fan-out. Live updates only: rich text also
+		// syncs as operations, so a dropped one loses nothing durable.
+		const bytes = Math.floor((msg.update.length * 3) / 4)
+		if (bytes > this.maxYjsUpdateBytes) {
+			this.sendError(
+				'YJS_UPDATE_TOO_LARGE',
+				`A live rich-text update of ${String(bytes)} bytes is over the server's ${String(this.maxYjsUpdateBytes)}-byte limit; it was not relayed.`,
+				false,
+			)
+			return
+		}
+		if (!this.yjsRateLimiter.allow(1)) {
+			if (!this.yjsThrottleNotified) {
+				this.yjsThrottleNotified = true
+				this.sendError(
+					'YJS_UPDATE_THROTTLED',
+					`More than ${String(this.yjsRateLimiter.limit)} live rich-text updates a minute: further ones are dropped for ${String(this.yjsRateLimiter.retryAfterMs())} ms.`,
+					true,
+				)
+			}
+			return
+		}
+		this.yjsThrottleNotified = false
 		const stored = (await this.lookupRecordFields(msg.collection, msg.recordId)) ?? null
 		let decision = authorizeRecordWrite(msg.collection, msg.recordId, stored, this.uplinkScopes())
 		const access = this.store.getSchema()?.access
