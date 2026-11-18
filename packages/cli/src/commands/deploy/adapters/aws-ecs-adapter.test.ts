@@ -420,18 +420,81 @@ describe('AwsEcsAdapter reports only what happened', () => {
 		expect(result.pendingSetup).toBeUndefined()
 	})
 
-	test('a missing ecsTaskExecutionRole stops the deploy with setup steps before any build', async () => {
+	const noSuchRole =
+		'An error occurred (NoSuchEntity) when calling the GetRole operation: The role with name ecsTaskExecutionRole cannot be found.'
+
+	test('a missing ecsTaskExecutionRole fails authenticate, before provisioning or building', async () => {
+		const runner = createRunnerMock([
+			{
+				matcher: ['sts', 'get-caller-identity'],
+				result: { exitCode: 0, stdout: '{}', stderr: '' },
+			},
+			{ matcher: ['iam', 'get-role'], result: { exitCode: 254, stdout: '', stderr: noSuchRole } },
+		])
+		await expect(new AwsEcsAdapter({ runner, context }).authenticate()).rejects.toThrow(
+			/ecsTaskExecutionRole[\s\S]*AmazonECSTaskExecutionRolePolicy/,
+		)
+		// Nothing was created: the check ran before any provisioning call.
+		expect(
+			runner.run.mock.calls.some(([, args]) => (args as string[]).includes('create-repository')),
+		).toBe(false)
+	})
+
+	test('a role lookup that fails for another reason is an error, not setup steps', async () => {
+		const runner = createRunnerMock([
+			{
+				matcher: ['sts', 'get-caller-identity'],
+				result: { exitCode: 0, stdout: '{}', stderr: '' },
+			},
+			{
+				matcher: ['iam', 'get-role'],
+				result: {
+					exitCode: 254,
+					stdout: '',
+					stderr:
+						'An error occurred (AccessDenied) when calling the GetRole operation: not authorized to perform: iam:GetRole',
+				},
+			},
+		])
+		const error = await new AwsEcsAdapter({ runner, context }).authenticate().catch((e: Error) => e)
+		expect(error).toBeInstanceOf(Error)
+		expect((error as Error).message).toContain('AccessDenied')
+		expect((error as Error).message).not.toContain('AmazonECSTaskExecutionRolePolicy')
+	})
+
+	test('an update-service failure other than a missing service is an error, not setup steps', async () => {
 		const runner = createRunnerMock([
 			...pushed,
 			{
-				matcher: ['iam', 'get-role'],
-				result: { exitCode: 254, stdout: '', stderr: 'NoSuchEntity' },
+				matcher: ['ecs', 'update-service'],
+				result: {
+					exitCode: 254,
+					stdout: '',
+					stderr:
+						'An error occurred (AccessDeniedException) when calling the UpdateService operation: not authorized',
+				},
 			},
 		])
 		await expect(new AwsEcsAdapter({ runner, context }).deploy(artifacts)).rejects.toThrow(
-			/ecsTaskExecutionRole[\s\S]*AmazonECSTaskExecutionRolePolicy/,
+			/AccessDeniedException/,
 		)
-		expect(runner.run.mock.calls.some(([command]) => command === 'docker')).toBe(false)
+	})
+
+	test('an inactive service (deleted) also gets the create-service steps', async () => {
+		const runner = createRunnerMock([
+			...pushed,
+			{
+				matcher: ['ecs', 'update-service'],
+				result: {
+					exitCode: 254,
+					stdout: '',
+					stderr:
+						'An error occurred (ServiceNotActiveException) when calling the UpdateService operation: Service was not ACTIVE.',
+				},
+			},
+		])
+		const result = await new AwsEcsAdapter({ runner, context }).deploy(artifacts)
+		expect(result.pendingSetup).toContain('aws ecs create-service')
 	})
 })
 
