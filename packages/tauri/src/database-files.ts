@@ -1,3 +1,4 @@
+import { KoraError } from '@korajs/core'
 import type { InvokeFn } from './tauri-sqlite-adapter'
 
 /**
@@ -17,9 +18,13 @@ export interface TauriDatabaseFileState {
 }
 
 /** Thrown by {@link deleteTauriDatabase} while the database is open in this app. */
-export class TauriDatabaseInUseError extends Error {
+export class TauriDatabaseInUseError extends KoraError {
 	constructor(readonly path: string) {
-		super(`Database "${path}" is open; close the app's store before deleting it.`)
+		super(
+			`Database "${path}" is open; close the app's store before deleting it.`,
+			'TAURI_DATABASE_IN_USE',
+			{ path },
+		)
 		this.name = 'TauriDatabaseInUseError'
 	}
 }
