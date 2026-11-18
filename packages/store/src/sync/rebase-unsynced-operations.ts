@@ -4,7 +4,7 @@ import { parseFieldVersions, serializeFieldVersions } from '../lww/field-version
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery } from '../query/sql-builder'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
-import type { OperationRow, RawCollectionRow, StorageAdapter } from '../types'
+import type { OperationRow, RawCollectionRow, StorageAdapter, Transaction } from '../types'
 import { rehashOperation } from './rehash-operation'
 
 /**
@@ -53,6 +53,13 @@ export async function rebaseUnsyncedOperationsInLog(
 	schema: SchemaDefinition,
 	unsyncedOpIds: string[],
 	correctedNowMs: number,
+	options: {
+		/**
+		 * Runs last in the rewrite's transaction, with the rewritten operations: what must be
+		 * durable with the rewrite (re-folding their records) commits with it.
+		 */
+		inTransaction?: (tx: Transaction, operations: readonly Operation[]) => Promise<void>
+	} = {},
 ): Promise<ClockRebaseResult> {
 	if (unsyncedOpIds.length === 0) {
 		return emptyResult()
@@ -190,6 +197,7 @@ export async function rebaseUnsyncedOperationsInLog(
 		}
 		// sequenceNumbers are intentionally unchanged, so `_kora_version_vector`
 		// needs no update: the version vector tracks sequences, not timestamps.
+		await options.inTransaction?.(tx, newOperations)
 	})
 
 	const newMaxTimestamp = newTimestamps[newTimestamps.length - 1] ?? null

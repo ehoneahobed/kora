@@ -2,6 +2,9 @@ import type { MetaRow, StorageAdapter, Transaction } from '../types'
 import { OWN_ACKED_THROUGH_META_KEY } from './sync-durability'
 import { NODE_TOKEN_META_KEY, nodeTokenKey } from './sync-state'
 
+/** What these helpers run statements on: an adapter, or a transaction of one. */
+export type SqlRunner = Pick<StorageAdapter, 'query' | 'execute'>
+
 /**
  * Durable sync bookkeeping that belongs to the device, not to the app (Phase 2 RT-36,
  * RT-38, RT-40): the operations the server refused for good, and the node ids this
@@ -105,7 +108,7 @@ const MAX_REFUSED_PRINCIPALS = 32
 export const ADOPTION_SCHEDULE_META_KEY = 'sync_adoption_schedule_v1'
 
 /** Adapters whose `_kora_local_nodes` table is known to have every column (this process). */
-const migratedAdapters = new WeakSet<StorageAdapter>()
+const migratedAdapters = new WeakSet<object>()
 
 /** A terminal rejection to record (RT-36). */
 export interface TerminalRejection {
@@ -207,7 +210,7 @@ export interface AdoptionSchedule {
  * read paths, which run often, assume the tables exist and never issue DDL (on the
  * IndexedDB adapter every statement schedules a snapshot).
  */
-export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Promise<void> {
+export async function ensureLocalSyncRecordTables(adapter: SqlRunner): Promise<void> {
 	await adapter.execute(TERMINAL_REJECTIONS_DDL)
 	await adapter.execute(LOCAL_NODES_DDL)
 	await adapter.execute(RECEIVED_LOCAL_OPS_DDL)
@@ -347,7 +350,7 @@ function parsePrincipalList(value: string | null): string[] {
  * fresh node (RT-21) instead of holding them for an owner that does not exist.
  */
 export async function registerLocalNode(
-	adapter: StorageAdapter,
+	adapter: SqlRunner,
 	nodeId: string,
 	options: { fromQueue?: boolean } = {},
 ): Promise<void> {
@@ -370,7 +373,7 @@ export async function registerLocalNode(
  * builds with node claims keep. beta.12's `last_acked_server_vector` does not count: its
  * server recorded no claims (RT-92).
  */
-async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<boolean> {
+async function hasSyncHistory(adapter: SqlRunner, nodeId: string): Promise<boolean> {
 	const rows = await adapter.query<MetaRow & { key: string }>(
 		'SELECT key, value FROM _kora_meta WHERE key IN (?, ?, ?)',
 		[NODE_TOKEN_META_KEY, nodeTokenKey(nodeId), OWN_ACKED_THROUGH_META_KEY],
@@ -522,7 +525,7 @@ export async function forgetLocalNode(adapter: StorageAdapter, nodeId: string): 
  * that was learned (RT-50). The node is registered if it is not yet.
  */
 export async function setLocalNodePrincipal(
-	adapter: StorageAdapter,
+	adapter: SqlRunner,
 	nodeId: string,
 	principal: string,
 	binding: LocalNodeBinding,
