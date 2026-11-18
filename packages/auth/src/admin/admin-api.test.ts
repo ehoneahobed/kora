@@ -81,7 +81,7 @@ describe('AdminApi', () => {
 			await createTestUser(userStore, 'alice@example.com', 'Alice')
 			await createTestUser(userStore, 'bob@example.com', 'Bob')
 
-			const result = await admin.listUsers()
+			const result = await admin.listUsers('admin-1')
 			expect(result.data).toHaveLength(2)
 			expect(result.total).toBe(2)
 		})
@@ -90,7 +90,7 @@ describe('AdminApi', () => {
 			await createTestUser(userStore, 'alice@example.com')
 			await createTestUser(userStore, 'bob@company.com')
 
-			const result = await admin.listUsers({ email: 'example' })
+			const result = await admin.listUsers('admin-1', { email: 'example' })
 			expect(result.data).toHaveLength(1)
 			expect(result.data[0]?.email).toBe('alice@example.com')
 		})
@@ -100,11 +100,11 @@ describe('AdminApi', () => {
 			await createTestUser(userStore, 'bob@example.com')
 			await userStore.setEmailVerified(userId, true)
 
-			const verified = await admin.listUsers({ emailVerified: true })
+			const verified = await admin.listUsers('admin-1', { emailVerified: true })
 			expect(verified.data).toHaveLength(1)
 			expect(verified.data[0]?.email).toBe('alice@example.com')
 
-			const unverified = await admin.listUsers({ emailVerified: false })
+			const unverified = await admin.listUsers('admin-1', { emailVerified: false })
 			expect(unverified.data).toHaveLength(1)
 			expect(unverified.data[0]?.email).toBe('bob@example.com')
 		})
@@ -114,19 +114,19 @@ describe('AdminApi', () => {
 				await createTestUser(userStore, `user${i}@example.com`)
 			}
 
-			const page1 = await admin.listUsers({ limit: 2, offset: 0 })
+			const page1 = await admin.listUsers('admin-1', { limit: 2, offset: 0 })
 			expect(page1.data).toHaveLength(2)
 			expect(page1.total).toBe(5)
 
-			const page2 = await admin.listUsers({ limit: 2, offset: 2 })
+			const page2 = await admin.listUsers('admin-1', { limit: 2, offset: 2 })
 			expect(page2.data).toHaveLength(2)
 
-			const page3 = await admin.listUsers({ limit: 2, offset: 4 })
+			const page3 = await admin.listUsers('admin-1', { limit: 2, offset: 4 })
 			expect(page3.data).toHaveLength(1)
 		})
 
 		test('returns empty result for no matches', async () => {
-			const result = await admin.listUsers()
+			const result = await admin.listUsers('admin-1')
 			expect(result.data).toHaveLength(0)
 			expect(result.total).toBe(0)
 		})
@@ -269,13 +269,13 @@ describe('AdminApi', () => {
 				mfaVerified: false,
 			})
 
-			const sessions = await admin.getUserSessions(userId)
+			const sessions = await admin.getUserSessions('admin-1', userId)
 			expect(sessions).toHaveLength(1)
 		})
 
 		test('returns empty when no session store configured', async () => {
 			const adminNoSessions = new AdminApi({ userStore })
-			const sessions = await adminNoSessions.getUserSessions('user-1')
+			const sessions = await adminNoSessions.getUserSessions('admin-1', 'user-1')
 			expect(sessions).toHaveLength(0)
 		})
 	})
@@ -332,14 +332,14 @@ describe('AdminApi', () => {
 
 			await userStore.setEmailVerified(u1, true)
 
-			const stats = await admin.getStats()
+			const stats = await admin.getStats('admin-1')
 			expect(stats.totalUsers).toBe(3)
 			expect(stats.verifiedUsers).toBe(1)
 			expect(stats.unverifiedUsers).toBe(2)
 		})
 
 		test('returns zeros when no users', async () => {
-			const stats = await admin.getStats()
+			const stats = await admin.getStats('admin-1')
 			expect(stats.totalUsers).toBe(0)
 		})
 	})

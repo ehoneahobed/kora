@@ -325,6 +325,7 @@ export {
 	AdminApiError,
 	AdminUserNotFoundError,
 	AdminUnauthorizedError,
+	AdminRevocationUnavailableError,
 } from './admin/admin-api'
 export type {
 	AdminApiConfig,
