@@ -172,6 +172,19 @@ export class AwarenessManager {
 	}
 
 	/**
+	 * Forget every remote client's state (the local state stays): the sync session ended, and
+	 * presence lasts only while connected. Reconnecting rebuilds it from the server's catch-up.
+	 */
+	clearRemoteStates(): void {
+		if (this.destroyed || this.remoteStates.size === 0) return
+		const removed = [...this.remoteStates.keys()]
+		this.remoteStates.clear()
+		this.lastUpdated.clear()
+		this.notifyListeners({ added: [], updated: [], removed })
+		this.emitAwarenessEvent()
+	}
+
+	/**
 	 * Register a handler for sending awareness messages through the transport.
 	 * The sync engine calls this to wire outgoing awareness messages to the transport.
 	 */

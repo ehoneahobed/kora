@@ -7553,6 +7553,8 @@ export class SyncEngine {
 		this.dropPendingProbe()
 		this.clearOutboundRetryTimer()
 		this.awarenessManager.stopCleanupTimer()
+		// Presence lasts only while connected: the others are no longer known.
+		this.awarenessManager.clearRemoteStates()
 		// Return in-flight batches to the queue: nothing unacknowledged is resolved.
 		this.sessionEpoch++
 		this.returnAllInFlightUploads()
@@ -7572,6 +7574,8 @@ export class SyncEngine {
 		// A transport error ends the session; close the transport so the socket is
 		// released before any reconnect opens another (SYNC-5).
 		if (this.state !== 'disconnected') {
+			this.awarenessManager.stopCleanupTimer()
+			this.awarenessManager.clearRemoteStates()
 			this.transitionTo('error')
 			this.emitter?.emit({ type: 'sync:disconnected', reason: err.message })
 			this.transitionTo('disconnected')
