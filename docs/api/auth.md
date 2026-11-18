@@ -284,6 +284,7 @@ function verifyRegistrationResponse(params: {
 
 function generateAuthenticationOptions(params: {
   rpId: string; allowCredentialIds?: string[]
+  requireUserVerification?: boolean  // default true: asks for userVerification 'required'
 }): AuthenticationOptions
 
 function verifyAuthenticationResponse(params: {
@@ -296,7 +297,9 @@ function verifyAuthenticationResponse(params: {
 ```
 
 Registration accepts the `none` attestation format. Authentication checks the ECDSA P-256
-signature, the user-verified flag and the sign counter. Failures throw `PasskeyVerificationError`
+signature, the user-verified flag and the sign counter. Pass the same `requireUserVerification`
+to `generateAuthenticationOptions` and `verifyAuthenticationResponse` (both default to true), so
+the options ask the device for exactly the verification the server then checks. Failures throw `PasskeyVerificationError`
 (`PASSKEY_VERIFICATION_ERROR`).
 
 ---
