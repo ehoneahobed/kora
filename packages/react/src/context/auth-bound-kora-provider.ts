@@ -151,18 +151,30 @@ export function AuthBoundKoraProvider({
 				})
 				.catch((error: unknown) => {
 					if (!disposed && currentGeneration === generation.current) {
-						void authClient.resolveSyncState?.().then((failedSession) => {
-							if (
-								!disposed &&
-								currentGeneration === generation.current &&
-								failedSession?.state === 'authenticated'
-							) {
-								setInitError({
-									error: classifyKoraInitializationError(error),
-									session: { userId: failedSession.userId },
-								})
-							}
-						})
+						void Promise.resolve(authClient.resolveSyncState?.())
+							.then((failedSession) => {
+								if (disposed || currentGeneration !== generation.current) return
+								if (failedSession?.state === 'authenticated') {
+									setInitError({
+										error: classifyKoraInitializationError(error),
+										session: { userId: failedSession.userId },
+									})
+									return
+								}
+								// The session ended meanwhile: nothing to show, but the failure is
+								// still reported.
+								console.error(
+									'[kora] AuthBoundKoraProvider: the app failed to open, and the session ended before the error could be shown:',
+									error,
+								)
+							})
+							.catch((sessionError: unknown) => {
+								console.error(
+									'[kora] AuthBoundKoraProvider: the app failed to open, and the session could not be read to show it:',
+									error,
+									sessionError,
+								)
+							})
 					}
 				})
 		}
@@ -176,7 +188,11 @@ export function AuthBoundKoraProvider({
 			const previous = active.current
 			active.current = null
 			activeUserId.current = null
-			if (previous) void previous.close()
+			if (previous) {
+				void previous.close().catch((error: unknown) => {
+					console.error('[kora] AuthBoundKoraProvider: closing the app failed:', error)
+				})
+			}
 		}
 	}, [authClient])
 
