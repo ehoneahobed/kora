@@ -163,9 +163,16 @@ export class IndexedDbPersistenceScheduler {
 			this.timer = null
 		}
 		// Group commit: concurrent barriers share the snapshot in flight and the next one.
-		// At most three rounds: one in flight that may predate `target` (or be relaxed), then
-		// a strict one started after it.
-		for (let round = 0; round < 3 && this.strictGeneration < target; round++) {
+		// Snapshots already in flight (relaxed background ones, or strict ones that may predate
+		// `target`) are waited out however many there are: a busy app keeps starting them, and
+		// that is not a failure. The barrier ends when a strict snapshot covers `target`, or
+		// fails when the strict snapshot it started itself fails (or the scheduler is disposed).
+		while (this.strictGeneration < target) {
+			if (this.disposed) {
+				throw new PersistenceError(
+					'IndexedDB persistence was disposed before the writes were persisted',
+				)
+			}
 			if (this.inFlight) {
 				await this.inFlight
 				continue
@@ -176,12 +183,12 @@ export class IndexedDbPersistenceScheduler {
 			} finally {
 				this.inFlight = null
 			}
-			if (this.strictGeneration < target) break
-		}
-		if (this.strictGeneration < target) {
-			throw this.lastFlushError instanceof Error
-				? this.lastFlushError
-				: new PersistenceError('IndexedDB snapshot was not persisted')
+			// A strict snapshot started after `target` covers it unless it failed.
+			if (this.strictGeneration < target) {
+				throw this.lastFlushError instanceof Error
+					? this.lastFlushError
+					: new PersistenceError('IndexedDB snapshot was not persisted')
+			}
 		}
 	}
 
