@@ -7,8 +7,9 @@
  * absolute gates, so an absolute "insert 10,000 records < 2.2 s" either flakes or must be
  * loosened until it catches nothing. Instead this compares the change with its base on the
  * SAME machine in the SAME job: it runs store-workload.mjs alternately against the built
- * base checkout and the built head checkout, keeps each side's fastest run (the run least
- * disturbed by noisy neighbours), and fails when the head is more than 10% slower.
+ * base checkout and the built head checkout, compares each side's median run (one run a noisy
+ * neighbour sped up or slowed down does not move it; see ab-decision.mjs), and fails when the
+ * head is more than 10% slower.
  *
  *   node scripts/bench/ab-regression.mjs --base ../base --head . [--runs 5] [--max-regression 0.10]
  *
@@ -18,6 +19,7 @@ import { spawnSync } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { decide } from './ab-decision.mjs'
 
 function arg(name, fallback) {
 	const index = process.argv.indexOf(`--${name}`)
@@ -60,10 +62,11 @@ for (let run = 0; run < runs; run++) {
 let failed = false
 const rows = []
 for (const metric of METRICS) {
-	const baseMs = Math.min(...samples.base.map((s) => s[metric.key]))
-	const headMs = Math.min(...samples.head.map((s) => s[metric.key]))
-	const change = headMs / baseMs - 1
-	const regressed = change > maxRegression && headMs - baseMs > metric.slackMs
+	const { baseMs, headMs, change, regressed } = decide(
+		samples.base.map((s) => s[metric.key]),
+		samples.head.map((s) => s[metric.key]),
+		{ maxRegression, slackMs: metric.slackMs },
+	)
 	if (regressed) failed = true
 	const all = (side) => samples[side].map((s) => s[metric.key].toFixed(1)).join(', ')
 	rows.push(
@@ -74,7 +77,7 @@ for (const metric of METRICS) {
 }
 
 const summary = [
-	`### Store performance, head vs base (same runner, fastest of ${runs})`,
+	`### Store performance, head vs base (same runner, median of ${runs})`,
 	'',
 	'| Workload | Base | Head | Change | Result |',
 	'|---|---|---|---|---|',
