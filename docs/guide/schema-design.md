@@ -209,7 +209,8 @@ and nothing is written. The server refuses such an operation on its own
 
 One known gap: the client SQLite store turns a lone surrogate inside a string into U+FFFD (the
 server stores it losslessly). Range filters and `orderBy` on strings that contain U+0000, U+FFFF
-or a lone surrogate order them by their stored escape, not by JavaScript order.
+or a lone surrogate order them by their stored escape, not by JavaScript order (the memory,
+SQLite and Postgres server stores all do, so they agree).
 
 ### How values are normalized
 

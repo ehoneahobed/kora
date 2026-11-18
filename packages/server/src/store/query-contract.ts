@@ -1,4 +1,4 @@
-import { quoteIdent } from '@korajs/core'
+import { encodeStoredText, quoteIdent } from '@korajs/core'
 import type { FieldDescriptor } from '@korajs/core'
 import { type SqlDialect, isTextColumn } from './materialization'
 
@@ -7,19 +7,21 @@ import { type SqlDialect, isTextColumn } from './materialization'
  *
  * - `where { field: value }` matches the stored value; `null` matches a field that is null
  *   or absent (`IS NULL`).
- * - `orderBy` puts nulls last in both directions; strings compare by code point (UTF-8 byte
- *   order: SQLite's BINARY collation, Postgres `COLLATE "C"`), `id` included. A string that
- *   contains U+0000, U+FFFF or a lone surrogate is stored escaped (text-codec.ts) and the SQL
- *   stores order it by the escape: the contract covers strings without them.
+ * - `orderBy` puts nulls last in both directions; strings compare by the code points of their
+ *   stored form (UTF-8 byte order: SQLite's BINARY collation, Postgres `COLLATE "C"`), `id`
+ *   included. The stored form is the string itself unless it contains U+0000, U+FFFF or a lone
+ *   surrogate, which are stored escaped (text-codec.ts): such a string sorts by its escape,
+ *   after U+FFFE and before astral characters at that position, in every store.
  * - `id` breaks every tie and is the order when none is given, so pages are stable.
  */
 
 /** Compare two non-null values as the SQL stores order them. */
 export function compareQueryValues(a: unknown, b: unknown): number {
 	if (typeof a === 'string' && typeof b === 'string') {
-		// Code point order (UTF-16 `<` differs from it for astral characters).
-		const left = a[Symbol.iterator]()
-		const right = b[Symbol.iterator]()
+		// Code point order of the stored form (UTF-16 `<` differs from it for astral characters;
+		// the encoding is the identity for strings without an escaped code unit).
+		const left = encodeStoredText(a)[Symbol.iterator]()
+		const right = encodeStoredText(b)[Symbol.iterator]()
 		for (;;) {
 			const l = left.next()
 			const r = right.next()
