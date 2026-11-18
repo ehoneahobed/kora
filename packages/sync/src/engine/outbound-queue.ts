@@ -1,4 +1,5 @@
 import type { Operation } from '@korajs/core'
+import { HybridLogicalClock } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
 import type { QueueStorage } from '../types'
 
@@ -22,6 +23,12 @@ export interface OutboundBatch {
 export class OutboundQueue {
 	private queue: Operation[] = []
 	private readonly seen: Set<string> = new Set()
+	/**
+	 * Ids that queued operations name as causal dependencies. An operation one of them is
+	 * waiting for goes before it, so it cannot simply be appended. Only grows while the queue
+	 * holds operations (a stale entry only costs a full sort); cleared when it empties.
+	 */
+	private readonly awaited: Set<string> = new Set()
 	private readonly inFlight: Map<string, Operation[]> = new Map()
 	/**
 	 * Ids of queued operations that were put on the wire at least once. Such an op may
@@ -47,9 +54,7 @@ export class OutboundQueue {
 			}
 		}
 		// Ensure causal order
-		if (this.queue.length > 1) {
-			this.queue = topologicalSort(this.queue)
-		}
+		this.resort()
 		if (this.storage.loadSentIds) {
 			for (const id of await this.storage.loadSentIds()) {
 				if (this.seen.has(id)) this.sent.add(id)
@@ -66,13 +71,36 @@ export class OutboundQueue {
 		if (this.seen.has(op.id)) return
 
 		this.seen.add(op.id)
-		this.queue.push(op)
+		const appended = this.append(op)
 		await this.storage.enqueue(op)
 
-		// Re-sort to maintain causal order when new ops arrive
-		if (this.queue.length > 1) {
-			this.queue = topologicalSort(this.queue)
-		}
+		// Re-sort only when appending would not give the causal order.
+		if (!appended) this.resort()
+	}
+
+	/**
+	 * Put `op` at the end when that is exactly where a full sort would place it: it sorts
+	 * after the current last operation (HLC), and no queued operation depends on it (a child
+	 * that arrived before its parent). Its own queued dependencies are already ahead of it.
+	 * A fresh local write always qualifies, so queueing a backlog costs O(n), not O(n² log n).
+	 *
+	 * @returns Whether it was appended (otherwise it is queued and the caller re-sorts)
+	 */
+	private append(op: Operation): boolean {
+		const last = this.queue.at(-1)
+		const fits =
+			!this.awaited.has(op.id) &&
+			(last === undefined || HybridLogicalClock.compare(last.timestamp, op.timestamp) < 0)
+		this.queue.push(op)
+		for (const dep of op.causalDeps) this.awaited.add(dep)
+		return fits
+	}
+
+	/** Sort the whole queue causally, and record what its operations wait for. */
+	private resort(): void {
+		if (this.queue.length > 1) this.queue = topologicalSort(this.queue)
+		this.awaited.clear()
+		for (const queued of this.queue) for (const dep of queued.causalDeps) this.awaited.add(dep)
 	}
 
 	/**
@@ -80,17 +108,14 @@ export class OutboundQueue {
 	 * re-sorted once (rather than once per operation).
 	 */
 	async enqueueMany(ops: Operation[]): Promise<void> {
-		let added = false
+		let sorted = true
 		for (const op of ops) {
 			if (this.seen.has(op.id)) continue
 			this.seen.add(op.id)
-			this.queue.push(op)
+			if (!this.append(op)) sorted = false
 			await this.storage.enqueue(op)
-			added = true
 		}
-		if (added && this.queue.length > 1) {
-			this.queue = topologicalSort(this.queue)
-		}
+		if (!sorted) this.resort()
 	}
 
 	/**
@@ -118,6 +143,8 @@ export class OutboundQueue {
 		} else {
 			ops = this.queue.splice(0, batchSize)
 		}
+		// Nothing queued waits for anything: appending is safe again.
+		if (this.queue.length === 0) this.awaited.clear()
 		const batchId = `batch-${this.nextBatchId++}`
 		this.inFlight.set(batchId, ops)
 
@@ -174,9 +201,7 @@ export class OutboundQueue {
 
 		if (retry.length > 0) {
 			this.queue.unshift(...retry)
-			if (this.queue.length > 1) {
-				this.queue = topologicalSort(this.queue)
-			}
+			this.resort()
 		}
 
 		if (acknowledged.length > 0) {
@@ -248,9 +273,7 @@ export class OutboundQueue {
 			this.queue.push(op)
 			await this.storage.enqueue(op)
 		}
-		if (this.queue.length > 1) {
-			this.queue = topologicalSort(this.queue)
-		}
+		this.resort()
 	}
 
 	/**
@@ -264,9 +287,7 @@ export class OutboundQueue {
 		this.inFlight.delete(batchId)
 		// Prepend returned ops, then re-sort for causal order
 		this.queue.unshift(...ops)
-		if (this.queue.length > 1) {
-			this.queue = topologicalSort(this.queue)
-		}
+		this.resort()
 	}
 
 	/**
@@ -326,7 +347,8 @@ export class OutboundQueue {
 		}
 		this.inFlight.clear()
 
-		this.queue = ops.length > 1 ? topologicalSort([...ops]) : [...ops]
+		this.queue = [...ops]
+		this.resort()
 		this.seen.clear()
 		this.sent.clear()
 		for (const op of this.queue) {
