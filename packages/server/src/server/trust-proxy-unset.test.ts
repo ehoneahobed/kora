@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
-import type { LogEntry } from '../types'
 import { withHostSettings } from './host-settings'
 import { type ProductionServer, createProductionServer } from './production-server'
 import type { TrustProxySetting } from './trust-proxy'
@@ -49,7 +48,7 @@ describe('the production server warns when trustProxy trusts no proxy', () => {
 	it.each(trustsNone)(
 		'trustProxy %s logs read.trust_proxy_unset at start',
 		async (_label, value) => {
-			const logs: LogEntry[] = []
+			const logs: Array<{ event: string }> = []
 			running = createProductionServer({
 				store: new MemoryServerStore('s'),
 				port: 0,

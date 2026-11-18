@@ -99,6 +99,8 @@ export interface ProductionServerConfig {
 	 * proxy IPs / CIDR ranges. Defaults to `KORA_TRUST_PROXY` (the same, comma-separated).
 	 * When neither is set, the header is ignored and `request.ip`
 	 * is the socket address, so a client cannot pick its own rate-limit bucket.
+	 * `0`, a negative count or `[]` trusts no proxy: the same as leaving it unset
+	 * (the server warns at start), and `KORA_TRUST_PROXY` does not replace it.
 	 */
 	trustProxy?: TrustProxySetting
 	/**
