@@ -11,15 +11,22 @@ export function withHostSettings(
 	config: ProductionServerConfig,
 	env: Record<string, string | undefined> = process.env,
 ): ProductionServerConfig {
-	const trustProxy = config.trustProxy ?? parseTrustProxy(env.KORA_TRUST_PROXY)
+	// A setting that trusts no proxy (0 hops, a negative count, an empty list) is the same as
+	// none: the socket address is not a client's, and the server warns. The app chose it, so
+	// the host's KORA_TRUST_PROXY does not replace it.
+	const trustProxy =
+		config.trustProxy !== undefined
+			? trustingSome(config.trustProxy)
+			: parseTrustProxy(env.KORA_TRUST_PROXY)
 	const auth = config.operationalAuth ?? {}
 	const pick = (own: string | undefined, name: string): string | undefined =>
 		own || env[name]?.trim() || undefined
 	const adminToken = pick(auth.adminToken, 'KORA_ADMIN_TOKEN')
 	const metricsToken = pick(auth.metricsToken, 'KORA_METRICS_TOKEN')
 	const backupToken = pick(auth.backupToken, 'KORA_BACKUP_TOKEN')
+	const { trustProxy: _appTrustProxy, ...rest } = config
 	return {
-		...config,
+		...rest,
 		...(trustProxy !== undefined ? { trustProxy } : {}),
 		operationalAuth: {
 			...auth,
@@ -28,6 +35,13 @@ export function withHostSettings(
 			...(backupToken ? { backupToken } : {}),
 		},
 	}
+}
+
+/** A trustProxy setting, or undefined when it trusts no proxy. */
+function trustingSome(setting: TrustProxySetting): TrustProxySetting | undefined {
+	if (typeof setting === 'number')
+		return Number.isFinite(setting) && setting > 0 ? setting : undefined
+	return setting.length > 0 ? setting : undefined
 }
 
 /**
