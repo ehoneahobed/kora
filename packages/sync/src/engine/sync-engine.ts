@@ -2109,6 +2109,9 @@ export class SyncEngine {
 		}
 		change()
 		this.querySubsetsVersion++
+		// A staged first sync is dropped by any view change at once (its position is no basis
+		// for the new view); it then ends, so the rest of a burst is still switched once.
+		if (this.staging !== null) this.flushViewChange()
 	}
 
 	/** Switch the delivery view once for the registrations since the last switch. */
@@ -2541,6 +2544,8 @@ export class SyncEngine {
 	}
 
 	private async handleMessageAsync(message: SyncMessage, arrivalGeneration: number): Promise<void> {
+		// A message never sees a view a burst of live-query changes has not switched to yet.
+		this.flushViewChange()
 		switch (message.type) {
 			case 'handshake-response':
 				await this.handleHandshakeResponse(message)
