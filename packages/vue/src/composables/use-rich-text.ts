@@ -3,22 +3,26 @@ import { KoraError } from '@korajs/core/lite'
 import { asRichTextSyncEngine, createRichTextController } from '@korajs/store'
 import type { CollectionAccessor } from '@korajs/store'
 import type { AwarenessUser } from '@korajs/sync'
-import { reactive, shallowRef, watch } from 'vue'
+import { type MaybeRefOrGetter, reactive, shallowRef, toValue, watch } from 'vue'
 import { useKoraContextRef } from '../context'
 import type { UseRichTextResult } from '../types'
 
 export interface UseRichTextOptions {
-	user?: AwarenessUser
+	/** The local user shown to collaborators; a ref or getter is followed. */
+	user?: MaybeRefOrGetter<AwarenessUser | undefined>
 	useDocChannel?: boolean
 }
 
 /**
  * Binds a richtext field to a shared Yjs document for editor integration.
+ *
+ * The collection, record id and field may be refs or getters: when one changes (a reused
+ * editor whose route param changes), the binding moves to the new record.
  */
 export function useRichText(
-	collectionName: string,
-	recordId: string,
-	fieldName: string,
+	collectionName: MaybeRefOrGetter<string>,
+	recordId: MaybeRefOrGetter<string>,
+	fieldName: MaybeRefOrGetter<string>,
 	options?: UseRichTextOptions,
 ): UseRichTextResult {
 	const context = useKoraContextRef()
@@ -36,9 +40,9 @@ export function useRichText(
 	watch(
 		() =>
 			[
-				collectionName,
-				recordId,
-				fieldName,
+				toValue(collectionName),
+				toValue(recordId),
+				toValue(fieldName),
 				options?.useDocChannel,
 				context.value.store,
 				context.value.syncEngine,
@@ -57,7 +61,7 @@ export function useRichText(
 				store,
 				syncEngine: asRichTextSyncEngine(syncEngine),
 				useDocChannel,
-				user: options?.user,
+				user: toValue(options?.user),
 			})
 
 			const syncState = (): void => {
@@ -86,7 +90,7 @@ export function useRichText(
 	)
 
 	watch(
-		() => options?.user,
+		() => toValue(options?.user),
 		(user) => {
 			controllerRef.value?.setUser(user)
 		},

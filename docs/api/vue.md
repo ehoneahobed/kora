@@ -187,12 +187,15 @@ Binds a schema `t.richtext()` field to a shared Yjs document for editor integrat
 <!-- docs-check: signature @korajs/vue @korajs/store @korajs/sync vue -->
 ```typescript
 function useRichText(
-  collectionName: string,
-  recordId: string,
-  fieldName: string,
-  options?: { user?: AwarenessUser; useDocChannel?: boolean },
+  collectionName: MaybeRefOrGetter<string>,
+  recordId: MaybeRefOrGetter<string>,
+  fieldName: MaybeRefOrGetter<string>,
+  options?: { user?: MaybeRefOrGetter<AwarenessUser | undefined>; useDocChannel?: boolean },
 ): UseRichTextResult
 ```
+
+The collection, record id, field and `user` may be refs or getters. When the record id changes
+(an editor reused across routes, `() => route.params.id`), the binding moves to the new record.
 
 The result holds the Yjs `doc` and `text` to bind to an editor, `undo`/`redo` with
 `canUndo`/`canRedo`, `ready`, `error`, remote `cursors` and `setCursor(anchor, head)`. Edits are
@@ -216,7 +219,7 @@ const collaborators = useCollaborators()
 </script>
 ```
 
-- `usePresence(user)`: publishes local presence; clears on unmount.
+- `usePresence(user)`: publishes local presence; clears on unmount. `user` may be a ref, a getter or a reactive object: a change updates what collaborators see, and `null` clears it.
 - `useCollaborators()`: a ref of remote peers' `AwarenessState` (`user`, `cursor?`). A state with a cursor reaches the sessions that can read its record; one without a cursor only sessions with the same download scope (see [Presence](/guide/presence#who-sees-a-presence-state)).
 
 ---
