@@ -210,6 +210,10 @@ export const { useCollection, useQuery, useMutation } = createKoraHooks<typeof a
 ## createRichTextBinding() / useRichText()
 
 Binds a `t.richtext()` field to Yjs. For reactive target changes, prefer `KoraRichText.svelte`.
+Call it during component initialization. Under a provider that renders before the store opens
+(the default), the binding is rebuilt once `app.ready` resolves so it gets the sync engine:
+collaborators' cursors and the live document channel. `doc` and `text` then refer to the new
+document, so bind an editor through the returned store (`$binding.text`), not a value read once.
 
 ---
 
