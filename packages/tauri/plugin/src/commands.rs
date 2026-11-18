@@ -166,17 +166,11 @@ pub fn open<R: Runtime>(
             .app_data_dir()
             .map_err(|e| Error::Plugin(format!("Failed to get app data dir: {}", e)))?;
         std::fs::create_dir_all(&data_dir)?;
-        data_dir.join(&path).to_string_lossy().into_owned()
+        resolve_open_path(&data_dir, &path)?
     };
 
     let conn = Connection::open(&db_path)?;
-
-    // Configure SQLite for optimal performance and correctness
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    // A resolved write is a durability promise, including across power loss.
-    conn.pragma_update(None, "synchronous", "FULL")?;
-    conn.pragma_update(None, "busy_timeout", "5000")?;
+    configure_connection(&conn)?;
 
     // Execute DDL statements from the schema
     for sql in &statements {
@@ -199,6 +193,31 @@ pub fn open<R: Runtime>(
 
     log::info!("Opened Kora database: {}", db_path);
     connections.insert(path, conn);
+    Ok(())
+}
+
+/// The file `open` uses for `path`: `:memory:` as is, otherwise a name inside the app's data
+/// directory. A parent, absolute or empty path is refused ([`validate_database_path`]), as for
+/// `inspect` and `delete`: `PathBuf::join` would follow it out of the directory.
+pub fn resolve_open_path(data_dir: &std::path::Path, path: &str) -> Result<String, Error> {
+    if path == ":memory:" {
+        return Ok(path.to_string());
+    }
+    validate_database_path(path)?;
+    Ok(data_dir.join(path).to_string_lossy().into_owned())
+}
+
+/// Configure a freshly opened connection for performance and correctness.
+pub fn configure_connection(conn: &Connection) -> Result<(), Error> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    // A resolved write is a durability promise, including across power loss.
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "busy_timeout", "5000")?;
+    // No other database may be attached: `ATTACH` (and `VACUUM INTO`, which attaches its
+    // target) would read or write any file the process can reach, outside the data directory.
+    // Kora never attaches one.
+    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED, 0);
     Ok(())
 }
 
@@ -541,5 +560,65 @@ mod binary_value_tests {
         let (kind, back) = store(json!({ "a": 1 }));
         assert_eq!(kind, "text");
         assert_eq!(back, json!("{\"a\":1}"));
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::{configure_connection, resolve_open_path};
+    use rusqlite::Connection;
+
+    // Threat model: a compromised webview calling the plugin's commands. It must not open,
+    // create or write a database outside the app's data directory.
+
+    #[test]
+    fn open_refuses_parent_and_absolute_paths() {
+        let data_dir = std::env::temp_dir().join("kora-open-paths");
+        for path in ["../escape.db", "/etc/escape.db", "a/../../escape.db", ""] {
+            assert!(
+                resolve_open_path(&data_dir, path).is_err(),
+                "{path:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn open_accepts_memory_and_names_in_the_data_directory() {
+        let data_dir = std::env::temp_dir().join("kora-open-paths");
+        assert_eq!(
+            resolve_open_path(&data_dir, ":memory:").unwrap(),
+            ":memory:"
+        );
+        assert_eq!(
+            resolve_open_path(&data_dir, "kora-db.db").unwrap(),
+            data_dir.join("kora-db.db").to_string_lossy()
+        );
+        assert!(resolve_open_path(&data_dir, "user/kora-db.db").is_ok());
+    }
+
+    #[test]
+    fn a_configured_connection_refuses_attach_and_vacuum_into() {
+        let outside = std::env::temp_dir().join(format!("kora-attach-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn).unwrap();
+        let target = outside.to_string_lossy().replace('\'', "''");
+        assert!(conn
+            .execute_batch(&format!("ATTACH DATABASE '{target}' AS outside"))
+            .is_err());
+        conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        assert!(conn
+            .execute_batch(&format!("VACUUM INTO '{target}'"))
+            .is_err());
+        assert!(
+            !outside.exists(),
+            "no file may be written outside the data directory"
+        );
+        // Ordinary statements still work.
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
