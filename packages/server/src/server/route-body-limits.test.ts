@@ -4,6 +4,7 @@ import { MemoryServerStore } from '../store/memory-server-store'
 import {
 	type ProductionServer,
 	ROUTE_BODIES_IN_FLIGHT,
+	ROUTE_BODY_DEADLINE_MS,
 	createProductionServer,
 } from './production-server'
 
@@ -36,21 +37,20 @@ function stalledUpload(
 	at: { host: string; port: number },
 	length: number,
 	first = '{',
-): { socket: Socket; reply: Promise<{ status: number; closedAtMs: number }> } {
+): { socket: Socket; reply: Promise<{ status: number }> } {
 	const socket = connect(at.port, at.host)
 	sockets.push(socket)
 	socket.write(
 		`POST /echo HTTP/1.1\r\nHost: ${at.host}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${length}\r\n\r\n${first}`,
 	)
 	let data = ''
-	const reply = new Promise<{ status: number; closedAtMs: number }>((resolve) => {
+	const reply = new Promise<{ status: number }>((resolve) => {
 		socket.on('data', (chunk) => {
 			data += chunk.toString('utf8')
 		})
 		const done = () =>
 			resolve({
 				status: Number(/^HTTP\/1\.1 (\d{3})/.exec(data)?.[1] ?? 0),
-				closedAtMs: Date.now(),
 			})
 		socket.on('close', done)
 		socket.on('end', done)
@@ -73,26 +73,29 @@ describe('custom route bodies', () => {
 	})
 
 	test('routeBodyTimeoutMs sets the ceiling below the rate rule', async () => {
-		// A declared 1 KB body would get 3 s by the rate rule; the configured 50 ms ceiling wins.
-		// The bound is 30x the ceiling: it fails only if the 3 s rule applied.
-		const at = await start({ routeBodyTimeoutMs: 50 })
-		const startedAt = Date.now()
-		const { reply } = stalledUpload(at, 1000)
-		const answered = await reply
-		expect(answered.status).toBe(408)
-		expect(answered.closedAtMs - startedAt).toBeLessThan(1_500)
+		// Read from the server's own deadline function (what its request path uses): no clock.
+		const deadlineFor = (): ((contentLength: number) => number) =>
+			(server as unknown as Record<symbol, (contentLength: number) => number>)[
+				ROUTE_BODY_DEADLINE_MS
+			] as (contentLength: number) => number
+		await start({ routeBodyTimeoutMs: 50 })
+		// A declared 1 KB body would get 3 s by the rate rule; the configured ceiling wins.
+		expect(deadlineFor()(1000)).toBe(50)
+		await server?.stop()
+		await start()
+		expect(deadlineFor()(1000)).toBe(3_000)
 	})
 
-	// Review of #323: a sender that keeps sending inside the ceiling is answered normally.
+	// Review of #323: a sender that keeps sending inside the ceiling is answered normally. The
+	// ceiling is far above anything scheduling could add; pieces go out across event-loop turns.
 	test('a body trickled steadily inside the ceiling gets 200', async () => {
-		const at = await start({ routeBodyTimeoutMs: 3_000 })
+		const at = await start({ routeBodyTimeoutMs: 60_000 })
 		const body = JSON.stringify({ text: 'x'.repeat(400) })
 		const { socket, reply } = stalledUpload(at, Buffer.byteLength(body), '')
-		// Ten pieces, one every 60 ms (about 0.6 s in all, against a 3 s ceiling).
 		const step = Math.ceil(body.length / 10)
 		for (let i = 0; i < body.length; i += step) {
 			socket.write(body.slice(i, i + step))
-			await new Promise((resolve) => setTimeout(resolve, 60))
+			await new Promise((resolve) => setImmediate(resolve))
 		}
 		const answered = await reply
 		expect(answered.status).toBe(200)

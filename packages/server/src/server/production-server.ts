@@ -373,6 +373,12 @@ const TOO_LARGE_DRAIN_BYTES = 64 * 1024 * 1024
  */
 export const ROUTE_BODIES_IN_FLIGHT = Symbol.for('kora.productionServer.routeBodiesInFlight')
 
+/**
+ * @internal The deadline this server gives a custom route body of a declared size (the function
+ * its request path uses), so tests check the configured ceiling without measuring time.
+ */
+export const ROUTE_BODY_DEADLINE_MS = Symbol.for('kora.productionServer.routeBodyDeadlineMs')
+
 export function createProductionServer(appConfig: ProductionServerConfig): ProductionServer {
 	// KORA_TRUST_PROXY and the operational tokens the host sets fill what the app left out.
 	const config = withHostSettings(appConfig)
@@ -610,6 +616,8 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 			? routeBodyCeilingMs(maxRequestBodyBytes)
 			: timerMilliseconds('routeBodyTimeoutMs', config.routeBodyTimeoutMs)
 	let routeBodiesInFlight = 0
+	const routeBodyDeadlineFor = (contentLength: number): number =>
+		routeBodyDeadlineMs(contentLength, routeBodyCeiling)
 	const maxBackupBytes = positiveInteger(
 		'maxBackupBytes',
 		config.maxBackupBytes,
@@ -1298,7 +1306,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 								new Promise<'timeout'>((resolve) => {
 									timer = setTimeout(
 										() => resolve('timeout'),
-										routeBodyDeadlineMs(Number(req.headers['content-length']), routeBodyCeiling),
+										routeBodyDeadlineFor(Number(req.headers['content-length'])),
 									)
 								}),
 							])
@@ -1408,6 +1416,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 	}
 	// Tests wait on this instead of on time (how many custom route bodies are being read).
 	Object.defineProperty(server, ROUTE_BODIES_IN_FLIGHT, { value: () => routeBodiesInFlight })
+	Object.defineProperty(server, ROUTE_BODY_DEADLINE_MS, { value: routeBodyDeadlineFor })
 	return server
 }
 
