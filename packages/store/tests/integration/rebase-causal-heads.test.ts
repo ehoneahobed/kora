@@ -62,4 +62,50 @@ describe('a clock rebase keeps causal heads pointing at the log', () => {
 		expect(rows.map((row) => row.title).sort()).toEqual(['concurrent', 'old'])
 		await store.close()
 	})
+
+	// Review of #306: the rebase's transaction ends before the store remaps its heads. A write
+	// already queued behind that transaction must not build its causalDeps from the old head.
+	test('a write queued behind the rebase depends only on operations in the final log', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const store = new Store({ schema, adapter })
+		await store.open()
+		const ahead = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10 * 60_000)
+		await store.collection('todos').insert({ title: 'written with a clock ahead' })
+		ahead.mockRestore()
+		const before = [...(await opIds(adapter))]
+		// The interleaving the review describes: the rebase's transaction commits, then the next
+		// queued write's transaction runs before the rebase's code after it does (a slow
+		// continuation). The first transaction from here on is the rebase's; it hands back only
+		// once the next one (the write's) has finished.
+		const original = adapter.transaction.bind(adapter)
+		let calls = 0
+		let writeDone: () => void = () => {}
+		const writeFinished = new Promise<void>((resolve) => {
+			writeDone = resolve
+		})
+		let queued: Promise<unknown> | null = null
+		vi.spyOn(adapter, 'transaction').mockImplementation(async (fn, options) => {
+			const call = ++calls
+			if (call === 1) {
+				const result = await original(fn, options)
+				// Committed: now the queued write runs before this resolves.
+				queued = store.collection('todos').insert({ title: 'queued behind the rebase' })
+				await writeFinished
+				return result
+			}
+			const result = await original(fn, options)
+			if (call === 2) writeDone()
+			return result
+		})
+		await store.rebaseUnsyncedOperations(before, Date.now())
+		await queued
+		const log = await opIds(adapter)
+		const rows = await adapter.query<{ id: string; causal_deps: string }>(
+			'SELECT id, causal_deps FROM _kora_ops_todos',
+		)
+		for (const row of rows) {
+			for (const dep of JSON.parse(row.causal_deps) as string[]) expect(log.has(dep)).toBe(true)
+		}
+		await store.close()
+	})
 })
