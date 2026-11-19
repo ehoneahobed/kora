@@ -52,6 +52,8 @@ mount(Root, { target: document.getElementById('app')!, props: { kora } })
   <App />
   {#await authBridge then bridge}
     <bridge.default />
+  {:catch}
+    <!-- The sign-in chunk did not load: the rest of the app keeps working. -->
   {/await}
 </KoraProvider>
 ```
