@@ -1,6 +1,9 @@
 import type { CollectionDefinition, SchemaDefinition } from '@korajs/core'
 import type { CollectionRecord, QueryDescriptor, SeedInput, SeedMeta, Store } from '@korajs/store'
 import type { ReadAnswer, ReadQuery, ReadRecord } from '@korajs/sync/read'
+import { toReadQuery } from './read-query'
+
+export { toReadQuery }
 
 /**
  * In-memory answers for queries that run before the store opens (first-visit parity S4b,
@@ -12,54 +15,9 @@ import type { ReadAnswer, ReadQuery, ReadRecord } from '@korajs/sync/read'
  * answer is never a result, so those queries render from the store, as without read-through.
  */
 
-/** The longest query key the read endpoint accepts. */
-const MAX_QUERY_KEY_LENGTH = 256
-
 /** What an answer source must do: the read client satisfies it, a test double can too. */
 export interface AnswerSource {
 	read(query: ReadQuery, options?: { signal?: AbortSignal }): Promise<ReadAnswer>
-}
-
-/**
- * The read-through query for a descriptor, or null when the query cannot be answered from
- * memory before the store opens.
- *
- * Refused (the store answers instead): relational queries, whose records would need their
- * included rows rebuilt; collections with rich text, whose stored form the in-memory record
- * cannot reproduce; collections the schema does not define; and a descriptor too long to be
- * a key (a hash could collide, and a collision would deliver another query's rows).
- */
-export function toReadQuery(
-	descriptor: QueryDescriptor,
-	schema: SchemaDefinition,
-): ReadQuery | null {
-	const definition = schema.collections[descriptor.collection]
-	if (definition === undefined) return null
-	if (descriptor.include !== undefined && descriptor.include.length > 0) return null
-	if (hasRichtext(definition)) return null
-	const key = JSON.stringify([
-		descriptor.collection,
-		descriptor.where,
-		descriptor.orderBy,
-		descriptor.limit ?? null,
-		descriptor.offset ?? null,
-	])
-	if (key.length > MAX_QUERY_KEY_LENGTH) return null
-	return {
-		key,
-		collection: descriptor.collection,
-		where: { ...descriptor.where },
-		orderBy: descriptor.orderBy.map((entry) => ({
-			field: entry.field,
-			direction: entry.direction,
-		})),
-		...(descriptor.limit !== undefined ? { limit: descriptor.limit } : {}),
-		...(descriptor.offset !== undefined ? { offset: descriptor.offset } : {}),
-	}
-}
-
-function hasRichtext(definition: CollectionDefinition): boolean {
-	return Object.values(definition.fields).some((field) => field.kind === 'richtext')
 }
 
 /**

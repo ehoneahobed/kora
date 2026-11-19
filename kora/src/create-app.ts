@@ -20,9 +20,11 @@ import { createCollectionAccessor } from './collection-accessor'
 import { CONFIG_VALIDATOR_SLOT, type ConfigValidatorSlot } from './config-validator-slot'
 import { namespacedDbName } from './db-name'
 import { applyDescriptor } from './deferred-query'
+import { type EarlyReads, createEarlyReads } from './early-read'
 import { LateSubscriptions, onlyChanges } from './late-subscriptions'
 import { offlineSyncDiagnostics } from './offline-sync-diagnostics'
 import { PreReadyWriteQueue } from './pre-ready-writes'
+import { type ReadTracker, createReadTracker } from './read-tracker'
 import { hasCompletedReplica } from './replica-marker'
 import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
 import type { InternalStorageWritesApi } from './storage-accessor'
@@ -229,6 +231,10 @@ export function createApp<const S extends SchemaInput>(
 				validateCreateAppConfig(config)
 			}
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
+			// A read-through read still waiting for its answer goes first: the store's chunks
+			// would share a slow link with it (S0 P7). Writes made meanwhile are journaled.
+			if (reading) await reading.tracker.idle(READ_YIELD_MAX_MS)
+			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
 			// Read the write journal while the store opens, so recovery before `ready` is free
 			// when it is empty.
 			queue.scan()
@@ -347,7 +353,8 @@ export function createApp<const S extends SchemaInput>(
 		completeListeners = []
 	}
 	const getStore = (): Store | null => (opened && runtime ? runtime.getStore() : null)
-	const answers = !inert ? loadPreReadyAnswers(config) : null
+	const reading = !inert ? loadPreReadyAnswers(config) : null
+	const answers = reading?.answers ?? null
 	// Only a browser has a link worth sparing: elsewhere (a Node program, a worker) the store
 	// opens at once and nothing waits for an answer.
 	if (answers === null || typeof window === 'undefined' || typeof document === 'undefined') {
@@ -391,6 +398,8 @@ export function createApp<const S extends SchemaInput>(
 			deliver: (records: import('@korajs/store').CollectionRecord[]) => void,
 		) {
 			if (answers === null) return null
+			// Sent now, before the answers chunk arrives; its client takes the response over.
+			reading?.early.ask(descriptor)
 			let detach: (() => void) | undefined
 			let gone = false
 			void answers.then((loaded) => {
@@ -896,6 +905,9 @@ export function createApp<const S extends SchemaInput>(
 /** Longest the runtime waits for the first read-through answer before it starts anyway. */
 const FIRST_ANSWER_WAIT_MS = 1200
 
+/** Longest the store's start waits for read-through reads in flight (S0 P7). */
+const READ_YIELD_MAX_MS = 1000
+
 /** Run `callback` after the browser has had a frame to paint the first render. */
 function afterFirstPaint(callback: () => void): void {
 	let done = false
@@ -958,17 +970,31 @@ function reloadOnceForChunk(name: string): boolean {
  * an app that does not use it downloads none of it. A failed load is not an error: the store
  * answers every query when it opens, as without read-through.
  */
-function loadPreReadyAnswers(
-	config: KoraConfig,
-): Promise<import('./pre-ready-answers').PreReadyAnswers | null> | null {
+function loadPreReadyAnswers(config: KoraConfig): {
+	answers: Promise<import('./pre-ready-answers').PreReadyAnswers | null>
+	early: EarlyReads
+	tracker: ReadTracker
+} | null {
 	const sync = config.sync
 	if (sync?.firstVisit?.readThrough !== true || !config.schema) return null
 	const schema = config.schema
-	return isReturningDevice(config).then(async (returning) => {
-		if (returning) return null
+	const returning = isReturningDevice(config)
+	// The first screen's reads leave now; the chunk below is one more round trip (S0 P2).
+	const tracker = createReadTracker()
+	const early = createEarlyReads(
+		sync,
+		schema,
+		returning.then((value) => !value),
+		tracker,
+	)
+	const answers = returning.then(async (isReturning) => {
+		if (isReturning) return null
 		const { createPreReadyAnswers } = await import('./pre-ready-answers-loader')
-		return createPreReadyAnswers(sync, schema)
+		return createPreReadyAnswers(sync, schema, early.fetch, tracker)
 	})
+	const stop = (): void => early.stop()
+	answers.then(stop, stop)
+	return { answers, early, tracker }
 }
 
 /**
