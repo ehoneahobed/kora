@@ -560,9 +560,12 @@ export class VersionGate {
 		if (!this.openPromise) {
 			const opening = this.doOpen()
 			this.openPromise = opening
-			// A failed open is not cached: the next open() tries again.
-			opening.catch(() => {
-				if (this.openPromise === opening) this.openPromise = null
+			// A failed open is not cached, so the next open() tries again, unless the gate is done:
+			// closed or retired by a newer build, it keeps that rejection for every caller.
+			opening.catch((error: unknown) => {
+				const terminal =
+					error instanceof BuildSupersededError || error instanceof VersionGateClosedError
+				if (!terminal && this.openPromise === opening) this.openPromise = null
 			})
 		}
 		return this.openPromise
