@@ -104,7 +104,14 @@ jobs:
         run: pnpm exec turbo run build '--filter=!kora-docs'
 
       - name: Install Playwright Chromium
-        run: pnpm --filter kora-e2e exec playwright install --with-deps chromium
+        # apt mirrors fail transiently (exit 100): retry so a mirror blip doesn't fail the run.
+        run: |
+          for attempt in 1 2 3; do
+            pnpm --filter kora-e2e exec playwright install --with-deps chromium && exit 0
+            echo "Chromium install failed (attempt $attempt); retrying in 30 s"
+            sleep 30
+          done
+          exit 1
 
       # --strict: a check that cannot run (no Postgres) fails instead of skipping quietly.
       - name: Packed-artifact matrix
@@ -170,7 +177,14 @@ jobs:
         run: pnpm exec turbo run build '--filter=!kora-docs'
 
       - name: Install Playwright Chromium
-        run: pnpm --filter kora-e2e exec playwright install --with-deps chromium
+        # apt mirrors fail transiently (exit 100): retry so a mirror blip doesn't fail the run.
+        run: |
+          for attempt in 1 2 3; do
+            pnpm --filter kora-e2e exec playwright install --with-deps chromium && exit 0
+            echo "Chromium install failed (attempt $attempt); retrying in 30 s"
+            sleep 30
+          done
+          exit 1
 
       - name: Packed offline-readiness suite (${{ matrix.template }})
         run: >-
