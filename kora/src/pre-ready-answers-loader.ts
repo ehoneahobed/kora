@@ -1,8 +1,8 @@
 import { type ReadFetch, ReadThroughClient, ReadThroughError } from '@korajs/sync/read'
+import { readEndpointUrl } from './early-read'
 import { PreReadyAnswers } from './pre-ready-answers'
-import { readEndpointUrl } from './read-query'
 import { readThroughAuthFor } from './read-through-auth'
-import type { ReadTracker } from './read-tracker'
+import { createReadTracker } from './read-tracker'
 import type { KoraConfig } from './types'
 
 /**
@@ -13,15 +13,14 @@ import type { KoraConfig } from './types'
  * @param sync - The app's sync configuration
  * @param schema - The app's schema
  * @param fetch - The fetch the read client uses (the early reads' hand-over)
- * @param tracker - Counts the reads waiting for an answer
  * @returns The answer service
  */
 export function createPreReadyAnswers(
 	sync: NonNullable<KoraConfig['sync']>,
 	schema: KoraConfig['schema'],
 	fetch?: ReadFetch,
-	tracker?: ReadTracker,
 ): PreReadyAnswers {
+	const tracker = createReadTracker()
 	// `sync.authClient` overrides `sync.auth` when both are set, as it does for sync.
 	const auth =
 		sync.authClient !== undefined
@@ -36,12 +35,13 @@ export function createPreReadyAnswers(
 	})
 	return new PreReadyAnswers({
 		schema,
+		readsIdle: tracker.idle,
 		source: {
 			// Each read counts from the ask until it settles, so the runtime's downloads wait.
 			read(query, options) {
-				tracker?.begin()
+				tracker.begin()
 				const reading = client.read(query, options)
-				const end = (): void => tracker?.end()
+				const end = (): void => tracker.end()
 				reading.then(end, end)
 				return reading
 			},

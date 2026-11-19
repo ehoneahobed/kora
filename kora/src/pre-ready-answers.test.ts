@@ -221,3 +221,18 @@ describe('DeferredQueryBuilder with a pre-ready answer', () => {
 		expect(s.withdraw).toHaveBeenCalled()
 	})
 })
+
+describe('the early read builds the same query as the answers chunk', () => {
+	it('identical JSON for plain queries (the request bodies must match byte for byte)', async () => {
+		const { earlyQuery } = await import('./early-read')
+		for (const overrides of [
+			{},
+			{ limit: 5 },
+			{ offset: 2, limit: 3 },
+			{ where: { title: 'x' } },
+		]) {
+			const d = descriptor(overrides)
+			expect(JSON.stringify(earlyQuery(d))).toBe(JSON.stringify(toReadQuery(d, schema)))
+		}
+	})
+})
