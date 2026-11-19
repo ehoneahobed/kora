@@ -29,12 +29,10 @@ export function createReadTracker(): ReadTracker {
 		},
 		idle(maxMs) {
 			if (pending === 0) return Promise.resolve()
+			// Whichever comes first; a later call of `resolve` does nothing.
 			return new Promise<void>((resolve) => {
-				const timer = setTimeout(resolve, maxMs)
-				waiters.push(() => {
-					clearTimeout(timer)
-					resolve()
-				})
+				setTimeout(resolve, maxMs)
+				waiters.push(resolve)
 			})
 		},
 	}

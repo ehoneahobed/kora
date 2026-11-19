@@ -2,7 +2,6 @@ import type { SchemaDefinition } from '@korajs/core'
 import type { QueryDescriptor } from '@korajs/store'
 import type { ReadFetch, ReadFetchResponse, ReadQuery, ReadRequest } from '@korajs/sync/read'
 import { readEndpointUrl, toReadQuery } from './read-query'
-import { readThroughAuthFor } from './read-through-auth'
 import type { ReadTracker } from './read-tracker'
 import type { KoraConfig } from './types'
 
@@ -32,13 +31,6 @@ const MAX_QUERIES_PER_REQUEST = 8
 /** The read protocol version (`READ_PROTOCOL_VERSION`), checked against the request type. */
 const READ_VERSION: ReadRequest['v'] = 1
 
-/** Thrown inside the auth check to say "no early read" (the client then decides as before). */
-class NoEarlyRead extends Error {
-	constructor(message: string, _code?: string, _retriable?: boolean) {
-		super(message)
-	}
-}
-
 /**
  * @param sync - The app's sync configuration (read-through on)
  * @param schema - The app's schema
@@ -53,10 +45,19 @@ export function createEarlyReads(
 ): EarlyReads {
 	const url = readEndpointUrl(sync.url)
 	const schemaVersion = sync.schemaVersion ?? schema.version
-	// `sync.authClient` overrides `sync.auth`, as for the chunk's client.
-	const auth =
-		sync.authClient !== undefined
-			? readThroughAuthFor(sync.authClient, NoEarlyRead as never)
+	// `sync.authClient` overrides `sync.auth`, as for the chunk's client, with the same rule
+	// (read-through-auth.ts) reduced to yes or no: a signed-in session with a token, or no early
+	// read (the client then decides, with its own errors). Kept small: this is first-paint code.
+	const binding = sync.authClient
+	const auth: (() => Promise<{ token: string }>) | undefined =
+		binding !== undefined
+			? async () => {
+					const state = await binding.resolveSyncState?.()
+					if (state !== undefined && state.state !== 'authenticated') throw 0
+					const credential = await binding.auth()
+					if (credential.token === '') throw 0
+					return credential
+				}
 			: sync.auth
 	const inFlight = new Map<string, Promise<ReadFetchResponse>>()
 	let turn: ReadQuery[] = []
@@ -111,7 +112,10 @@ export function createEarlyReads(
 		ask(descriptor) {
 			if (stopped) return
 			const query = toReadQuery(descriptor, schema)
-			if (query === null || turn.some((other) => other.key === query.key)) return
+			// A repeated query in one turn makes a body the client (which dedupes) never sends:
+			// the early response then goes unused, and the client asks itself. Rare, and cheaper
+			// than a check on first-paint code.
+			if (query === null) return
 			if (turn.length === 0) setTimeout(flush, 0)
 			turn.push(query)
 			// Counted from the ask, so a read still waiting for its turn holds the runtime too.
