@@ -366,6 +366,12 @@ const TOO_LARGE_DRAIN_BYTES = 64 * 1024 * 1024
  * const url = await server.start()
  * ```
  */
+/**
+ * @internal Tests read the number of custom route bodies being read through this key, to wait
+ * on the server's state instead of on time. Not part of the API.
+ */
+export const ROUTE_BODIES_IN_FLIGHT = Symbol.for('kora.productionServer.routeBodiesInFlight')
+
 export function createProductionServer(appConfig: ProductionServerConfig): ProductionServer {
 	// KORA_TRUST_PROXY and the operational tokens the host sets fill what the app left out.
 	const config = withHostSettings(appConfig)
@@ -773,7 +779,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 		res.end(JSON.stringify(result.body ?? null))
 	}
 
-	return {
+	const server: ProductionServer = {
 		kora: routeContext,
 		access: syncServer.access,
 
@@ -1399,6 +1405,9 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 			}
 		},
 	}
+	// Tests wait on this instead of on time (how many custom route bodies are being read).
+	Object.defineProperty(server, ROUTE_BODIES_IN_FLIGHT, { value: () => routeBodiesInFlight })
+	return server
 }
 
 /**
