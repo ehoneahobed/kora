@@ -565,7 +565,10 @@ describe('commit outcome unknown (M2) when the log cannot be read at once', () =
 		adapter.failLookups = true
 		adapter.fault = { kind: 'commit-lost', error: new Error('injected: commit lost') }
 		await expect(h.store.collection('todos').insert({ title: 'maybe' })).rejects.toThrow()
-		await quiesce()
+		// Wait for the outcome, not a fixed settle: on a loaded runner the display updates later.
+		await until(
+			() => h.registry.list()[0]?.state === 'unknown' && titles(h.seen.rows).includes('maybe'),
+		)
 		expect(h.registry.list()[0]?.state).toBe('unknown')
 		expect(labels(h.events)).toContain('store:write-settled:unknown')
 		expect(titles(h.seen.rows)).toEqual(['maybe'])
@@ -589,7 +592,7 @@ describe('commit outcome unknown (M2) when the log cannot be read at once', () =
 		adapter.failLookups = true
 		adapter.fault = { kind: 'commit-landed', error: new Error('injected: reply lost') }
 		await expect(h.store.collection('todos').insert({ title: 'landed' })).rejects.toThrow()
-		await quiesce()
+		await until(() => h.registry.list()[0]?.state === 'unknown')
 		expect(h.registry.list()[0]?.state).toBe('unknown')
 		adapter.failLookups = false
 		h.store
