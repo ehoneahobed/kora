@@ -19,7 +19,7 @@ export interface EarlyRead {
 	ask(descriptor: QueryDescriptor): void
 	/** The fetch the chunk's read client uses. */
 	readonly fetch: ReadFetch
-	/** Settles once the first request was sent (or decided not to be), or after 50 ms. */
+	/** Settles once the first request was sent (or decided not to be), or after 300 ms. */
 	readonly firstSend: Promise<void>
 }
 
@@ -68,8 +68,11 @@ export function createEarlyRead(
 	const firstSend = new Promise<void>((resolve) => {
 		sent = resolve
 	})
-	// A screen that asks nothing within 50 ms does not hold the answers chunk back longer.
-	setTimeout(sent, 50)
+	// Counted from createApp, so it must cover the first query mounting and being sent on a slow
+	// device (at 4x CPU that took ~90 ms; a 50 ms cap let the chunk go first, and the read then
+	// opened its own connection beside it). A screen that asks nothing does not hold the chunk
+	// back longer than this.
+	setTimeout(sent, 300)
 	// One request, for the first turn. With `sync.authClient` there is none: asking a lazily
 	// loaded sign-in client for its session would download it during the first paint, the link
 	// this read spares (the chunk's client reads then, as before).
