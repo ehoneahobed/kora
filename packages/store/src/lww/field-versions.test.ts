@@ -35,6 +35,19 @@ const writeArb: fc.Arbitrary<FieldWrite> = fc.record({
 })
 
 /**
+ * A sequence of writes as replicas can see it: every timestamp unique. A node's HLC never
+ * repeats and two nodes always differ by node id, so two writes with one timestamp and different
+ * values (a tie no order can break) cannot happen; letting the generator make them failed the
+ * convergence property for a reason the system never meets (seed 1076817297).
+ */
+const writesArb = (maxLength: number): fc.Arbitrary<FieldWrite[]> =>
+	fc.uniqueArray(writeArb, {
+		minLength: 1,
+		maxLength,
+		selector: (write) => serializeRowVersion(write.timestamp),
+	})
+
+/**
  * Fold a sequence of writes through the per-field LWW register in the given
  * order, returning the final field->value and field->version maps. This is the
  * pure model of what `store.applyRemoteOperation` does field-by-field.
@@ -90,28 +103,25 @@ describe('per-field LWW register', () => {
 	// AGENTS.md: merge must be DETERMINISTIC and ORDER-INDEPENDENT. Folding the
 	// same writes in any order must yield identical materialized state — this is
 	// the exact guarantee the concurrent-multifield sync bug violated.
-	propTest.prop([fc.array(writeArb, { minLength: 1, maxLength: 12 })])(
-		'folding writes is order-independent (convergence)',
-		(writes) => {
-			const canonical = foldWrites(writes)
-			// Try several independent shuffles; all must converge to the same state.
-			const orders = [
-				[...writes].reverse(),
-				[...writes].sort((a, b) => a.field.localeCompare(b.field)),
-				[...writes].sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp)),
-				[...writes].sort((a, b) => HybridLogicalClock.compare(b.timestamp, a.timestamp)),
-			]
-			for (const order of orders) {
-				const folded = foldWrites(order)
-				expect(folded.values).toEqual(canonical.values)
-			}
-		},
-	)
+	propTest.prop([writesArb(12)])('folding writes is order-independent (convergence)', (writes) => {
+		const canonical = foldWrites(writes)
+		// Try several independent shuffles; all must converge to the same state.
+		const orders = [
+			[...writes].reverse(),
+			[...writes].sort((a, b) => a.field.localeCompare(b.field)),
+			[...writes].sort((a, b) => HybridLogicalClock.compare(a.timestamp, b.timestamp)),
+			[...writes].sort((a, b) => HybridLogicalClock.compare(b.timestamp, a.timestamp)),
+		]
+		for (const order of orders) {
+			const folded = foldWrites(order)
+			expect(folded.values).toEqual(canonical.values)
+		}
+	})
 
 	// A true random permutation (not just a fixed set of sorts) must also
 	// converge — this is the general order-independence property.
 	propTest.prop([
-		fc.array(writeArb, { minLength: 1, maxLength: 12 }).chain((writes) =>
+		writesArb(12).chain((writes) =>
 			fc.tuple(
 				fc.constant(writes),
 				fc.shuffledSubarray(
@@ -129,12 +139,9 @@ describe('per-field LWW register', () => {
 	// Idempotency: re-applying a write that already lost (or already won) never
 	// changes the outcome. Content-addressing dedups at the op layer, but the
 	// register must be idempotent on its own.
-	propTest.prop([fc.array(writeArb, { minLength: 1, maxLength: 10 })])(
-		're-applying the whole sequence is idempotent',
-		(writes) => {
-			const once = foldWrites(writes)
-			const twice = foldWrites([...writes, ...writes])
-			expect(twice.values).toEqual(once.values)
-		},
-	)
+	propTest.prop([writesArb(10)])('re-applying the whole sequence is idempotent', (writes) => {
+		const once = foldWrites(writes)
+		const twice = foldWrites([...writes, ...writes])
+		expect(twice.values).toEqual(once.values)
+	})
 })
