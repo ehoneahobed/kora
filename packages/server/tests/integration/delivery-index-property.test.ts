@@ -432,6 +432,36 @@ async function playBoth(
 	}
 }
 
+/**
+ * Logs that once failed on the order of the stream, not on a delete: replayed with the
+ * generated logs and checked alone below. A membership change and a retraction in one burst
+ * (found by seed 194831439): the global scan sends the lesson's retraction before the new member
+ * row, and the index path must send the same stream.
+ */
+const ORDER_REGRESSIONS: Action[][] = [
+	[
+		{ kind: 'removeSchool', school: 's2' },
+		{ kind: 'lesson', school: 's2' },
+		{ kind: 'transfer', school: 's2', to: 'ann' },
+		{ kind: 'grant', school: 's2', role: 'view' },
+		{ kind: 'move', slot: 0, school: 's1' },
+	],
+]
+
+describe('order regressions: the index stream equals the global scan', () => {
+	for (const kind of kinds) {
+		for (const mode of ['catch-up', 'live', 'burst', 'stalled'] as const) {
+			if (mode === 'stalled' && kind.handle === null && kind.name === 'memory') continue
+			for (const [i, actions] of ORDER_REGRESSIONS.entries()) {
+				test(`${kind.name} ${mode}: order regression ${i + 1}`, async () => {
+					const { through, scan } = await playBoth(kind, mode, actions)
+					expect(through.lines).toEqual(scan.lines)
+				}, 120_000)
+			}
+		}
+	}
+})
+
 describe('regression logs are served by the index and keep the delete', () => {
 	// The logs that once failed, per mode: each asserts that the index served the read (a
 	// fallback to the global scan would pass the comparison trivially) and that bob is sent the
@@ -475,7 +505,9 @@ describe('the delivery index is a superset of what a session acts on', () => {
 					fc.asyncProperty(fc.array(actionArb, { minLength: 1, maxLength: 14 }), compare),
 					{
 						numRuns: kind.handle ? 15 : 40,
-						examples: REGRESSIONS.map((actions) => [actions] as [Action[]]),
+						examples: [...REGRESSIONS, ...ORDER_REGRESSIONS].map(
+							(actions) => [actions] as [Action[]],
+						),
 					},
 				)
 				// The property did not pass by never using the index.
