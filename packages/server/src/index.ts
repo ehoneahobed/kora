@@ -212,3 +212,4 @@ export { createSqliteServerStore } from './store/sqlite-server-store'
 // the compiler available. Bundled browser apps register it from the Kora runtime instead.
 import { registerAccessCompiler } from '@korajs/core'
 registerAccessCompiler()
+export { InvalidServerConfigError } from './server/server-config-error'

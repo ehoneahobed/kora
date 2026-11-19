@@ -27,6 +27,7 @@ import {
 import { tokensMatch } from './operational-token'
 import type { OperationsCommittedHandler } from './operations-committed'
 import type { ProductionHttpRouteContext } from './route-context'
+import { InvalidServerConfigError } from './server-config-error'
 import { type ShellMeta, applyShellMeta } from './shell-meta'
 import { createStaticFileHandler } from './static-files'
 import { type TrustProxySetting, resolveClientIp } from './trust-proxy'
@@ -572,10 +573,24 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 		return lines.join('\n')
 	}
 
-	const maxRequestBodyBytes = config.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
-	const maxConcurrentRequestBodies = config.maxConcurrentRequestBodies ?? 128
+	// Checked here, at creation: NaN would turn a limit off (it never compares as reached) and 0
+	// would refuse every request it covers.
+	const maxRequestBodyBytes = positiveInteger(
+		'maxRequestBodyBytes',
+		config.maxRequestBodyBytes,
+		DEFAULT_MAX_REQUEST_BODY_BYTES,
+	)
+	const maxConcurrentRequestBodies = positiveInteger(
+		'maxConcurrentRequestBodies',
+		config.maxConcurrentRequestBodies,
+		128,
+	)
 	let routeBodiesInFlight = 0
-	const maxBackupBytes = config.maxBackupBytes ?? DEFAULT_MAX_BACKUP_BYTES
+	const maxBackupBytes = positiveInteger(
+		'maxBackupBytes',
+		config.maxBackupBytes,
+		DEFAULT_MAX_BACKUP_BYTES,
+	)
 
 	/**
 	 * Read a request body of at most `limit` bytes. Resolves null when the body (or its
@@ -1589,4 +1604,13 @@ async function routeInsights(
 		}
 	}
 	return out
+}
+
+/** A size or count option: a positive whole number, or the default when left out. */
+function positiveInteger(option: string, value: unknown, fallback: number): number {
+	if (value === undefined) return fallback
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+		throw new InvalidServerConfigError(option, value, 'a positive whole number')
+	}
+	return value
 }

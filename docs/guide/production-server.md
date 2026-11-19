@@ -63,6 +63,8 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `maxBackupBytes` | 256 MiB | Largest backup import. |
 | `crossOriginEmbedderPolicy` | `'credentialless'` | COEP header for the served app. |
 
+The size and count options (`maxRequestBodyBytes`, `maxConcurrentRequestBodies`, `maxBackupBytes`) must be positive whole numbers. Anything else, such as `NaN`, `0` or a fraction, throws `InvalidServerConfigError` (`INVALID_SERVER_CONFIG`) when the server is created, instead of turning the limit off or refusing every request.
+
 `syncOptions` (also the config of `createKoraServer` / `KoraSyncServer`):
 
 | Option | Default | Description |
