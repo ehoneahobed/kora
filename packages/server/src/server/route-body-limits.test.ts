@@ -1,7 +1,11 @@
 import { type Socket, connect } from 'node:net'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { MemoryServerStore } from '../store/memory-server-store'
-import { type ProductionServer, createProductionServer } from './production-server'
+import {
+	type ProductionServer,
+	ROUTE_BODIES_IN_FLIGHT,
+	createProductionServer,
+} from './production-server'
 
 /**
  * Custom route bodies (auth, webhooks, app APIs) must arrive at a minimum rate and only so many
@@ -54,46 +58,41 @@ function stalledUpload(
 	return { socket, reply }
 }
 
-const within = <T>(promise: Promise<T>, ms: number): Promise<T | 'timeout'> =>
-	Promise.race([
-		promise,
-		new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), ms)),
-	])
+/** How many custom route bodies the server is reading now (its own count, not a guess from time). */
+const bodiesInFlight = (): number =>
+	(server as unknown as Record<symbol, () => number>)[ROUTE_BODIES_IN_FLIGHT]?.() ?? -1
 
+// No sleeps: deadlines are configured tiny (the rate arithmetic is unit-tested in
+// read-body-deadline.test.ts), and ordering waits on the server's in-flight count.
 describe('custom route bodies', () => {
-	test('a sender that stalls after the headers gets 408 and is cut off within the deadline', async () => {
-		const at = await start()
-		const startedAt = Date.now()
+	test('a sender that stalls after the headers gets 408 and the connection is closed', async () => {
+		const at = await start({ routeBodyTimeoutMs: 50 })
 		const { reply } = stalledUpload(at, 1000)
-		// 1,000 declared bytes: 2 s grace plus 1 s per KiB.
-		const answered = await within(reply, 6_000)
-		expect(answered).not.toBe('timeout')
-		if (answered === 'timeout') return
+		const answered = await reply
 		expect(answered.status).toBe(408)
-		expect(answered.closedAtMs - startedAt).toBeLessThan(5_000)
-	}, 15_000)
+	})
 
-	test('routeBodyTimeoutMs sets the ceiling: a stalled sender is cut off at it', async () => {
-		// A declared 1 KB body would get 3 s by the rate rule; the configured ceiling is shorter.
-		const at = await start({ routeBodyTimeoutMs: 300 })
+	test('routeBodyTimeoutMs sets the ceiling below the rate rule', async () => {
+		// A declared 1 KB body would get 3 s by the rate rule; the configured 50 ms ceiling wins.
+		// The bound is 30x the ceiling: it fails only if the 3 s rule applied.
+		const at = await start({ routeBodyTimeoutMs: 50 })
 		const startedAt = Date.now()
 		const { reply } = stalledUpload(at, 1000)
 		const answered = await reply
 		expect(answered.status).toBe(408)
-		expect(answered.closedAtMs - startedAt).toBeLessThan(2_000)
+		expect(answered.closedAtMs - startedAt).toBeLessThan(1_500)
 	})
 
 	test('past the in-flight cap, another body is refused with 503 at once', async () => {
-		const at = await start({ maxConcurrentRequestBodies: 2 })
+		const at = await start({ maxConcurrentRequestBodies: 2, routeBodyTimeoutMs: 60_000 })
 		stalledUpload(at, 5000)
 		stalledUpload(at, 5000)
-		await new Promise((resolve) => setTimeout(resolve, 200))
+		// Both bodies are being read before the third arrives.
+		await vi.waitFor(() => expect(bodiesInFlight()).toBe(2))
 		const third = stalledUpload(at, 10)
-		const answered = await within(third.reply, 2_000)
-		expect(answered).not.toBe('timeout')
-		if (answered === 'timeout') return
+		const answered = await third.reply
 		expect(answered.status).toBe(503)
-	}, 15_000)
+	})
 
 	test('an ordinary request still gets its answer', async () => {
 		const at = await start()
