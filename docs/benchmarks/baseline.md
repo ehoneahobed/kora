@@ -196,8 +196,15 @@ average 5 to 8 from other agents (ratios hold, absolute times do not):
 
 After C3 the device's time is: content-id verification and other per-operation engine work about
 a third, the fold about 30%, commits 16 to 18%, the rest under 20%. The live benchmark's full
-scope (server in the same process) moved 0.56 to 0.95 per alternated round. The browser variant,
-where each OPFS commit is a 10 to 15 ms fixed cost, is still to be measured.
+scope (server in the same process) moved 0.56 to 0.95 per alternated round.
+
+In the browser, where each OPFS commit is a 10 to 15 ms fixed cost, the batch transaction alone
+still left about 18 storage calls per operation (13 reads, 5 writes) inside it. C3b
+(`SyncStoreBatch.prefetch`) reads what a chunk's operations need once, which brings it to about
+1.07 calls per operation: first sync of the 20,000-operation school in Chromium on OPFS went from
+about 6.4 minutes to about 2.3 minutes (about 2.7x). The rest is OPFS journal I/O, which staged
+replication addresses (`docs/design/fast-first-sync.md`, section 8, and
+`docs/design/first-visit-parity.md`).
 
 ## Merge (the fold, `@korajs/core`)
 

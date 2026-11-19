@@ -109,7 +109,10 @@ are only reported there. At Slow 4G, about 29 KB of gzip costs about 137 ms of t
 ### 2.6 Where it runs
 
 - **Nightly** (`.github/workflows/parity-nightly.yml`): read-through on, `4g` and `broadband`, 1x
-  and 4x. `KORA_PARITY_ENFORCE=1` fails the job on any failing relative cell or Kora target.
+  and 4x. `KORA_PARITY_ENFORCE=1` fails the job on any failing relative cell or Kora target. On
+  `main`, the run of 2026-11-19 dispatched after #333 (44511902726) and the scheduled run that
+  followed (44520051982) passed every cell and K3 (22.5 KiB against the 23,100-byte, 22.6 KiB
+  ratchet).
 - **Every PR** (`e2e.yml`, bundle budget): K3 as a no-growth check. The `react-tailwind-sync`
   template is built at the merge base and at the head on one runner, with the scaffold's tooling
   pinned (`PINNED_TOOLING`). The job fails when the head exceeds the base by more than
@@ -184,6 +187,16 @@ dependency, so it ships in the lite entry. It coalesces the requests of one turn
 POST, shares identical queries, refreshes the token once after a 401, retries with backoff, and
 remembers a 404 for the session. Its credential is `sync.auth`, or `sync.authClient` while a user
 is signed in (`kora/src/read-through-auth.ts`).
+
+**The early read.** The read client lives in the answers chunk, one more round trip on a first
+visit. So the first screen's queries leave from the first paint (`kora/src/early-read.ts`): the
+first turn's queries go out in one request built exactly as the client would build it, and the
+client takes that response over when the chunk arrives. The chunk waits up to 300 ms for that
+first request to be sent, so on a slow device the read takes the open connection instead of racing
+the chunk on a second one. With `sync.authClient` there is no early read (asking a lazily loaded
+sign-in client for its session would download it during the first paint); the chunk's client
+reads then. A navigation read still waiting for its answer holds back the store's storage
+downloads for at most a second (`READ_YIELD_MAX_MS`).
 
 ### 5.1 In-memory answers
 

@@ -56,7 +56,7 @@ const nativeAuth = createKoraAuth({
 |--------|------|---------|
 | `serverUrl` | `string` | required |
 | `credentialStore` | `AuthKeyValueStorage` (sync or async `getItem`/`setItem`/`removeItem`) | `localStorage` when available, else memory |
-| `storage` | `AuthTokenStorage` | adapted from `credentialStore` |
+| `storage` | `AuthTokenStorage` | adapted from `credentialStore`, without a declared durability |
 | `deviceKeyStore` | `DeviceKeyStore` | IndexedDB when available |
 | `deviceIdentity` | `AuthDeviceIdentityProvider \| false` | created when persistent storage exists |
 | `storageKey` | `string` | `'kora_auth'` |
@@ -67,6 +67,12 @@ const nativeAuth = createKoraAuth({
 
 `new AuthClient(config)` takes the same options without `credentialStore`/`deviceKeyStore`
 (`storage` and `deviceIdentity` instead).
+
+[Offline readiness](/api/offline#sign-in) counts a stored session only on storage that declares
+it survives a restart. The default `localStorage` store does; a store passed as `credentialStore`
+declares nothing and reads `unknown`. For a platform keychain, pass
+`storage: createAuthTokenStorage({ store, durability: 'durable' })` instead (on Tauri,
+`createTauriCredentialStore()` from `@korajs/tauri`).
 
 ### `AuthClient`
 
@@ -134,18 +140,24 @@ const app = createApp({
 
 The binding (`AuthSyncBinding`) supplies `auth({ forceRefresh? })`, `resolveSyncState()` (`loading`,
 `signed-out`, `anonymous` or `authenticated` with `userId`, `deviceId`, `offline`, `locked`),
-`resolveScopeMap()`, `resolveNodeId()`, `resolveUserId()` and `subscribe()`. Kora uses them to bind
-every local write to the signed-in user, keep one sync node per user and device, suspend sync while
-signed out or loading, and reconnect when the user changes. The scope map is only a hint that can
-narrow what the server grants.
+`resolveScopeMap()`, `resolveNodeId()`, `resolveUserId()`, `resolveOfflineRestore()` and
+`subscribe()`. Kora uses them to bind every local write to the signed-in user, keep one sync node
+per user and device, suspend sync while signed out or loading, reconnect when the user changes,
+and report whether the session restores on an offline reload (`app.offline.status().auth`). The
+scope map is only a hint that can narrow what the server grants.
+
+The binding loads the stored session of a client nobody initialized (an app that uses the client
+without `AuthProvider`, such as a desktop till or a script), so sync does not stay signed out
+after a restart. To keep the sign-in client out of the first paint, wrap the binding in
+`lazyAuthSync(() => import('./auth').then((m) => m.authSync))` from `korajs`.
 
 ### Token storage
 
 | Function | Description |
 |----------|-------------|
-| `createAuthTokenStorage({ store, prefix? })` | Adapts a sync or async key-value store to `AuthTokenStorage`. |
-| `createWebStorageAuthTokenStorage(storage, prefix?)` | `localStorage` or `sessionStorage`. |
-| `createMemoryAuthTokenStorage()` | Memory only (tests, SSR). |
+| `createAuthTokenStorage({ store, durability?, prefix? })` | Adapts a sync or async key-value store to `AuthTokenStorage`. `durability` (`'durable'`, `'session'` or `'memory'`) says whether the tokens survive a restart; without it the store is `unknown` to offline readiness. |
+| `createWebStorageAuthTokenStorage(storage, prefix?)` | `localStorage` (`durable`) or `sessionStorage` (`session`). |
+| `createMemoryAuthTokenStorage()` | Memory only (tests, SSR); `memory`. |
 | `TokenStore` | Older synchronous token store (`saveTokens`, `loadTokens`, `clearTokens`). |
 | `EncryptedTokenStore({ key, storageKey? })` | Tokens encrypted with AES-256-GCM in `localStorage`: `saveTokens`, `loadTokens`, `clearTokens`, `getAccessToken`, `getRefreshToken` (async). |
 
@@ -209,9 +221,10 @@ interface DeviceKeyStore {
 
 ### `OrgClient`
 
-Client for organization endpoints (`/orgs/...`). Those endpoints are **not** served by
-`createKoraAuthServer().handleRequest`: wire [`OrgRoutes`](#orgroutes) into your server under the
-same paths.
+Client for organization endpoints (`/orgs/...`, `/invitations/...`, below its `serverUrl`). Those
+endpoints are **not** served by `createKoraAuthServer().handleRequest`: serve them with
+[`routeOrgRequest`](#orgroutes), which maps every request the client makes to its `OrgRoutes`
+handler. Ids travel as encoded path segments.
 
 ```typescript
 const orgClient = new OrgClient({
@@ -360,7 +373,7 @@ declare function SignInForm(): JSX.Element
 | `useAuth()` | `{ user, isAuthenticated, isLoading, error, initError, signUp, signIn, signOut, signInWithOAuth, getOAuthAuthorizationUrl, completeOAuthSignIn, linkOAuth, listLinkedAccounts, unlinkOAuth, sendVerificationEmail, verifyEmail, requestPasswordReset, resetPassword, changePassword }`. |
 | `useCurrentUser()` | `AuthUser \| null`. |
 | `useAuthStatus()` | `{ state, isAuthenticated, isLoading }`; re-renders only when the state changes. |
-| `<OrgProvider client>` | Provides an `OrgClient`. |
+| `<OrgProvider client>` | Provides an `OrgClient`. Safe under StrictMode: org sessions are shared per client and released shortly after the last provider unmounts. |
 | `useOrg()` | `{ org, role, orgId, switchOrg, createOrg, leaveOrg, clearOrg, listOrgs, error }`. |
 | `useOrgMembers(orgId)` | `{ members, isLoading, refresh, invite, removeMember, updateRole, error }`. |
 | `usePermission(role)` / `checkOrgPermission(currentRole, role)` | `true` when the active role is at least `role` (`viewer` < `billing` < `member` < `admin` < `owner`). |
@@ -432,7 +445,7 @@ const server = createProductionServer({
 
 | Option | Type | Default |
 |--------|------|---------|
-| `jwtSecret` | `string \| string[]` (index 0 signs, all verify) | `KORA_AUTH_SECRET`; a generated development secret outside production |
+| `jwtSecret` | `string \| string[]` (index 0 signs, all verify) | `authSecretFromEnv()`: `KORA_AUTH_SECRET` signs and the comma-separated `KORA_AUTH_SECRET_PREVIOUS` still verify; a generated development secret outside production |
 | `userStore` | `UserStore` | `InMemoryUserStore` (refused in production) |
 | `revocationStore` | `TokenRevocationStore` | the user store's own (`getTokenRevocationStore()`) |
 | `allowInMemory` | `boolean` | `false`: with `NODE_ENV=production`, in-memory user, revocation or email verification stores throw `InMemoryAuthStoreError` (`IN_MEMORY_AUTH_STORE`) |
@@ -441,6 +454,7 @@ const server = createProductionServer({
 | `oauth` | `OAuthServerConfig` | OAuth disabled |
 | `mfa` | `MfaVerifier` (for example a `TotpManager`) | none: sign-in is one step |
 | `emailVerification` | `{ url, send, sendOnSignUp?, tokenTtlMs?, maxPerHour?, store? }`: serves `POST /auth/email/send-verification` and `POST /auth/email/verify` (see [Email Verification](/guide/authentication#email-verification)) | off |
+| `passwordReset` | `{ url, send, tokenTtlMs?, maxPerHour?, store?, onPasswordChanged?, onUnverifiedAccountClaimed? }`: serves `POST /auth/password/forgot` and `POST /auth/password/reset` (see [Password Reset](/guide/authentication#password-reset)); `POST /auth/password/change` is served either way | off |
 | `challengeStore` / `rateLimiter` | `ChallengeStore` / `RateLimiter` | in memory |
 | `scopeValues` | `(claims) => values` | none: scoped collections bind `{ userId }` only |
 | `resolveScopes` | `(claims) => ScopeMap \| SyncGrant` (a `SyncGrant` grants reading and writing separately) | none |
@@ -452,7 +466,10 @@ Returned `KoraAuthServer`:
 
 | Member | Description |
 |--------|-------------|
-| `handleRequest(request)` | One handler for every route below. `request`: `{ method, path, body?, headers?, query?, ip? }`. |
+| `handleRequest(request)` | One handler for every route below. `request`: `{ method, path, body?, headers?, query?, ip?, waitUntil? }`; pass a serverless host's `waitUntil` so emails sent after the response still go out. |
+| `httpRoute` | `{ path, handle, insights }` for `createProductionServer({ httpRoutes })`: the routes, plus sign-in activity reported under `http.auth` in `/__kora/insights`. |
+| `activity()` | Counts of what the routes did in the last hour and day (sign-ins, sign-ups, second factors, OAuth, refreshes, verification and reset emails), by outcome and failure code. Counts only, in memory, per instance. |
+| `emailVerification?`, `passwordReset?` | The managers, when configured. |
 | `auth` | Sync auth provider for `KoraSyncServer` (`authenticate(token)` with server-derived scopes, `onRevoke`). |
 | `routes`, `userStore`, `tokenManager`, `oauth?`, `linkedIdentityStore?` | The configured parts. |
 | `revokeAllForUser(userId)` | Revokes every credential of a user and ends their live sync sessions. |
@@ -471,6 +488,9 @@ Returned `KoraAuthServer`:
 | `GET /auth/oauth/:provider` | Authorization URL and state (binding cookie for browsers). |
 | `GET` or `POST /auth/oauth/:provider/callback` | Completes sign-in. |
 | `POST /auth/oauth/:provider/link/start`, `POST` / `DELETE /auth/oauth/:provider/link`, `GET /auth/oauth/links` | Account linking. |
+| `POST /auth/email/send-verification`, `POST /auth/email/verify` | Email verification (with `emailVerification`). |
+| `POST /auth/password/forgot`, `POST /auth/password/reset` | Password reset (with `passwordReset`). |
+| `POST /auth/password/change` | Password change for the signed-in user. |
 
 Error responses are `{ error, code }` with stable codes such as `INVALID_CREDENTIALS`,
 `RATE_LIMITED`, `ACCESS_TOKEN_REQUIRED`, `ACCESS_TOKEN_INVALID`, `REFRESH_TOKEN_INVALID`,
@@ -479,6 +499,29 @@ Error responses are `{ error, code }` with stable codes such as `INVALID_CREDENT
 `OAuthServerConfig`: `providers` (required), `stateStore`, `stateTtlMs`, `fetch`,
 `linkedIdentityStore`, `createNewUsers` (default `true`), `autoLinkVerifiedEmail` (default `false`),
 `allowUnlinkLastIdentity` (default `false`, so an OAuth-only account keeps a way to sign in).
+
+### App signer
+
+`createAppSigner(secret, purpose)` signs the small values an app hands out and reads back (share
+links, invitations, unsubscribe links) with the sign-in secret. Pass `authSecretFromEnv()`: tokens
+are signed with the current secret and still verify when signed with one listed in
+`KORA_AUTH_SECRET_PREVIOUS`, so changing the secret does not break links already sent. Each purpose
+(1 to 64 letters, digits, `.`, `:`, `-`, `_`) gets its own key, so a token made for one purpose is
+refused by another and is never a session.
+
+<!-- docs-check: standalone -->
+```typescript
+import { authSecretFromEnv, createAppSigner } from '@korajs/auth/server'
+
+const invites = createAppSigner(authSecretFromEnv() ?? 'dev-secret', 'invite')
+const token = invites.sign({ listId: 'l1' }, { expiresInSeconds: 3600 }) // signed, not encrypted
+const value = invites.verify<{ listId: string }>(token) // null when forged, changed or expired
+```
+
+`authSecretFromEnv(env?)` returns `KORA_AUTH_SECRET` alone, or `[current, ...previous]` when
+`KORA_AUTH_SECRET_PREVIOUS` lists others, or `undefined` when the current secret is unset or
+blank. A mistake in the app's code (no secret, an invalid purpose) throws `AppSignerError`
+(`APP_SIGNER_INVALID`); `verify` never throws for a visitor's token.
 
 ### `BuiltInAuthRoutes`
 
@@ -496,10 +539,13 @@ The handlers behind `handleRequest`, for custom wiring. Each returns
 | `handleDeviceRegister(accessToken, { deviceId, publicKey, name })`, `handleDeviceChallenge(accessToken, deviceId)`, `handleDeviceVerify({ deviceId, challenge, signature })` | Device keys. |
 | `handleRevokeDevice(accessToken, deviceId)` | |
 | `authenticateAccess(token)` | The one check every route and the sync provider use: signature, expiry, user and device revocation. |
-| `revokeAllForUser(userId)`, `onRevoke(listener)` | Revocation. |
+| `revokeAllForUser(userId, at?)`, `onRevoke(listener)` | Revocation; `revokeAllForUser` returns the cut-off it recorded. |
 | `toSyncAuthProvider({ scopeValues?, resolveScopes? })` | Sync provider. |
 
 Config: `userStore`, `tokenManager` (required), `challengeStore`, `rateLimiter`, `mfa`, `onRevoke`.
+A custom `RateLimiter` implements `isAllowed`, `record`, `reset` and, for production, the optional
+`consume(key)` (check and count in one atomic step); sign-in uses `consume` when present, so
+parallel guesses cannot all pass before one is counted.
 
 ### User stores
 
@@ -507,9 +553,17 @@ Config: `userStore`, `tokenManager` (required), `challengeStore`, `rateLimiter`,
 `createPostgresUserStore(...)` (`PostgresUserStore`). The SQLite and Postgres stores also hold the
 token revocations. `PostgresUserStore.close()` ends the connections of a store made by
 `createPostgresUserStore` (a client passed to `new PostgresUserStore(sql)` stays open unless
-`{ ownsClient: true }`), so scripts can exit. Custom stores implement `UserStore` (`createUser`, `findByEmail`, `findById`,
+`{ ownsClient: true }`), so scripts can exit. The SQLite, Postgres and in-memory stores also keep
+pending email verifications and password resets (`getEmailVerificationStore()`,
+`getPasswordResetStore()`). Custom stores implement `UserStore` (`createUser`, `findByEmail`, `findById`,
 `registerDevice`, `findDevice`, `listDevices`, `revokeDevice`, `setEmailVerified`, `updatePassword`,
-`listAll`, `update`, `delete`, `touchDevice`, optional `getTokenRevocationStore`).
+`listAll`, `update`, `delete`, `touchDevice`, optional `getTokenRevocationStore`). `update(user)`
+writes the profile only (email, name, `emailVerified`), so an update made from an earlier copy
+cannot undo a password change. Password reset and change need the optional
+`updatePasswordIf(userId, condition, hash, salt)` and email verification needs
+`markEmailVerifiedIfEmail(userId, email)`, each one atomic conditional update; without them the
+managers refuse the store (`PASSWORD_RESET_STORE_UNSUPPORTED`, `PASSWORD_CHANGE_STORE_UNSUPPORTED`,
+`EMAIL_VERIFICATION_STORE_UNSUPPORTED`).
 
 ### `TokenManager`
 
@@ -531,7 +585,8 @@ Methods: `issueTokens`, `issueAccessToken(userId, deviceId, options?)`,
 `issueRefreshToken(userId, deviceId, options?)`, `issueDeviceCredential`, `validateToken(token)`
 (signature and expiry, synchronous), `validateTokenWithRevocation(token)`, `rotateRefreshToken`,
 `refreshAccessToken`, `revokeToken(jti, expiresAt)`, `revokeFamily`, `revokeDeviceTokens(deviceId)`,
-`revokeAllForUser(userId)`. Without a revocation store, tokens stay valid until they expire.
+`revokeAllForUser(userId, at?)` (returns the cut-off). Issue options accept `issuedAtMs` to date a
+token. Without a revocation store, tokens stay valid until they expire.
 
 A just-rotated refresh token is accepted once more within `refreshReuseGraceMs` and returns the same
 successor pair (two tabs refreshing at once); later reuse revokes the token family.
@@ -578,8 +633,17 @@ await totp.verifySetup('user-123', '123456')
 Config: `issuer`, `store`, `digits` (6), `period` (30 s), `algorithm` (`'SHA-1'`), `window` (1),
 `recoveryCodes` (8). Methods: `enable`, `verifySetup`, `verify`, `verifyRecoveryCode`,
 `regenerateRecoveryCodes(userId, totpCode)`, `disable(userId, code)`, `isEnabled`,
-`remainingRecoveryCodes`. A code is accepted once (replay protection); after 5 wrong codes the user
-is locked out with exponential backoff from 30 s to 15 minutes (`TotpLockedError`, `TOTP_LOCKED`).
+`remainingRecoveryCodes`, `removeForUser`. A code is accepted once (replay protection); after 5 wrong
+codes the user is locked out with exponential backoff from 30 s to 15 minutes (`TotpLockedError`,
+`TOTP_LOCKED`).
+
+Checks are atomic: checks for one user run one at a time in each process, and every write is
+conditional on the stored `revision`, so one code cannot sign in twice and parallel wrong guesses
+are each counted, also across server processes. A `TotpStore` implements `save`, `getByUserId`,
+`delete` and `saveIf(secret, expectedRevision)`: save only if the stored revision still matches
+(for SQL, `UPDATE ... WHERE user_id = ? AND revision = ?` checking the affected row count), and
+store `revision` as given. `TotpManager` refuses a store without `saveIf` (`TOTP_STORE_NOT_ATOMIC`).
+`InMemoryTotpStore` implements it, for development and tests.
 
 ### `OrgRoutes`
 
@@ -654,9 +718,9 @@ Native public clients use `pkce: true` without `clientSecret`. Durable stores:
 
 | Module | Summary |
 |--------|---------|
-| `PasswordResetManager(userStore, { url, send, tokenTtlMs?, maxPerHour?, store?, onPasswordChanged? })` | `request(email)` (run it without waiting and never tell the requester its outcome), `reset(token, password)`, `change(userId, currentPassword, newPassword)`. `createKoraAuthServer({ passwordReset })` builds one and serves its routes; use it directly only with custom routes. |
+| `PasswordResetManager(userStore, { url, send, tokenTtlMs?, maxPerHour?, store?, onPasswordChanged?, onUnverifiedAccountClaimed? })` | `request(email)` (run it without waiting and never tell the requester its outcome), `reset(token, password)`, `change(userId, currentPassword, newPassword)`. `createKoraAuthServer({ passwordReset })` builds one and serves its routes; use it directly only with custom routes. |
 | `EmailVerificationManager(userStore, { url, send, sendOnSignUp?, tokenTtlMs?, maxPerHour?, store? })` | `send(userId, reason)`, `verify(token, signedInUserId)` (the user id from the request's verified access token: a link verifies only its own account). `createKoraAuthServer({ emailVerification })` builds one and serves its routes; use it directly only with custom routes. |
-| `ExternalJwtProvider({ providerName, jwtSecret?, validateToken? })`, `createClerkAdapter`, `createSupabaseAdapter` | Accept tokens from another identity provider. With `jwtSecret`, any standard HS256 header verifies (a `kid`, no `typ`); `none` and other algorithms are refused. Asymmetric keys (RS256, ES256, a Supabase project on JWT signing keys) need `validateToken`. |
+| `ExternalJwtProvider({ providerName, jwtSecret?, validateToken?, mapClaims?, audience?, issuer?, scopeValues?, resolveScopes? })`, `createClerkAdapter`, `createSupabaseAdapter` | Accept tokens from another identity provider. `resolveScopes` may return a scope map or a directional `SyncGrant`. With `jwtSecret`, any standard HS256 header verifies (a `kid`, no `typ`); `none` and other algorithms are refused. Asymmetric keys (RS256, ES256, a Supabase project on JWT signing keys) need `validateToken`. |
 | `AdminApi({ userStore, sessionStore?, auditLogger?, isAdmin?, revokeAllForUser? })` | Every method takes the acting admin's id first, is refused with `ADMIN_UNAUTHORIZED` when `isAdmin` rejects it, and is audited: `getUser(adminId, userId)`, `listUsers(adminId, { email?, emailVerified?, limit?, offset? })`, `updateUser`, `deleteUser`, `getUserSessions(adminId, userId)`, `revokeUserSessions`, `revokeSession`, `getStats(adminId)`. Without `isAdmin`, gate access to `AdminApi` yourself. `deleteUser` and `revokeUserSessions` throw `ADMIN_REVOCATION_UNAVAILABLE` before deleting anything when nothing can revoke the user's tokens: wire `revokeAllForUser` (for example `authServer.revokeAllForUser`, which also ends live sync sessions) or use a user store with a token revocation store. |
 | `AuditLogger` | `log`, `query`, `count`, `purge`, `getUserActivity`, `getFailedLogins`. |
 | `WebhookManager({ store, fetch?, allowPrivateTargets?, resolveHost?, transport? })` | `register({ url, events, metadata? })`, `update`, `remove`, `list`, `get`, `getDeliveries`, `dispatch`. Targets must be https and public: loopback, private, link-local (cloud metadata), CGNAT, IPv4-compatible (`::/96`) and IPv4-mapped or NAT64 (`64:ff9b::/96`) addresses carrying a private IPv4 address are refused. Each attempt resolves the host once and connects to that checked address (`transport`, by default Node's `https` with the lookup pinned; the certificate is still checked against the host name), so a second DNS answer cannot redirect it. A custom `fetch` resolves on its own and is not pinned: pass `transport` too for a runtime without `node:https`. |
@@ -673,7 +737,7 @@ relaxes this for development; refused targets throw `WebhookTargetError`). Each 
 
 <!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
-interface AuthUser { id: string; email: string; name: string | null }
+interface AuthUser { id: string; email: string; name: string | null; emailVerified?: boolean }
 interface AuthTokens { accessToken: string; refreshToken: string }
 type TokenType = 'access' | 'refresh' | 'device_credential'
 
@@ -700,7 +764,8 @@ type CollectionScopeResolver = (ctx: ScopeContext) => ScopeFilter | null
 
 `AuthEvent` (`auth:signed-in`, `auth:signed-out`, `auth:locked`, `auth:unlocked`,
 `auth:token-refreshed`, `auth:device-revoked`, `auth:permission-changed`) is declared but not
-emitted; observe `onAuthChange` and `onSessionChange` instead.
+emitted; observe `onAuthChange` and `onSessionChange` instead. Its `user` is the client's
+`AuthUser`, the type `AuthClient.currentUser` returns.
 
 ## Errors
 
@@ -719,13 +784,15 @@ for each code.
 | Server (`@korajs/auth/server`) | Codes |
 |--------------------------------|-------|
 | `InMemoryAuthStoreError` | `IN_MEMORY_AUTH_STORE` |
+| `AuthProviderError` | `AUTH_PROVIDER_ERROR` (with the HTTP `status`) |
+| `AppSignerError` | `APP_SIGNER_INVALID` |
 | `DuplicateEmailError`, `DeviceOwnershipError` | `DUPLICATE_EMAIL`, `DEVICE_OWNERSHIP_CONFLICT` |
 | `PasskeyVerificationError` | `PASSKEY_VERIFICATION_ERROR` |
 | Session errors | `SESSION_NOT_FOUND`, `SESSION_EXPIRED`, `SESSION_LIMIT_EXCEEDED`, `SESSION_MFA_REQUIRED` |
-| TOTP errors | `TOTP_INVALID_CODE`, `TOTP_LOCKED`, `TOTP_NOT_ENABLED`, `TOTP_ALREADY_ENABLED`, `TOTP_NOT_VERIFIED`, `TOTP_RECOVERY_EXHAUSTED` |
+| TOTP errors | `TOTP_INVALID_CODE`, `TOTP_LOCKED`, `TOTP_NOT_ENABLED`, `TOTP_ALREADY_ENABLED`, `TOTP_NOT_VERIFIED`, `TOTP_RECOVERY_EXHAUSTED`, `TOTP_STORE_NOT_ATOMIC` |
 | Organization errors | `ORG_NOT_FOUND`, `ORG_SLUG_TAKEN`, `MEMBERSHIP_NOT_FOUND`, `MEMBER_ALREADY_EXISTS`, `INSUFFICIENT_ROLE`, `CANNOT_REMOVE_OWNER`, `INVITATION_NOT_FOUND`, `INVITATION_EXPIRED` |
 | RBAC errors | `INVALID_PERMISSION`, `ROLE_NOT_FOUND`, `CIRCULAR_INHERITANCE` |
 | OAuth errors | `OAUTH_STATE_MISMATCH`, `OAUTH_CODE_EXCHANGE_FAILED`, `OAUTH_USER_INFO_FAILED`, `OAUTH_PROVIDER_NOT_FOUND`, `DUPLICATE_LINKED_IDENTITY` |
-| Reset and verification | `RESET_TOKEN_EXPIRED`, `RESET_TOKEN_NOT_FOUND`, `RESET_RATE_LIMITED`, `VERIFICATION_TOKEN_EXPIRED`, `VERIFICATION_TOKEN_NOT_FOUND` |
+| Reset and verification (`EmailVerificationError`, `KoraError`) | `EMAIL_VERIFICATION_STORE_UNSUPPORTED`, `PASSWORD_RESET_STORE_UNSUPPORTED`, `PASSWORD_CHANGE_STORE_UNSUPPORTED`. Token problems are result codes, not errors: `RESET_TOKEN_INVALID`, `RESET_TOKEN_EXPIRED`, `VERIFICATION_TOKEN_INVALID`, `VERIFICATION_TOKEN_EXPIRED`, `VERIFICATION_WRONG_ACCOUNT` (the route responses' `code`). |
 | External providers | `AUTH_EXTERNAL_TOKEN_INVALID`, `AUTH_EXTERNAL_OPERATION_NOT_SUPPORTED` |
-| Admin and webhooks | `ADMIN_USER_NOT_FOUND`, `ADMIN_UNAUTHORIZED`, `WEBHOOK_ENDPOINT_NOT_FOUND`, `WEBHOOK_TARGET_REFUSED` |
+| Admin and webhooks | `ADMIN_USER_NOT_FOUND`, `ADMIN_UNAUTHORIZED`, `ADMIN_REVOCATION_UNAVAILABLE`, `WEBHOOK_ENDPOINT_NOT_FOUND`, `WEBHOOK_TARGET_REFUSED` |

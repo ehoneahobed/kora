@@ -9,7 +9,8 @@ description: "@korajs/core API reference: defineSchema, field builders, atomic o
 operation model, the hybrid logical clock, the per-field merge (the fold) and the shared types. It
 depends on no other `@korajs` package. The `korajs` meta-package re-exports the everyday part
 (`defineSchema`, `t`, `migrate`, `op`, `HybridLogicalClock`, `generateUUIDv7`, `createOperation`,
-`KoraError`, `AppNotReadyError` and the schema and operation types); import everything else from
+the [access rule](#access-rules) builders, `KoraError`, `AppNotReadyError`, `AppOpenFailedError`,
+`BlobPullUnavailableError` and the schema and operation types); import everything else from
 `@korajs/core`.
 
 ```typescript
@@ -44,7 +45,17 @@ produces typed collections without code generation.
 <!-- docs-check: signature @korajs/core -->
 ```typescript
 function defineSchema<const T extends SchemaInput>(input: T): TypedSchemaDefinition<T>
+function finalizeSchema(schema: SchemaDefinition): void
 ```
+
+`defineSchema` returns at once a lightweight schema: its collections and fields, which is what the
+first screen needs. The rest (names, indexes, constraints, resolvers, scopes, state machines,
+relations, migrations, sync rules, access rules) is validated and completed by `finalizeSchema`,
+which loads with the Kora runtime. Wherever the full `@korajs/core` entry is loaded (development
+builds of `korajs`, servers, the CLI, tests), that happens inside `defineSchema`, so an invalid
+schema throws at the call. In a production browser build it happens when the runtime loads, and an
+invalid schema rejects `app.ready` with the same error. Reading `schema.access` before then throws
+`AccessNotLoadedError` (`ACCESS_NOT_LOADED`). Application code does not call `finalizeSchema`.
 
 #### SchemaInput
 
@@ -54,6 +65,7 @@ function defineSchema<const T extends SchemaInput>(input: T): TypedSchemaDefinit
 | `collections` | `Record<string, CollectionInput>` | Yes | At least one collection. Names start with a letter and contain letters, digits and underscores. |
 | `relations` | `Record<string, RelationInput>` | No | Relations between collections. |
 | `migrations` | `Record<number, MigrationBuilder>` | No | Migrations keyed by target version (2 to `version`), built with [`migrate()`](#migrations). |
+| `access` | `{ memberships?, roles?, groups? }` | No | The memberships collection, the roles (lowest to highest) and the group collections whose creator becomes a member. See [Access rules](#access-rules). |
 | `sync` | `Record<string, { where: Record<string, true \| string> }>` | No | [Partial-sync rules](#schema-sync-rules). |
 
 #### CollectionInput
@@ -66,6 +78,7 @@ function defineSchema<const T extends SchemaInput>(input: T): TypedSchemaDefinit
 | `resolve` | `Record<string, (local, remote, base) => unknown>` | No | Custom resolvers per field (tier 3). |
 | `scope` | `string[]` | No | Legacy scope fields for sync filtering; prefer root-level `sync` rules. |
 | `stateMachine` | `{ field, transitions, onInvalidTransition: 'reject' \| 'last-valid-state' }` | No | A state machine on an enum field. See [State Machines](/guide/state-machines). |
+| `access` | `{ read?, write?, create?, update?, delete?, fields? }` | No | Who may read and write the collection's records, built from the [access rules](#access-rules). A collection cannot declare both `access` and a sync scope. |
 
 #### RelationInput
 
@@ -120,8 +133,9 @@ const schema = defineSchema({
 
 ### Errors
 
-`defineSchema()` throws `SchemaValidationError` (code `SCHEMA_VALIDATION`) at the call, with the
-offending collection or field in `context`, when:
+`defineSchema()` throws `SchemaValidationError` (code `SCHEMA_VALIDATION`), with the offending
+collection or field in `context` (in a production browser build, `app.ready` rejects with it; see
+above), when:
 
 - `version` is not a positive integer, or there is no collection, or a collection has no field
 - a collection or field name is invalid
@@ -130,6 +144,11 @@ offending collection or field in `context`, when:
 - a relation names a missing collection or a `field` the source collection does not declare
 - a migration key is not an integer from 2 to `version`, or a migration has no steps
 - a state machine or `.transitions()` map names a value that is not in the enum
+- an access rule names an unknown field or role, a `where()` value does not fit its field, an
+  `anyone()` write lacks `{ writes: true }`, a read rule uses `custom()` or expands past 8
+  alternatives, a group collection's owner field is not `t.string().stamp('userId')`, or a field
+  uses `stamp()` in a collection without `access` (the [Access Rules guide](/guide/access-rules)
+  lists every check)
 
 ---
 
@@ -162,6 +181,7 @@ merge behaviour.
 | `.auto()` | The developer cannot set the field. Kora fills `t.timestamp().auto()` with the insert time; on any other kind the field stays empty. |
 | `.merge(strategy)` | Overrides the default merge. Strategies are not validated against the kind, so use them where the table below says they apply. |
 | `.transitions(map)` | Enum only: allowed state transitions. See [State Machines](/guide/state-machines). |
+| `.stamp('userId')` | `t.string()` only, in a collection with `access` rules: on insert Kora fills the field with the signed-in user (leave it out), the server refuses any other value, and no client may change it. Cannot be combined with `.auto()` or `.default()`. See [Access Rules](/guide/access-rules). |
 
 | `.merge()` strategy | Use on | Behaviour (trace strategy name) |
 |---------------------|--------|---------------------------------|
@@ -196,8 +216,8 @@ const inventory = defineSchema({
 | Field | Record (read) type | `insert()` | `update()` |
 |-------|--------------------|------------|------------|
 | required | `T` | required | `T` |
-| `.optional()` | `T \| null` | may be omitted (`null` is refused: omit the key) | `T \| null` |
-| `.default(v)` | `T \| null` | may be omitted | `T \| null` |
+| `.optional()` | `T \| null` | may be omitted | `T \| null` |
+| `.default(v)` | `T \| null` | may be omitted (`null` is refused) | `T \| null` |
 | `t.timestamp().auto()` | `number` | cannot be set | cannot be set |
 | other `.auto()` | `T \| null` | cannot be set | cannot be set |
 | `t.enum([...])` | literal union | | |
@@ -206,7 +226,10 @@ const inventory = defineSchema({
 | `t.richtext()` | `Uint8Array` | `string \| Uint8Array \| ArrayBuffer` | same as insert |
 
 Every record also has `id: string`, `createdAt: number` and `updatedAt: number`. A defaulted field
-reads as `T | null` because `update(id, { field: null })` can clear it.
+reads as `T | null` because `update(id, { field: null })` can clear it. The insert type has no
+`null`, but at runtime an insert accepts `null` for an optional field with no default and leaves it
+empty, as an update does (a form's "None" choice). A required or defaulted field refuses `null` with
+`SCHEMA_VALIDATION`.
 
 ```typescript
 import type { CollectionInsertOf, CollectionRecordOf } from 'korajs'
@@ -282,6 +305,7 @@ class HybridLogicalClock {
 | `receive(remote): HLCTimestamp` | Merges a remote timestamp. Throws `InvalidTimestampError` (`INVALID_TIMESTAMP_FIELDS`) for non-integer or negative fields or `logical > MAX_LOGICAL`, and `RemoteClockDriftError` (`REMOTE_CLOCK_DRIFT`) for a timestamp more than 5 minutes ahead of reference-corrected time, before changing any state. |
 | `setReferenceOffset(ms)` | Records the server-minus-local offset learned at the handshake, so drift and remote validation use corrected time. |
 | `advanceTo(ts)` | Moves the clock forward to at least `ts` (never backwards). |
+| `hasObservedTime(): boolean` | `true` once the clock has issued or received a timestamp. |
 | `static compare(a, b)` | Total order: `wallTime`, then `logical`, then `nodeId`. |
 | `static serialize(ts)` / `static deserialize(s)` | Lexicographically sortable string form. |
 
@@ -384,7 +408,7 @@ describes the semantics per field type; these functions expose it for tools and 
 |----------|-------------|
 | `foldRecord(ops, schema, options?)` | Folds a record's operations from scratch (any order). Returns `{ state, traces }`. |
 | `mergeOp(state, op, schema, options?)` | Merges one operation into a state (a join). Returns `{ state, traces, changed }`. |
-| `materialize(state, { richtext? })` | The record's field values, or `null` when it does not exist or is deleted. |
+| `materialize(state, { richtext?, fields? })` | The record's field values, or `null` when it does not exist or is deleted. `fields` (a `Set` of field names) materializes only those fields. |
 | `joinStates(a, b, schema)` | Joins two replicas' states of one record. |
 | `serializeFoldState` / `deserializeFoldState` | Stable serialized form. |
 | `toMergeTrace(trace)` | Converts a fold trace to the DevTools `MergeTrace`. |
@@ -656,7 +680,10 @@ Core error classes: `SchemaValidationError` (`SCHEMA_VALIDATION`), `OperationErr
 (`OPERATION_ERROR`), `OperationTooLargeError` (`OPERATION_TOO_LARGE`), `MergeConflictError`
 (`MERGE_CONFLICT`), `SyncError` (`SYNC_ERROR`), `StorageError` (`STORAGE_ERROR`), `AppNotReadyError`
 (`APP_NOT_READY`), `ClockDriftError` (`CLOCK_DRIFT`), `RemoteClockDriftError` (`REMOTE_CLOCK_DRIFT`),
-`InvalidTimestampError` (`INVALID_TIMESTAMP_FIELDS`). `getKoraErrorFix(code)` returns a short fix
+`InvalidTimestampError` (`INVALID_TIMESTAMP_FIELDS`), `AppOpenFailedError` (`APP_OPEN_FAILED`: a call
+needs a store that did not open), `BlobPullUnavailableError` (`BLOB_SYNC_UNAVAILABLE`:
+`app.blobs.pull()` without a sync connection), `AccessNotLoadedError` (`ACCESS_NOT_LOADED`).
+`getKoraErrorFix(code)` returns a short fix
 hint for common codes. The [Error Codes reference](/api/errors) lists every code of every package
 with its cause and fix.
 
@@ -672,6 +699,39 @@ try {
     err.context // { collection: 'todos', field: 'title', expectedType: 'string', receivedType: 'number' }
   }
 }
+```
+
+---
+
+## App settings (.env.example) {#env-example}
+
+<!-- docs-check: signature @korajs/core -->
+```typescript
+function parseEnvExample(text: string): EnvDeclaration[]
+function missingRequiredEnv(
+  declarations: readonly EnvDeclaration[],
+  env: Readonly<Record<string, string | undefined>>,
+): EnvDeclaration[]
+
+interface EnvDeclaration {
+  readonly name: string
+  readonly example: string              // the value written in the file
+  readonly description: string | null   // the comment above it, without tags
+  readonly required: boolean            // [required]
+  readonly secret: boolean              // [secret]
+  readonly developmentOnly: boolean     // [development]
+}
+```
+
+An app lists its settings in `.env.example`. A comment block describes the variables directly
+below it, and the tags `[required]` (production needs it), `[secret]` (a credential) and
+`[development]` (only used outside production) set the rules. `parseEnvExample` reads the file
+without running the app (a repeated name keeps its first entry), and `missingRequiredEnv` returns
+the required settings that are missing or blank in `env`. `kora doctor` reports them.
+
+```bash
+# [required] [secret] Sends invitation and verification emails.
+RESEND_API_KEY=
 ```
 
 ---

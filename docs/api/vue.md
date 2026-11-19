@@ -1,6 +1,6 @@
 ---
 title: Vue API
-description: "@korajs/vue API reference: the Kora provider and composables for reactive queries, mutations, and sync status in Vue apps."
+description: "@korajs/vue API reference: the Kora provider and composables for reactive queries, mutations, sync status, offline readiness and form drafts in Vue apps."
 ---
 
 # Vue API Reference
@@ -13,6 +13,10 @@ import {
   useQuery,
   useMutation,
   useSyncStatus,
+  useSyncSummary,
+  useOfflineReady,
+  useOfflineKeep,
+  useFormDraft,
   useCollection,
   useRichText,
   usePresence,
@@ -191,10 +195,41 @@ const sync = useSyncSummary()
 
 ---
 
+## useOfflineReady() / useOfflineKeep()
+
+`useOfflineReady()` returns a readonly ref of `OfflineStatus`: whether a reload with no network
+would open the app with its data (`app.offline.status()`). `state` is `ready`, `preparing` or
+`not-ready`, and `reasons` says why not.
+
+`useOfflineKeep(query, options?)` keeps the records a query matches on the device while the
+component's effect scope is alive, and returns readonly refs `{ held, error }`. Pass a getter to
+follow reactive state: the hold releases the old pin and takes the new one. `{ files: true }` also
+keeps the files of its records.
+
+```vue
+<script setup lang="ts">
+import { useApp, useOfflineKeep, useOfflineReady } from '@korajs/vue'
+import type { app as koraApp } from '../kora'
+
+const props = defineProps<{ courseId: string }>()
+const app = useApp<typeof koraApp>()
+useOfflineKeep(() => app.lessons.where({ courseId: props.courseId }), { files: true })
+const offline = useOfflineReady()
+</script>
+
+<template>
+  <span>{{ offline.state === 'ready' ? 'Available offline' : 'Not available offline yet' }}</span>
+</template>
+```
+
+See [Offline readiness](/api/offline) for every field.
+
+---
+
 ## useApp() / useCollection()
 
 - `useApp()`: returns the `KoraAppLike` instance from context.
-- `useCollection(name)`: the store's collection accessor (`insert`, `update`, `delete`, `findById`, `where`).
+- `useCollection(name)`: the store's collection accessor (`insert`, `insertMany`, `update`, `delete`, `findById`, `where`).
 
 ## createKoraHooks()
 

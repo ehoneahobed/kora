@@ -1,6 +1,6 @@
 ---
 title: React API
-description: "@korajs/react API reference: KoraProvider, useQuery, useQueryState, useMutation, useSyncStatus, useSyncSummary, createKoraHooks, useRichText, usePresence, and useCollaborators."
+description: "@korajs/react API reference: KoraProvider, useQuery, useQueryState, useMutation, useSyncStatus, useSyncSummary, createKoraHooks, useOfflineReady, useOfflineKeep, useFormDraft, useRichText, usePresence, and useCollaborators."
 ---
 
 # React API Reference
@@ -15,12 +15,19 @@ import {
   useQueryState,
   useMutation,
   useSyncStatus,
+  useSyncSummary,
+  useApp,
   useCollection,
+  useOfflineReady,
+  useOfflineKeep,
+  useFormDraft,
   useRichText,
   usePresence,
   useCollaborators,
 } from '@korajs/react'
 ```
+
+Everything is also re-exported from `korajs/react`.
 
 <!-- docs-check-prelude
 import { createApp, defineSchema, t } from 'korajs'
@@ -84,6 +91,14 @@ Context provider that makes the Kora app instance available to all hooks in the 
 
 If `app.ready` rejects, the provider renders the error message in place of its children and logs
 it to the console.
+
+By default the provider renders its children before `app.ready`: the SQLite WASM and the store
+runtime load after the first paint. Until the store opens, `useQuery` returns `[]`,
+`useQueryState` reports `ready: false`, and writes made through `useMutation` are queued (saved to
+a small IndexedDB journal first) and applied in order once it opens. A direct
+`await app.todos.insert(...)` before `app.ready` still throws `AppNotReadyError`. See
+[Rendering before the store opens](/guide/react-hooks#rendering-before-the-store-opens) for what
+is journaled and what waits in memory only.
 
 ### Example
 
@@ -214,7 +229,7 @@ function useQueryState<T = CollectionRecord>(
 }
 ```
 
-The returned object keeps its identity until `data`, `error` or `ready` changes. `error` clears when results flow again; `data` keeps the last good rows meanwhile. `ready` is `false` until the first result of the current query (always `false` on the server).
+The returned object keeps its identity until one of its values changes. `error` clears when results flow again; `data` keeps the last good rows meanwhile. `ready` is `false` until the first result of the current query (always `false` on the server, and until the store opens). `source` says where the rows come from (`'server'` for an answer read through before the local store opened, `'local'`, or `'pending'`), and `complete` is `false` while the device is still replicating its scope on a first visit, so you can say "showing what is on this device so far". It is always `true` for a local-only app.
 
 ```tsx
 function SafeTodoList() {
@@ -425,6 +440,10 @@ not replace the app.
 The renderer receives a stable code, sanitized primitive metadata, and a token-free session with
 only `userId`. `retry()` uses the provider's serialized transition queue and closes partial resources
 before opening exactly one replacement. Omitting `error` retains the default framework view.
+`locked` is rendered while the session is locked (offline past the auth client's
+`maxOfflineGraceMs`, or the device clock moved backwards); it defaults to `signedOut`, and the app
+and its local data stay open underneath. `classifyKoraInitializationError(error)` returns the same
+`{ code, name, message, metadata, cause }` shape for your own error handling.
 
 ---
 
@@ -591,11 +610,13 @@ import {
   useCollaborators,
   useCollection,
   useMutation,
+  useOfflineReady,
   usePresence,
   useQuery,
   useQueryState,
   useRichText,
   useSyncStatus,
+  useSyncSummary,
 } from '@korajs/react'
 const schema = defineSchema({
   version: 1,
@@ -648,7 +669,7 @@ function useCollection(name: string): CollectionAccessor
 
 ### Returns
 
-`CollectionAccessor`: `insert`, `update`, `delete`, `findById` and `where`, the same object while `name` is unchanged.
+`CollectionAccessor`: `insert`, `insertMany`, `update`, `delete`, `findById` and `where`, the same object while `name` is unchanged.
 
 ### Example
 
@@ -940,11 +961,62 @@ function CollaborativeDocument({ currentUser }: { currentUser: User }) {
 
 ---
 
+## useApp()
+
+Returns the app from the nearest `<KoraProvider app={app}>`. Pass your app's type to get typed
+collections: `useApp<typeof app>()`. It throws `KORA_NOT_PROVIDED` outside a provider or under a
+provider given only a `store`. The `useApp` returned by [`createKoraHooks`](#createkorahooks) is
+already typed.
+
+---
+
+## useOfflineReady()
+
+Whether a reload with no network would open the app with its data: `app.offline.status()` as a
+hook. It re-renders only when the status changes, and the object keeps its identity while
+unchanged. During a server render it reports `not-ready` with the reason `server-rendering`.
+
+<!-- docs-check: signature @korajs/react @korajs/store @korajs/sync korajs -->
+```typescript
+function useOfflineReady(): OfflineStatus
+```
+
+```tsx
+function OfflineBadge() {
+  const offline = useOfflineReady()
+  return <span title={offline.reasons[0]}>{offline.state === 'ready' ? 'Available offline' : 'Not available offline yet'}</span>
+}
+```
+
+`state` is `'ready'`, `'preparing'` or `'not-ready'`, and `reasons` says why it is not ready. See
+[Offline readiness](/api/offline) for every field and reason.
+
+## useOfflineKeep()
+
+Keeps the records a query matches on the device while the component is mounted (a hold on
+`app.offline.keep`), so `app.offline` is `ready` with them. Several components may hold the same
+query; the pin stays until the last one unmounts. The query is one collection's `where` (no
+`limit`, `offset` or `include`); `{ files: true }` also keeps the files its records reference.
+
+<!-- docs-check: skip signature listing; OfflineKeepQuery and OfflineKeepOptions come from @korajs/core/bindings -->
+```typescript
+function useOfflineKeep(
+  query: OfflineKeepQuery,
+  options?: { files?: boolean },
+): { held: boolean; error: Error | null }
+```
+
+`held` is true once the pin is recorded on this device; `error` says why it was refused (an
+unsupported query, or the 64-pin limit, `OFFLINE_PIN_LIMIT`). See
+[Keeping data](/api/offline#keeping-data-keep-release-hold).
+
+---
+
 ## useFormDraft()
 
 Keeps a form's input across the reload a new version of the app asks for. Opt-in per form; see
 [App updates and multiple tabs](/guide/app-updates#keeping-what-the-user-typed-form-drafts) for
-the five privacy rules.
+its privacy rules.
 
 <!-- docs-check: skip signature listing -->
 ```typescript

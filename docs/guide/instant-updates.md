@@ -139,7 +139,7 @@ const limited = createApp({
 
 - **Self-check.** Every time a database result replaces a prediction, Kora compares the two. A difference on any field other than `createdAt` and `updatedAt` emits `store:overlay-diverged` (field names only). Three divergences in one collection stop prediction for it for the rest of the session (`store:overlay-disabled`); its writes then behave as with the feature off.
 - **Test builds fail loudly.** With `NODE_ENV=test` a divergence throws an `OverlayDivergedError` so a wrong prediction cannot hide in your test suite.
-- **Unknown outcomes.** If the connection to the storage worker is lost during a commit, Kora looks the write up by its content-addressed operation id. If it landed, the prediction becomes the stored row; if not, it is rolled back. A write that cannot be decided stays shown until the lookup can run, and never longer than a minute.
+- **Unknown outcomes.** If the connection to the storage worker is lost during a commit, Kora looks the write up by its content-addressed operation id. If it landed, the prediction becomes the stored row; if not, it is rolled back. A write whose lookup cannot run yet stays shown until a later successful read decides it, and a write still pending after a minute is marked unknown and decided the same way. A write that produced no operation (an update that changed nothing) and lost its commit answer is taken back, since it changed nothing.
 - **Cleared with the data.** Closing the store, switching or signing out the user, reloading from disk, restoring a backup and a full resync all drop every prediction before the queries re-run.
 - **Tab-local.** Predictions are never stored, synced or sent to other tabs. Another tab sees the write when it commits, as before.
 
@@ -157,7 +157,7 @@ DevTools lists them in the operation and query timelines. `store:write-settled` 
 
 ## IndexedDB fallback
 
-The IndexedDB fallback store uses the same setting. Its commits take longer (the database is also persisted to IndexedDB), so the early view is more noticeable there.
+The IndexedDB fallback store uses the same setting. Its writes take longer (each write's promise also waits for a strict snapshot to IndexedDB, see [Storage Configuration](/guide/storage-configuration#durable-writes-on-the-indexeddb-fallback)), so the early view is more noticeable there. A shown row can still be followed by a rejection with `WriteNotDurableError`: the write is committed but not confirmed on disk, so do not repeat it.
 
 ## Turning it off
 

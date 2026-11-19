@@ -234,6 +234,9 @@ The name appears in the DevTools operation timeline, making it easy to trace rel
 - Updating multiple records that must stay consistent
 - Any multi-step mutation where partial completion would leave invalid data
 
+For many records of one collection (an import, seeding), `app.<collection>.insertMany(rows)` is
+the shorter form: one transaction, all rows or none. See [Bulk inserts](/api/store#bulk-inserts).
+
 ::: tip
 Transactions are atomic on the device where they run: every write gets its own sequence number
 inside the same commit, and secret fields, per-field versions and state machines are handled as
@@ -414,6 +417,12 @@ The server enforces the grant in both directions:
 Collections **not listed** in the grant are inaccessible. A client can only narrow the grant.
 Moving a record out of a user's scope (ownership transfer) must go through a server route.
 
+A grant can also be disjunctive: `{ $or: [{ ownerId: user.id }, { teamId: { $in: teamIds } }] }`
+(up to 8 branches) gives "my own records or my teams' records" as one grant (see
+[Sync Configuration](/guide/sync-configuration)). When access depends
+on memberships (shared documents, teams, roles), declare [access rules](/guide/access-rules) in
+the schema instead of computing scopes in the auth provider.
+
 ---
 
 ## Pagination
@@ -446,6 +455,30 @@ function PaginatedList() {
 ```
 
 `limit` and `offset` take non-negative integers (anything else is refused with a `QueryError`).
+`count()` applies them too (it returns how many rows `exec()` would return), so count the total
+for a page indicator without them:
+
+```typescript
+const total = await app.todos.where({ completed: false }).count()
+```
+
+---
+
+## Read-only Previews
+
+To let an admin look at the app as another person without saving anything, make the app instance
+read-only. Every local write (insert, update, delete, `app.transaction`, `app.mutation`) then
+throws `StoreReadOnlyError` (`STORE_READ_ONLY`) before anything is recorded, whatever screen the
+admin opens; reads, live queries and incoming sync carry on:
+
+```typescript
+app.setReadOnly('Previewing as Ama')
+app.readOnlyReason() // 'Previewing as Ama'
+
+app.setReadOnly(null) // writable again
+```
+
+It applies to this app instance only and is not saved.
 
 ---
 

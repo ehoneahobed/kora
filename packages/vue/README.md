@@ -56,8 +56,14 @@ In an SFC:
 | Composable | Purpose |
 |------------|---------|
 | `useQuery(query)` | Reactive local query results |
-| `useMutation(fn)` | Optimistic mutations with rollback |
+| `useQueryState(query)` | `{ data, error, ready, source, complete }` |
+| `useMutation(fn)` | Local writes with loading, error and server-refusal (`rejected`) state |
 | `useSyncStatus()` | Connection / sync state |
+| `useSyncSummary()` | The sync status summarized for an indicator |
+| `useOfflineReady()` | Whether a reload with no network would open the app with its data |
+| `useOfflineKeep(query, { files })` | Keep a query's records on the device while mounted |
+| `useFormDraft(formKey, initial, { fields })` | Keep typed input across a new version's reload |
+| `createKoraHooks<typeof app>()` | Composables typed by your schema |
 | `useApp<typeof app>()` | The `createApp()` instance (the type argument types its collections) |
 | `useCollection(name)` | Collection accessor |
 | `useRichText(name, id, field)` | Yjs richtext editor binding |

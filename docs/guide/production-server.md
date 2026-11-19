@@ -55,9 +55,12 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `httpRoutes` | | Your HTTP routes; each handler gets `request.kora` (the trusted data plane) and answers JSON (`body`), HTML (`html`) or bytes (`raw` with your `Content-Type`). |
 | `shellMeta` | | Per-URL title, description and Open Graph tags for the app shell, so shared links preview the page they point at. See [Link previews](#link-previews-and-per-page-metadata). |
 | `spaFallback` | `'navigation'` | Which missing paths get the app shell: `'navigation'` (browser navigations and crawlers), `'strict'` (browser navigations only) or `'extensionless'` (any extensionless path). |
-| `operationalAuth` | `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_BACKUP_TOKEN` | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups). With `NODE_ENV=production`, endpoints whose token is unset are **disabled** (`403 OPERATIONAL_ENDPOINT_DISABLED`; `allowPublic: true` serves them anyway); outside production they are public, with a startup warning (`server.operational_endpoints_unprotected`). |
+| `operationalAuth` | `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_BACKUP_TOKEN`, `KORA_INSIGHTS_TOKEN` | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups); `metricsToken` and `backupToken` fall back to `adminToken`. `insightsToken` opens [`/__kora/insights`](#operator-insights-kora-insights) and nothing else. Tokens are compared in constant time. With `NODE_ENV=production`, endpoints whose token is unset are **disabled** (`403 OPERATIONAL_ENDPOINT_DISABLED`; `allowPublic: true` serves them anyway); outside production they are public, with a startup warning (`server.operational_endpoints_unprotected`). |
 | `allowedOrigins` | | Other origins whose pages may call `httpRoutes` and `/health` from a browser engine. Always allowed: native app shells (Tauri's `tauri://localhost`, `http(s)://tauri.localhost`), the comma-separated `KORA_ALLOWED_ORIGINS`, and, outside production, `http://localhost` on any port. Never with credentials. |
-| `trustProxy` | `KORA_TRUST_PROXY` | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list; the variable takes the same, comma-separated); `request.ip` uses it. |
+| `trustProxy` | `KORA_TRUST_PROXY` | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list; the variable takes the same, comma-separated); `request.ip` uses it. `0`, a negative count or `[]` trusts no proxy, the same as leaving it unset (the server warns at start that per-address protection is off), and `KORA_TRUST_PROXY` does not replace that choice. |
+| `blobStore` | `KORA_BLOB_STORE_URL`, else `KORA_BLOB_DIR`, else none | Where the bytes behind `t.blob()` fields are kept. Pass a `ContentAddressedBlobStore` to choose one in code, or `false` to keep none. Ignored when `syncOptions` sets `resolveBlobChunk` or `persistBlobChunk`. See [Central blob storage](#central-blob-storage-and-scheduled-garbage-collection). |
+| `blobGarbageCollection` | `{ intervalHours: 24, graceHours: 24 }` | Sweep of file bytes no live record points at, when the server holds a blob store. The first sweep runs 15 minutes after start. `false` turns it off. |
+| `blobStats` | | `() => Promise<{ count, bytes }>`: stored files, reported as `blobs` in `/__kora/insights`. |
 | `maxRequestBodyBytes` | 1 MiB | Larger bodies of custom routes get `413` before they are buffered. |
 | `maxConcurrentRequestBodies` | 128 | Custom route bodies read at once; past it a request with a body gets `503` with `Retry-After`. Each body must also arrive at a minimum rate (2 s plus 1 s per KiB, at most `routeBodyTimeoutMs`), or it gets `408` and the connection is closed. |
 | `routeBodyTimeoutMs` | enough for `maxRequestBodyBytes` at 16 KiB/s after 2 s, at least 30 s (66 s for 1 MiB) | The longest a custom route body may take to arrive. The default grows with `maxRequestBodyBytes`, so a client on a slow link (about 2G) can still upload a body near the limit. A body sent chunked (no `Content-Length`) has no declared size to rate-check: it gets this whole time, and the in-flight cap bounds how many such uploads wait at once. It can be at most 2,147,483,647 ms (about 24.8 days, the longest a timer can wait), and the default is capped there for a huge `maxRequestBodyBytes`. |
@@ -65,6 +68,8 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `crossOriginEmbedderPolicy` | `'credentialless'` | COEP header for the served app. |
 
 The size and count options (`maxRequestBodyBytes`, `maxConcurrentRequestBodies`, `maxBackupBytes`, `routeBodyTimeoutMs`) must be positive whole numbers. Anything else, such as `NaN`, `0` or a fraction, throws `InvalidServerConfigError` (`INVALID_SERVER_CONFIG`) when the server is created, instead of turning the limit off or refusing every request.
+
+A body over `maxRequestBodyBytes` (or `maxBackupBytes`) is answered `413` before it is buffered. The server then reads and discards the rest of the upload for at most 5 s or 64 MiB before it closes the connection, so the client receives the `413` instead of a reset connection. A route handler that throws or rejects is answered `500` and never stops the process.
 
 `syncOptions` (also the config of `createKoraServer` / `KoraSyncServer`):
 
@@ -98,6 +103,10 @@ The size and count options (`maxRequestBodyBytes`, `maxConcurrentRequestBodies`,
 | `sessionRevalidationIntervalMs` | 30 s | Re-check every live session's credential and scope. |
 | `httpSessionIdleTimeoutMs` | 2 min | HTTP long-poll sessions without requests are closed. |
 | `allowLegacyAnonymousClaims` | `true` | See [Anonymous devices](#anonymous-devices-and-node-claims). |
+| `deliveryPartitions` | | Extra fields to file operations under, per collection, for scopes the schema cannot show. See [The delivery visibility index](#the-delivery-visibility-index). |
+| `readThrough` | enabled | Limits of the read-through endpoint `POST <syncPath>/read` (rows, bytes, rate, auth guard, `cursorSecret`). See [Read-through endpoint](/api/server#read-through). |
+| `accessSweepIntervalMs` | 60 s | How often expired memberships are ended with a server write, when the schema declares [access rules](/guide/access-rules); `0` disables the timer. |
+| `experimentalAccessRules` | | Deprecated, no effect (logs a warning): a schema that declares `access` is always enforced. |
 | `unscopedSharing` | `'warn'` | A signed-in grant that restricts no collection (every user syncs everyone's data): `'warn'` once, `'allow'` silently, or `'refuse'` the session (`UNSCOPED_SHARING_REFUSED`). |
 | `deviceNodeHandover` | `true` | Claim an ownerless node (beta.12 history, or released) for the signed-in user whose verified device id equals it. See [Upgrading a beta.12 server database](#upgrading-a-beta-12-server-database-with-authentication). |
 | `anonymousClaimTtlMs` | 24 h | |
@@ -162,6 +171,11 @@ production and for more than one instance:
   upgrade (an older Kora does not record the plan), and if an instance of the previous release
   restarts during the rollout (it records its plan again), restart one new instance once the
   rollout is done.
+- **Instances starting together** (an overlapping deploy) set up the schema one at a time, under
+  a cross-instance advisory lock, so they never deadlock. A `PostgresServerStore` built on your
+  own connection pool needs at least two connections while setup runs (`createPostgresServerStore`
+  opens its own pool). The store's idempotent DDL no longer prints `already exists, skipping`
+  notices on every start, and `close()` ends the client it opened.
 - Version vectors are read from the database, so they are correct across instances; duplicates
   are refused atomically; delivery sequences are assigned through one counter row, so delivery
   order matches commit order across instances.
@@ -170,7 +184,7 @@ production and for more than one instance:
 
 ## Operation log integrity
 
-On their first start of this release the SQLite and Postgres stores read every stored operation
+On their first start of 1.0.0-beta.13 or later the SQLite and Postgres stores read every stored operation
 once and move rows that cannot be read back into an operation (malformed JSON, an out-of-range
 timestamp) to an `operations_quarantine` table, verbatim, so no fold ever reads them. A warning is
 logged; `store.getLogIntegrityReport()` returns the result. A record that owns quarantined
@@ -518,9 +532,31 @@ Beyond that, do not list memberships in the grant: give users a coarser scope va
 ## Central blob storage and scheduled garbage collection
 
 When you want blob bytes to outlive the device that authored them, back the
-server with a central blob store. `toServerBlobCallbacks` turns any
-`ContentAddressedBlobStore` (such as `FilesystemBlobStore`) into the
-`resolveBlobChunk` / `persistBlobChunk` pair the sync server needs:
+server with a central blob store. `createProductionServer` does this from the host's
+environment with no code:
+
+- `KORA_BLOB_STORE_URL=s3://<bucket>` with `KORA_BLOB_STORE_ACCESS_KEY_ID` and
+  `KORA_BLOB_STORE_SECRET_ACCESS_KEY` (optionally `KORA_BLOB_STORE_REGION`, and
+  `KORA_BLOB_STORE_ENDPOINT` for S3-compatible services such as R2 or MinIO), or
+  `KORA_BLOB_STORE_URL=https://<account>.blob.core.windows.net/<container>` for Azure Blob
+  with the workload's managed identity.
+- `KORA_BLOB_DIR=/path`: a directory that survives restarts.
+
+A URL the server cannot use is refused at startup. With neither set, the server keeps no file
+bytes: uploaded files stay on devices, which pass them to each other through the server's relay
+(see [Who can read a blob](#who-can-read-a-blob)), and in production the server logs
+`server.blob_store_none` at start. The
+`blobStore` option chooses a store in code instead, or `false` keeps none.
+
+When the server holds a store, it also sweeps bytes no live record points at, once a day (the
+first sweep 15 minutes after start; logged as `server.blob_gc`). A blob written within the last
+day is kept even when nothing references it yet, because a device uploads a blob's bytes before
+the record that points at it, and that record can arrive much later. Tune or turn the sweep off
+with `blobGarbageCollection: { intervalHours, graceHours }` or `false`.
+
+To wire the store yourself, `toServerBlobCallbacks` turns any `ContentAddressedBlobStore` (such
+as `FilesystemBlobStore`) into the `resolveBlobChunk` / `persistBlobChunk` pair the sync server
+needs. A server that sets these callbacks keeps no store of its own and runs no sweep:
 
 ```typescript
 import { collectBlobGarbage, toServerBlobCallbacks } from '@korajs/store'
@@ -555,7 +591,10 @@ setInterval(async () => {
 
 `collectBlobGarbage` never deletes anything reachable from `liveRefs`, so a blob
 a record still points at is always safe, even mid-upload. Only bytes no live
-record references are removed.
+record references are removed, and on stores that record write times
+(`FilesystemBlobStore`, the object stores) only once they are older than `graceMs` (24 hours
+by default; a re-upload refreshes the time). The grace applies to `dryRun` too; pass
+`graceMs: 0` to list every unreferenced blob.
 
 ### Who can read a blob
 
@@ -738,8 +777,7 @@ younger than `anonymousClaimTtlMs` (default 24 hours). A device that is refused
 `NODE_ID_CLAIMED` anyway moves to a fresh node id and re-sends every unsynced write
 under it (event `sync:node-id-rotated`), so no write is lost.
 
-`allowLegacyAnonymousClaims` (default `true` in 1.0.0-beta.13, `false` from the next
-release) keeps clients without token support working: nodes whose history predates
+`allowLegacyAnonymousClaims` (default `true`) keeps clients without token support working: nodes whose history predates
 node claims (every node of a database a beta.12 or older server wrote), nodes held by
 the pre-release shared anonymous owner, and provisional claims that expired
 unconfirmed, are re-issued with a `session.legacy_anonymous_claim` warning in the log.
@@ -927,6 +965,20 @@ the upgrade.
   it claims it). To keep beta.12 clients syncing through the upgrade, release their
   node ids (`SELECT DISTINCT node_id FROM operations` lists them) before they
   reconnect, accepting that the first principal to present a released node id gets it.
+
+## Clients older than the server
+
+- **Sync protocol 1 is gone.** Apps on Kora 1.0.0-beta.12 and earlier speak sync protocol 1. From
+  1.0.0-beta.15 the server refuses them at the handshake, before authentication, with the
+  non-retriable `PROTOCOL_VERSION_UNSUPPORTED`, and logs `session.protocol_refused`. Update those
+  apps before you upgrade the server. Operations they wrote keep their version-1 ids and stay
+  valid: an updated device can still upload them, and an id the server cannot verify is refused
+  with `INVALID_OPERATION_ID`. `/health` reports the protocol the server speaks
+  (`protocolVersion`).
+- **Grants and access rules a client cannot follow.** A client from before 1.0.0-beta.15 is
+  refused with `CLIENT_TOO_OLD` when its grant contains `$or`, or when the schema declares
+  [access rules](/guide/access-rules). Grants without `$or` and schemas without access rules
+  still serve it.
 
 ## The delivery visibility index
 

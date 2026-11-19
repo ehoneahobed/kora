@@ -46,17 +46,26 @@ const todo = await app.todos.insert({ title: 'Hello' })
 
 Every schema collection is available as `app.<name>` and always as `app.collections.<name>`. With a
 schema from `defineSchema()` every method is typed (see [Type inference](/api/core#type-inference)).
-Every method rejects with `AppNotReadyError` (`APP_NOT_READY`) before `app.ready` resolves; inside
-`<KoraProvider app={app}>` the app is ready before children render.
+Before `app.ready` resolves, `where()` returns a deferred query (same descriptor and `queryKey`,
+run once the store opens), so `useQuery(app.todos.where(...))` works in the first render.
+`insert`, `insertMany`, `update` and `delete` made through `useMutation` are queued and applied
+once the store opens; the same calls made directly, and `findById`, reject with `AppNotReadyError`
+(`APP_NOT_READY`). `<KoraProvider app={app}>` renders its children before `app.ready` (pass
+`waitForStorage` to wait for the store instead); see [React Hooks](/guide/react-hooks).
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `insert(data)` | `Promise<Record>` | Validates, applies defaults and `t.timestamp().auto()`, generates a UUID v7 `id`, writes the record and its operation in one transaction. `null` leaves an optional field (with no default) empty; a required field, or one with a default, refuses `null` (leave the field out to get its default). |
 | `insertMany(rows)` | `Promise<Record[]>` | Inserts several records in **one** transaction: all of them or none. Every row is validated before anything is written. Each row is still its own insert operation (in input order, one shared `transactionId`), and live queries update once, after the commit. Use it for bulk writes (imports, seeding): see [Bulk inserts](#bulk-inserts). |
-| `update(id, data)` | `Promise<Record>` | Writes only the fields that change (an unchanged value is not a write). Accepts [atomic ops](/api/core#atomic-ops). Throws `RecordNotFoundError` for a missing or deleted record. |
+| `update(id, data)` | `Promise<Record>` | Writes only the fields that change; an update that changes nothing writes no operation and returns the record untouched. [Atomic ops](/api/core#atomic-ops), rich-text and secret values are always applied. Throws `RecordNotFoundError` for a missing or deleted record. |
 | `delete(id)` | `Promise<void>` | Deletes the record (relations apply their `onDelete`). Throws `RecordNotFoundError` when it does not exist. |
 | `findById(id)` | `Promise<Record \| null>` | The record, or `null`. |
 | `where(filter)` | `QueryBuilder` | Starts a query (see below). |
+
+`insert`, `insertMany`, `update` and `delete` take an optional last argument, `WriteOptions`:
+`{ durable: true }` shows that one write in live queries only after it commits, when
+[instant updates](/guide/instant-updates) are on. It adds no durability, and does nothing when
+instant updates are off.
 
 Records also carry `createdAt` and `updatedAt` (milliseconds): the insert time and the last write
 time, readable and queryable even when the schema does not declare them (a schema field of the same
@@ -65,8 +74,15 @@ name wins). The names are exported as `VIRTUAL_TIMESTAMP_FIELDS`.
 Writes are refused before anything is stored when a value is outside its field's domain
 (`SchemaValidationError`), the serialized operation exceeds `maxOperationBytes` (256 KiB by
 default, `OperationTooLargeError`), a state machine forbids the transition
-(`InvalidStateTransitionError`), or the database cannot be made durable
-(`StorageDurabilityError`).
+(`InvalidStateTransitionError`), the database cannot be made durable
+(`StorageDurabilityError`), the app is read-only (`StoreReadOnlyError`), a newer build of the app
+has taken over the database (`BuildSupersededError`, see [Version gate](#version-gate)), or an
+insert names another user in a `.stamp('userId')` field (`StampedFieldError`).
+
+A write whose promise resolved is durable on every backend. On the IndexedDB fallback each write
+waits for a snapshot that holds it; when that snapshot cannot be saved the write stays committed
+and its promise rejects with `WriteNotDurableError` (`WRITE_NOT_DURABLE`, with `operationIds`).
+Do not retry it: it exists. See [Offline Readiness](/guide/offline-readiness).
 
 ### Bulk inserts {#bulk-inserts}
 
@@ -268,9 +284,13 @@ function validateUpdateStateMachine(
 | Member | Description |
 |--------|-------------|
 | `app.storeInfo()` | `{ baseName, databaseName, authUserId, persistence, durable, isolationState }`, without reading records. |
-| `app.setReadOnly(reason \| null)` | Makes the app read-only: every local write (insert, update, delete, `app.mutation`, `app.transaction`, and writes made before `app.ready`) throws `StoreReadOnlyError` (`STORE_READ_ONLY`, with the `reason`) before anything is recorded. Reads, subscriptions and incoming sync carry on. `null` (or a blank reason) makes it writable again. Per app instance, not saved: for example while an admin previews the app as another person. |
-| `app.readOnlyReason()` | The reason the app is read-only, or `null`. |
+| `app.setReadOnly(reason \| null)` | Makes the app read-only: every local write (insert, insertMany, update, delete, `app.mutation`, `app.transaction`, and writes made before `app.ready`) throws `StoreReadOnlyError` (`STORE_READ_ONLY`, with the `reason`) before anything is recorded. Reads, subscriptions and incoming sync carry on. `null` (or a blank reason) makes it writable again. Per app instance, not saved: for example while an admin previews the app as another person. |
+| `app.readOnlyReason()` | The reason the app is read-only, or `null`. On the store: `store.setReadOnly(reason)`, `store.getReadOnlyReason()` and `store.assertWritable()`. |
 | `app.storage.listDatabases()` / `app.storage.deleteDatabase(name, { force? })` | Manage this origin's local databases. See [Storage Configuration](/guide/storage-configuration#managing-local-databases). |
+| `app.storage.writes` | `status()` and `subscribe()`: `{ state: 'durable' }`, or `{ state: 'failing', permanent, since, message }` after a resolved write could not be confirmed durable (`permanent`: reload before making more changes). `store.getWriteDurability()` reports the same. |
+| `app.storage.evicted` | A detected loss of this database's storage (it existed on this device and reopened empty), or `null`. See [Offline Readiness](/guide/offline-readiness). |
+| `app.storage.persistence` | `status()` and `request()` for `navigator.storage.persist()`. |
+| `store.pendingWriteCount()` / `store.whenWritesSettled()` | Writes the store admitted that have not settled (local writes, transactions, applied sync batches), and a promise that resolves once they have. The offline shell's update reload waits for zero. |
 | `app.exportBackup()` / `app.importBackup()` | See [Backup and Restore](/guide/backup-restore). |
 
 ---
@@ -304,14 +324,26 @@ interface StorageAdapter {
   close(): Promise<void>
   execute(sql: string, params?: unknown[]): Promise<void>
   query<T>(sql: string, params?: unknown[]): Promise<T[]>
-  transaction(fn: (tx: Transaction) => Promise<void>): Promise<void>
+  transaction(fn: (tx: Transaction) => Promise<void>, options?: { immediate?: boolean }): Promise<void>
   migrate(from: number, to: number, migration: MigrationPlan): Promise<void>
   /** Post-open state of adapters that can degrade at runtime. */
   getStorageOpenState?(): StorageOpenState | null
   /** Resolves once earlier commits are durable; required for adapters that persist asynchronously. */
   ensureDurable?(): Promise<void>
+  /** A scratch in-memory database for staged replication of a large first sync. */
+  createStagingAdapter?(): Promise<StorageAdapter | null>
 }
 ```
+
+The other optional members (`refusesWrites`, `whenPersisted`, `getVersionGate`,
+`getStorageEvidence`, `prefersStaging`, and `executeBatch` on `Transaction`) are used by the
+built-in browser adapters; a custom adapter can leave them out.
+
+`@korajs/store/sqlite-wasm` also exports `exportLocalDatabase(dbName, { workerUrl })`, which
+returns a closed local database as a standard SQLite file (`Uint8Array`) read from its OPFS or
+IndexedDB backend under the database's exclusive lock. It never migrates or changes the source,
+and rejects with `StorageInUseError` while a tab has the database open and
+`LocalDatabaseNotFoundError` (`LOCAL_DATABASE_NOT_FOUND`) when no copy exists.
 
 ### StoreConfig
 
@@ -328,7 +360,9 @@ The `Store` constructor's configuration, built by `createApp()`. You need it onl
 | `secretKeyProvider` | Key for encrypted `t.secret()` fields. |
 | `operationTransforms` | Schema transforms applied at fold time (pass the sync engine's list). |
 | `maxOperationBytes` | Largest local operation (default 256 KiB, the server default). |
-| `materialization` | `'fold'` (default) or `'legacy'` (the 1.0.0-beta.12 merge, for comparison only; removed in a later release). |
+| `instantUpdates` | `true` or `{ maxPendingWrites?, maxPendingBytes?, maxRecordsPerWrite? }` (defaults 256, 8 MiB, 100). Off by default. See [Instant updates](/guide/instant-updates). |
+| `databaseOwner` | The one user this database belongs to (`createApp` sets it with `store.namespaceByAuthUser`). |
+| `versionGate` | The database's [version gate](#version-gate) when the adapter does not own one (default `adapter.getVersionGate()`). |
 | `localMutationHandler`, `onQuerySubscribed` | Hooks used by `createApp()`. |
 
 ---
@@ -342,9 +376,9 @@ between devices over the sync connection, once per content hash.
 
 | Method | Description |
 |--------|-------------|
-| `put(bytes, { mimeType?, filename? })` | Stores the bytes and prepares them for transfer. Returns `{ ref, manifest }`; put `ref` in the record. |
+| `put(bytes, { mimeType?, filename? })` | Stores the bytes and prepares them for transfer. Returns `{ ref, manifest }`; put `ref` in the record. Refused with `BuildSupersededError` in a tab a newer build has superseded, like `delete`, `pull` and `gc`. |
 | `get(hash)` / `has(hash)` / `delete(hash)` | Local bytes. |
-| `pull(refOrManifest)` | Fetches the missing chunks over the sync connection and verifies them. Rejects with `BlobTransferError` when a chunk cannot be obtained (see below). |
+| `pull(refOrManifest)` | Fetches the missing chunks over the sync connection and verifies them. Rejects with `BlobTransferError` when a chunk cannot be obtained (see below), and with `BlobPullUnavailableError` (`BLOB_SYNC_UNAVAILABLE`) without a sync connection. |
 | `gc({ dryRun? })` | Deletes local bytes no live record references. |
 | `store` | The underlying `ContentAddressedBlobStore`. |
 
@@ -361,14 +395,22 @@ await avatarApp.users.insert({ name: 'Ada', avatar: ref })
 ```
 
 Every backend implements `ContentAddressedBlobStore` (`put`, `get`, `has`, `delete`, `size`,
-`list`). Reads are integrity-checked: bytes that do not hash to their key throw
+`list`, and an optional `readonly durable` flag). A store that does not declare `durable = true`
+counts as not durable: an [`app.offline.keep`](/guide/offline-readiness) pin that keeps files
+reports `storage-non-durable`. Reads are integrity-checked: bytes that do not hash to their key throw
 `BlobIntegrityError` (with `expectedHash` and `actualHash`).
 
 | Class | Import | Persistence |
 |-------|--------|-------------|
 | `MemoryBlobStore` | `@korajs/store` | memory (tests) |
 | `OpfsBlobStore`, `createOpfsBlobStore(rootDirName = 'kora-blobs')` | `@korajs/store` | browser OPFS |
-| `FilesystemBlobStore(dir)` | `@korajs/store/blob-fs` | Node.js filesystem, sharded by hash prefix, atomic writes |
+| `FilesystemBlobStore(dir)` | `@korajs/store/blob-fs` | Node.js filesystem, sharded by hash prefix, atomic writes; `location` is the resolved directory |
+| `ObjectBlobStore(backend)`, `createS3BlobBackend`, `createAzureBlobBackend`, `openBlobStoreFromEnv(env)` | `@korajs/store/blob-object` | S3-compatible and Azure Blob object storage, for servers. `openBlobStoreFromEnv` opens what `KORA_BLOB_STORE_URL` or `KORA_BLOB_DIR` names (or returns `null`); see [Storage Configuration](/guide/storage-configuration) |
+
+`@korajs/store/blob-object` also exports `toServerBlobCallbacks(store)` (blob callbacks for the
+sync server) and `collectBlobGarbage(store, liveRefs, options?)`, which keeps unreferenced blobs
+written within the last day (`graceMs`, default `DEFAULT_BLOB_GC_GRACE_MS`) because a device
+uploads a blob before the record that points at it.
 
 ### Pulling: retries, deadline and errors
 
@@ -420,7 +462,14 @@ The server side of blob transfer is configured on the sync server; see
 | `StorageInUseError` | `STORAGE_IN_USE` | Deleting a database that is open in some tab or worker; close it everywhere and retry. |
 | `UnsyncedDataError` | `UNSYNCED_DATA` | Deleting a database with unsynced writes (without `force`). |
 | `StorageBackendMismatchError` | `STORAGE_BACKEND_MISMATCH` | The database's data lives in a backend this runtime cannot read (for example OPFS is unavailable now); Kora refuses to start an empty copy. |
-| `PersistenceError` | `PERSISTENCE_ERROR` | IndexedDB persistence failed. |
+| `PersistenceError` | `PERSISTENCE_ERROR` | IndexedDB persistence failed. `context.code` is `SNAPSHOT_SUPERSEDED` for a snapshot of a replaced worker database, `UNSAVED_WRITES` for a close refused while a retiring tab could not save its writes. |
+| `WriteNotDurableError` | `WRITE_NOT_DURABLE` | A committed write could not be confirmed on durable storage (IndexedDB fallback). Do not retry it. |
+| `StoreReadOnlyError` | `STORE_READ_ONLY` | A local write while the app is read-only (`app.setReadOnly`). |
+| `StampedFieldError` | `STAMP_MISMATCH`, `STAMP_USER_UNKNOWN` | An insert names another user in a `.stamp('userId')` field, or the device does not know who is signed in. |
+| `BuildSupersededError` | `BUILD_SUPERSEDED` | A write in a tab whose build a newer one superseded (retriable after a reload). |
+| `StorageFormatAheadError` | `STORAGE_FORMAT_AHEAD` | The database was written by a newer Kora storage format; nothing was changed. |
+| `TabCoordinationUnavailableError` | `TAB_COORDINATION_UNAVAILABLE` | A secure context without Web Locks; storage open is refused unless `allowUncoordinatedTabs` is set. |
+| `LocalDatabaseNotFoundError` | `LOCAL_DATABASE_NOT_FOUND` | `exportLocalDatabase` of a database with no copy on this origin. |
 | `InvalidStateTransitionError` | `INVALID_STATE_TRANSITION` | A local write the state machine forbids. |
 
 The [Error Codes reference](/api/errors#store) lists every store code, including the worker and

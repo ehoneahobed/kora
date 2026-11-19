@@ -33,6 +33,8 @@ breaks every remaining tie, so there is never an ambiguity.
 - An **update** writes a field only when its value differs from the writer's own `previousData`
   for that field (or it carries an atomic op such as `op.increment`). Re-sending an unchanged
   field (a form that saves every field) is not a write and never overrides a concurrent change.
+  Locally, an update whose values all equal the record's writes no operation at all (since
+  beta.15), so an autosave that re-saves an unchanged form adds nothing to the log.
 - An update to a record whose insert has not arrived yet waits for it; it does not create a row.
 - **Delete vs write**: the later of the newest delete and the newest write decides. A record
   revived by a later write shows every field's merged value.
@@ -293,6 +295,13 @@ When a record becomes visible to a device (a share, a new grant), the server sen
 entry carrying the record's fold state. The device joins that state with its own, so counters,
 rich text, resolvers and arrays keep any concurrent local edits instead of being overwritten.
 Each restated field keeps exactly its own version.
+
+A scope entry does not show what the record held before the device could read it (beta.15):
+removed array elements and deleted object keys keep their merge stamps under a salted digest,
+without the value, so a late write still merges exactly; a `max`/`min` field's shadowed value and
+rich-text updates hidden by a reset are left out; rich text carries only the updates no newer one
+contains, with deleted text removed. Counters, atomic chains and custom-resolver logs are still
+sent, because merging needs them. See [Access Rules](/guide/access-rules).
 
 ## Inspecting merges
 

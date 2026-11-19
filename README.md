@@ -8,9 +8,9 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 
 ## Status
 
-**Public beta (v1.0.0-beta.14).** beta.14 is a non-breaking follow-up to beta.13: beta.12 servers now upgrade with no manual step, presence works across different access, and the beta.13 rollout fixes are in ([release notes](docs/releases/v1.0.0-beta.14.md)). Coming from 1.0.0-beta.12, read the [upgrade guide](docs/guide/upgrading-to-beta13.md) first (servers first, then clients) and the beta.13 [security advisory](https://github.com/ehoneahobed/kora/security/advisories/GHSA-v63m-pq3j-7m44). The API is what we intend to ship as 1.0; the beta period is for real-world feedback before the stable cut.
+**Public beta.** The published release is v1.0.0-beta.14; v1.0.0-beta.15 is being prepared. beta.15 changes behaviour but not the sync protocol: offline readiness (`app.offline`), access rules and sharing (`@korajs/spaces`), a first paint that renders before the local database opens, the version gate for tabs of two deployments, `kora upgrade` and a stricter `kora doctor` ([release notes](docs/releases/v1.0.0-beta.15.md)). Coming from 1.0.0-beta.14, read [Upgrading to beta.15](docs/guide/upgrading-to-beta15.md) (servers first, then clients; `npx kora upgrade` does the version bump). Coming from 1.0.0-beta.12, read [Upgrading to beta.13](docs/guide/upgrading-to-beta13.md) first and the beta.13 [security advisory](https://github.com/ehoneahobed/kora/security/advisories/GHSA-v63m-pq3j-7m44). The API is what we intend to ship as 1.0; the beta period is for real-world feedback before the stable cut.
 
-Beta packages publish under the `beta` npm dist-tag. Install with `npm install korajs@beta` (or `@korajs/<pkg>@beta`), and scaffold with `npx create-kora-app@beta`: the untagged `create-kora-app` installs the older 0.x line.
+Beta packages publish under the `beta` npm dist-tag. Install with `npm install korajs@beta` (or `@korajs/<pkg>@beta`), and scaffold with `npx create-kora-app@beta`.
 
 | Package | Status | Description |
 |---------|--------|-------------|
@@ -20,9 +20,11 @@ Beta packages publish under the `beta` npm dist-tag. Install with `npm install k
 | `@korajs/merge` | Beta | Cross-record constraints and referential integrity (per-field merging lives in the core fold) |
 | `@korajs/sync` | Beta | Sync protocol v2, WebSocket and HTTP long-poll transports, end-to-end encryption |
 | `@korajs/server` | Beta | Sync server with Memory, SQLite and PostgreSQL stores, production server, static files |
-| `@korajs/react` | Beta | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `createKoraHooks`, `useRichText` |
-| `@korajs/cli` | Beta | `kora create`, `kora dev`, `kora migrate`, `kora generate`, `kora deploy`, offline app shell |
+| `@korajs/react` | Beta | React hooks: `useQuery`, `useMutation`, `useSyncStatus`, `createKoraHooks`, `useOfflineReady`, `useRichText` |
+| `@korajs/cli` | Beta | `kora create`, `kora dev`, `kora migrate`, `kora doctor`, `kora upgrade`, `kora deploy`, offline app shell |
+| `@korajs/test` | Beta | In-process multi-device sync tests, Playwright offline helpers |
 | `@korajs/auth` | Experimental | Authentication, sessions, MFA, organizations, RBAC, passkeys |
+| `@korajs/spaces` | Experimental | Sharing on top of access rules: email invitations, roles, members, ownership |
 | `@korajs/devtools` | Experimental | Browser DevTools extension with sync timeline and conflict inspector |
 | `@korajs/vue` | Experimental | Vue composables mirroring the React bindings |
 | `@korajs/svelte` | Experimental | Svelte stores mirroring the React bindings |
@@ -39,8 +41,8 @@ Kora sits alongside your UI layer (React, Vue, Svelte) and owns the entire data 
 - **Conflict resolution**: every replica folds a record's operations into a per-field CRDT state (last-write-wins registers, element multisets for arrays, per-key maps, counters, Yjs rich text, custom resolvers), so the result depends only on which operations it holds. Cross-record constraints are enforced by the sync server.
 - **Synchronization**: causal order via HLC, version vectors for uploads, a gap-free delivery watermark for downloads, and nothing silently dropped: operations a device cannot apply yet are quarantined and retried.
 - **Binary blobs**: content-addressed `blob` fields stored in OPFS, deduplicated, integrity-verified and transferred out of band (`app.blobs`).
-- **Offline by default**: every code path works without a network, and scaffolded apps open offline through a service worker.
-- **Authentication and encryption**: server-granted sync scopes, sessions, MFA, organizations, RBAC, passkeys, and end-to-end encryption with a shared per-user keyring.
+- **Offline by default**: every code path works without a network, and scaffolded apps open offline through a service worker. `app.offline.status()` tells the app whether a reload with no network would open it with its data.
+- **Authentication, access rules and encryption**: access rules declared in the schema and enforced by the sync server, sessions, MFA, organizations, RBAC, passkeys, and end-to-end encryption with a shared per-user keyring.
 - **Type inference**: schema types flow through `createApp` to collection accessors, queries, transactions and `createKoraHooks`.
 - **DevTools**: operation inspector, conflict tracer and sync timeline.
 - **Schema migrations**: versioned migrations that apply atomically, backfills that sync, and transforms for devices on older schema versions.
@@ -105,7 +107,7 @@ const app = createApp({
 })
 ```
 
-Without `autoConnect: true`, call `await app.sync?.connect()` after `app.ready`.
+Without `autoConnect: true`, call `app.sync?.connect()` yourself; it need not wait for `app.ready` (the socket opens while the local database does).
 
 ### Deploy
 
@@ -113,7 +115,7 @@ Without `autoConnect: true`, call `await app.sync?.connect()` after `app.ready`.
 kora deploy
 ```
 
-Generates a Dockerfile, bundles your server, builds your client, and deploys to Fly.io, Railway or AWS. See the [Deployment guide](https://korajs.dev/guide/deployment).
+Deploys to Kora Cloud (`kora deploy --platform kora-cloud`, built on Kora Cloud from your source), or generates a Dockerfile, bundles your server, builds your client and deploys to Fly.io, Railway or AWS. See the [Deployment guide](https://korajs.dev/guide/deployment).
 
 ### React hooks
 
@@ -226,6 +228,7 @@ pnpm typecheck          # TypeScript strict mode check
 pnpm lint               # Biome lint and format check
 pnpm lint:fix           # Auto-fix lint/format issues
 pnpm test:e2e           # Run Playwright E2E tests (requires Chromium)
+pnpm test:e2e:offline   # Every template through the offline-readiness suite (Chromium)
 pnpm benchmark:gates    # Run performance benchmark gates
 pnpm test:production-path  # PRODUCTION_PATH convergence tests (korajs)
 pnpm test:release-gate  # production-path + reconnect + chaos + benchmarks
@@ -283,6 +286,9 @@ Opens the VitePress docs site at `http://localhost:5173` with guides, API refere
 | `docs.yml` | Push to main (docs/**) | Build + deploy docs to GitHub Pages |
 | `benchmark-gates.yml` | PRs + push to main | Performance regression gates |
 | `chaos-nightly.yml` | Nightly schedule | Chaos convergence test |
+| `parity-nightly.yml` | Nightly schedule + manual | First-visit parity contract against a plain-REST baseline |
+| `release-matrix.yml` | Release PRs, nightly, manual | Packed packages installed into clean projects and exercised as a user would |
+| `tauri-plugin.yml` | PRs and pushes that touch the Tauri plugin | Rust checks of the Kora SQLite Tauri plugin |
 
 ## Testing the Framework
 
@@ -448,11 +454,14 @@ Full documentation is available at **[korajs.dev](https://korajs.dev/)**.
 
 Covers:
 - [Getting Started](https://korajs.dev/getting-started): a scaffolded app, a migration, the core API
+- [Upgrading to beta.15](https://korajs.dev/guide/upgrading-to-beta15): moving a 1.0.0-beta.14 app and server
 - [Upgrading to beta.13](https://korajs.dev/guide/upgrading-to-beta13): every breaking change from 1.0.0-beta.12 and the code change it needs
 - [Schema Design](https://korajs.dev/guide/schema-design): field types, the value domain, relations, migrations
 - [Conflict Resolution](https://korajs.dev/guide/conflict-resolution): the per-field fold, constraints, resolvers
 - [Sync Configuration](https://korajs.dev/guide/sync-configuration) and [Sync Protocol](https://korajs.dev/guide/sync-protocol)
 - [Storage Configuration](https://korajs.dev/guide/storage-configuration): OPFS, IndexedDB, multi-tab, persistence
+- [Offline Readiness](https://korajs.dev/guide/offline-readiness) and [App updates and multiple tabs](https://korajs.dev/guide/app-updates)
+- [Access Rules](https://korajs.dev/guide/access-rules) and [Sharing](https://korajs.dev/guide/sharing)
 - [Authentication](https://korajs.dev/guide/authentication) and [Sync Encryption](https://korajs.dev/guide/sync-encryption)
 - [Production Server](https://korajs.dev/guide/production-server) and [Deployment](https://korajs.dev/guide/deployment)
 - [Error Codes](https://korajs.dev/api/errors): every error code with cause and fix

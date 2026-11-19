@@ -195,6 +195,14 @@ Production servers must protect backup endpoints with `KORA_BACKUP_TOKEN` or `KO
 backup endpoints are disabled (403). Imported operations go through the same ingest
 validation as uploads.
 
+A backup file carries a SHA-256 checksum of its content. A damaged or truncated file (an upload
+cut short, say) is refused before anything changes, with `BACKUP_CHECKSUM_MISMATCH` (HTTP 400 on
+the import endpoint), so a replace-mode restore never empties the server for a bad file. On SQLite
+and Postgres a replace-mode restore clears the materialized records in the same transaction that
+replaces the operation log, so a crash part-way never leaves behind records the restore removed. A Postgres
+backup's version vector is computed from the operations it exported, so it never claims an
+operation committed while the export ran.
+
 A server backup also carries the users' end-to-end encryption key records (section
 `encryption_keys`, wrapped keyrings only). A restore reconciles them record by record:
 
@@ -230,7 +238,7 @@ received. Operations the device already has are skipped by id, so the resync cos
 correctness. A device or server from before anchors behaves as it did. With access rules, a replace-mode restore also ends every live session
 (retriable `ACCESS_RULES_CHANGED`) so each device reconnects and is re-scoped under the restored
 memberships; on another server instance this happens at its next delivery poll. If you restore by
-calling `store.importBackup(...)` yourself, call `server.revalidateAccessSessions()` afterwards.
+calling `store.importBackup(...)` yourself, call `revalidateAccessSessions()` on your `KoraSyncServer` afterwards; a `createProductionServer` handle has no such method, and its next delivery poll (`deliveryPollIntervalMs`, 2 s by default) ends those sessions.
 
 ## Restore a Whole App on Your Own Machine
 

@@ -7,7 +7,8 @@ description: "Adjudicate untrusted client operations before they become authorit
 
 The sync server always enforces authentication, server-granted scopes, node ownership, the value
 domain, operation size, rate limits and cross-record constraints (see
-[Authentication](/guide/authentication)). Beyond that, every operation a client syncs is accepted:
+[Authentication](/guide/authentication)), and the schema's [access rules](/guide/access-rules)
+when it declares them. Beyond that, every operation a client syncs is accepted:
 it materializes on the server and fans out to other clients. That is the right default when every
 client is one of your own users writing their own data. Add your own policy when a client is
 untrusted: a public form, an anonymous submission, a business rule such as an approval workflow.

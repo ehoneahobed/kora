@@ -217,7 +217,9 @@ or allowed domains).
   group record, then members by role; without read access to the group record, members without
   the owner), `useInvitations(space)` (pending and expired, managers only), and
   `useMyRole(space, userId)` (UI only; the server decides). Hooks re-render at the earliest
-  expiry, and treat malformed expiries and unconfigured roles as granting nothing.
+  expiry, and treat malformed expiries and unconfigured roles as granting nothing. They read
+  through the app's pre-ready collection accessors and `app.schema`, so they render before the
+  store opens (first-visit read-through) and return nothing until it has.
 - Authority is checked before anything about the space or the target: someone who cannot
   manage members (invite, change roles, remove, transfer) gets `FORBIDDEN` whatever the
   space's state, so a refusal never reveals whether a space exists or who is in it. The creator

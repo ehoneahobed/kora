@@ -55,7 +55,9 @@ const unsubscribe = app.todos.where({ completed: false }).subscribe((todos) => {
 
 `createApp` picks one automatically. Kora never runs on non-durable storage silently: when nothing
 durable can open it emits `store:durability-lost` and refuses writes with `StorageDurabilityError`.
-`FilesystemBlobStore` lives in `@korajs/store/blob-fs` so browser bundles never include `node:fs`.
+`FilesystemBlobStore` lives in `@korajs/store/blob-fs` so browser bundles never include `node:fs`,
+and `@korajs/store/blob-object` holds the server-side object stores (S3-compatible, Azure Blob,
+`openBlobStoreFromEnv`).
 
 ## Documentation
 

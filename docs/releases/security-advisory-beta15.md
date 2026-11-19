@@ -9,7 +9,10 @@ title: "Security advisory: Kora.js 1.0.0-beta.14 and earlier (fixed in 1.0.0-bet
 > `v1.0.0-beta.14` source. Fixes to features that are new in beta.15 (access rules,
 > `@korajs/spaces`, the read-through endpoint) are not listed: no released version had them.
 
-**Affected:** the packages named per item, `<= 1.0.0-beta.14` · **Patched:** `1.0.0-beta.15`
+**Affected:** the packages named per item, `<= 1.0.0-beta.14` (every published version that has the
+feature) · **Patched:** `1.0.0-beta.15` · **GitHub advisory:** `GHSA-xxxx-xxxx-xxxx`
+(**placeholder**, assigned at publish; replace it here and in the release notes) · **CVSS:**
+**placeholder**, assigned at publish
 
 ## Patches
 
@@ -36,8 +39,15 @@ npx kora upgrade --to 1.0.0-beta.15
   requests with the same code both signed in, one recovery code worked twice, and parallel wrong
   guesses were counted once, which weakened the lockout. Every write is now conditional on a
   revision (`TotpStore.saveIf`). (#251)
-- **Operational tokens were compared with `===`** (`@korajs/server`). The admin, metrics, backup
-  and insights tokens are now compared in constant time. (#303)
+- **OAuth auto-linking trusted an unverified local address** (`@korajs/auth`, only with
+  `oauth.autoLinkVerifiedEmail: true`, which is off by default). An OAuth sign-in whose provider
+  verified the email was linked to an existing account holding that email even when that account
+  had never verified it, so whoever registered someone else's address first was linked to the
+  owner's provider identity. Both sides must now have verified the address; otherwise the sign-in
+  is answered `409`. **Action:** existing password accounts have not verified their address; turn
+  on `emailVerification` so they can. (#36)
+- **Operational tokens were compared with `===`** (`@korajs/server`). The admin, metrics and backup
+  tokens (and the insights token new in beta.15) are now compared in constant time. (#303)
 
 ## Network and denial of service
 

@@ -44,6 +44,18 @@ backup restore). The other tabs re-run their affected queries; they never reappl
 When a tab attaches as a follower, Kora emits a `store:db-name-collision`
 diagnostic. For multi-tab of one app this is expected and informational.
 
+## Tabs on two builds of the same app
+
+During a deployment one tab can still run the previous build while another opens the new one.
+Since 1.0.0-beta.15 one build writes a database at a time: the older tab is retired (its writes
+are refused with `BuildSupersededError`, the writes it already started are saved, then it lets go
+of the database) before the newer tab opens storage. Coordination fails closed: without
+`BroadcastChannel` only one tab at a time opens the database (`store:tab-exclusive`), and in a
+secure context without Web Locks storage open is refused with `TabCoordinationUnavailableError`
+unless `store.allowUncoordinatedTabs` is set (test environments only). On plain HTTP (not HTTPS,
+not localhost) browsers expose no Web Locks, so the gate is off there with one console warning.
+See [App updates and multiple tabs](/guide/app-updates).
+
 ## Multiple logically separate apps on one origin
 
 The trap is two *different* apps on the same origin that both use the default name.

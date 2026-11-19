@@ -44,22 +44,37 @@ const url = await server.start()
 |--------|---------|
 | `store` | required |
 | `port` | `PORT` environment variable, else `3001` |
-| `staticDir` | `'./dist'` (the SPA shell is served for unknown paths) |
+| `staticDir` | `'./dist'`; a missing path requested as a page gets the app shell (see `spaFallback`) |
 | `syncPath` | `'/kora-sync'` |
 | `syncOptions` | `KoraSyncServerConfig` without `store`, `port`, `host`, `path` |
-| `httpRoutes` | `[]`: `{ path, handle(request) }`, mounted before static files |
-| `operationalAuth` | `{ adminToken?, metricsToken?, backupToken?, allowPublic? }`; endpoints without a token are disabled under `NODE_ENV=production` (403) unless `allowPublic`, public otherwise |
+| `httpRoutes` | `[]`: `{ path, handle(request), insights? }`, mounted before static files. `request` has `method`, `path`, `body`, `headers`, `query`, `ip`, `kora` (the [route context](#route-context)) and `access` (the [access API](/guide/access-rules#changing-who-belongs-where)); the response is `{ status, body?, html?, raw?, headers? }` (JSON by default, `html` as `text/html`, `raw` bytes with your `Content-Type`). `insights: { key, read() }` reports numeric counts under `http[key]` in `/__kora/insights` |
+| `shellMeta` | none: `({ path, query, headers, ip, kora }) => ShellMeta \| null`, per-URL title, description and Open Graph tags written into the app shell (values escaped; `null` or a throw serves the shell unchanged). `applyShellMeta(html, meta)` and `metaExcerpt(text, maxLength = 160)` are exported. See [Link previews](/guide/production-server#link-previews-and-per-page-metadata) |
+| `spaFallback` | `'navigation'`: browser navigations and non-browser clients (link-preview crawlers) asking for an extensionless path outside `/api/` and `/__kora` get the shell; `'strict'`: browser navigations only (the beta.14 behavior); `'extensionless'`: any extensionless path. Never under `/assets/` |
+| `operationalAuth` | `{ adminToken?, metricsToken?, backupToken?, insightsToken?, allowPublic? }`, defaulting to `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_BACKUP_TOKEN` and `KORA_INSIGHTS_TOKEN` (metrics and backup fall back to the admin token; `/__kora/insights` also accepts the metrics or admin token). Endpoints without a token are disabled under `NODE_ENV=production` (403 `OPERATIONAL_ENDPOINT_DISABLED`) unless `allowPublic`, public otherwise. Tokens are compared in constant time |
+| `allowedOrigins` | none: other origins whose pages may call `httpRoutes` and `/health`. Always allowed: native app shells (`tauri://localhost`, `http(s)://tauri.localhost`), the comma-separated `KORA_ALLOWED_ORIGINS`, and, outside production, `http://localhost` on any port. Never with credentials |
+| `blobStore` | `KORA_BLOB_STORE_URL` or `KORA_BLOB_DIR`, else none: where the bytes behind `t.blob()` fields are kept (a `ContentAddressedBlobStore`, or `false` for none). Ignored when `syncOptions` wires `persistBlobChunk` / `resolveBlobChunk` |
+| `blobGarbageCollection` | on when the server holds a blob store: `{ intervalHours: 24, graceHours: 24 }`, first sweep 15 minutes after start; `false` turns it off |
+| `blobStats` | none: `() => Promise<{ count, bytes }>`, reported as `blobs` in `/__kora/insights` |
 | `crossOriginEmbedderPolicy` | `'credentialless'` |
-| `trustProxy` | `KORA_TRUST_PROXY`, else off: `request.ip` is the socket address unless the proxy is trusted |
+| `trustProxy` | `KORA_TRUST_PROXY`, else off: `request.ip` is the socket address unless the proxy is trusted. `0`, a negative count or `[]` count as unset (the server warns at start) and are not replaced by `KORA_TRUST_PROXY` |
 | `maxRequestBodyBytes` | 1 MiB for `httpRoutes` bodies (larger requests get 413) |
 | `maxConcurrentRequestBodies` | 128 `httpRoutes` bodies read at once (more get 503 with `Retry-After`); each must arrive at 2 s plus 1 s per KiB, at most `routeBodyTimeoutMs` (slower gets 408 and the connection closes) |
 | `routeBodyTimeoutMs` | The longest an `httpRoutes` body may take; default: enough for `maxRequestBodyBytes` at 16 KiB/s after 2 s, at least 30 s (66 s for 1 MiB). A chunked body (no `Content-Length`) gets this whole time with no rate check. At most 2,147,483,647 ms (about 24.8 days, what a timer can wait); the default is capped there too |
 | `maxBackupBytes` | 256 MiB for `/__kora/backup/import` |
 
 The handle (`ProductionServer`) has `start()` (resolves to the URL), `stop()`, `kora` (the
-[route context](#route-context)), `getLiveBlobRefs()`, `refreshScopes(userId)`,
+[route context](#route-context)), `access` (the [access API](/guide/access-rules#changing-who-belongs-where), also `request.access` in routes), `getLiveBlobRefs()`, `refreshScopes(userId)`,
 `revalidateSessions()`, `forceFullResync({ userId?, nodeId? })` and `onOperationsCommitted(handler)` (see the `KoraSyncServer` methods below). `/health` is always public and answers `{ status, version, authRequired, protocolVersion, uptime, connectedClients, totalOperations, timestamp }`. `authRequired` is a boolean (true when an `auth` provider other than `NoAuthProvider` guards the sync handshake) and `protocolVersion` is the highest sync protocol the server speaks (2 from 1.0.0-beta.13); neither reveals a credential. `kora doctor --production --url` reads them. Both are also in `getStatus()` and `/__kora/status`; `/__kora/*`
-endpoints use the matching token as `Authorization: Bearer <token>`.
+endpoints use the matching token as `Authorization: Bearer <token>`. `GET /__kora/insights` reports
+device, sync and operation counts without record values or user ids (see
+[Operator insights](/guide/production-server#operator-insights-kora-insights)).
+
+A body larger than `maxRequestBodyBytes` (or `maxBackupBytes`) is answered 413 before it is
+buffered; the rest of the upload is then read and discarded for at most 5 s or 64 MiB before the
+connection closes, so the client receives the 413 instead of a reset. A route handler that throws
+answers 500 without stopping the server. The size and count options must be positive whole
+numbers (`routeBodyTimeoutMs` at most 2,147,483,647); anything else throws
+`InvalidServerConfigError` (`INVALID_SERVER_CONFIG`) when the server is created.
 
 ## KoraSyncServer
 
@@ -75,12 +90,13 @@ endpoints use the matching token as `Authorization: Bearer <token>`.
 | `revalidateSessions()` | Re-checks every live session's credential and scope now (also runs every `sessionRevalidationIntervalMs`). |
 | `refreshScopes(userId)` | Re-checks one user's live sessions now, after a membership change; a session whose grant changed ends with a retriable `SCOPE_CHANGED` and reconnects with the new grant. Returns how many ended. This process only. |
 | `revalidateAccessSessions()` | Ends every live session whose access rules are no longer in force (the store is rebuilding its membership index, or rebuilt it since the session started) with a retriable `ACCESS_RULES_CHANGED`; each reconnects and is re-scoped. Runs on every delivery poll and after `/__kora/backup/import`; call it after `store.importBackup(...)` in your own code. |
+| `access` | The [access API](/guide/access-rules#changing-who-belongs-where) (`grant`, `revoke`, `transfer`, `backfill`, `roleOf`, `prepareGrant`, `prepareRevoke`, `sweepExpired`) for a schema with access rules. Invalid input throws `AccessApiError` (`ACCESS_API_ERROR`). |
 | `releaseNodeClaim(nodeId)` | Releases a device node id so the next principal can claim it. |
 | `forceFullResync({ userId?, nodeId? })` | Makes every device of a user, or one device node, download everything again: its next handshake restarts delivery from 0 (the path a restored server uses), and this instance's live sessions end with a retriable `RESYNC_REQUIRED` so they reconnect now. Stored in the server store (request tokens come from a counter there, shared by every instance), so a device that is offline or on another instance resyncs when it next connects, once per request in each delivery view (scope and query subsets) it streams under. A custom store must implement `requestFullResync`, `getFullResyncState` and `completeFullResync` together, or it refuses with `FULL_RESYNC_UNSUPPORTED`. Use it to repair devices that kept data a fixed bug should have removed (re-scoping does not: it judges the device's own values). Watermark clients only (1.0.0-beta.5 and later). Returns how many live sessions ended. |
 | `applyLocalOperation(...)`, `relayServerOperations(operations)` | Server-authored writes and their fan-out (prefer the route context). Both report to `onOperationsCommitted`. |
 | `onOperationsCommitted(handler)` | Runs `handler` after every committed batch on this instance; returns an unsubscribe function. See [Reacting to committed writes](#operations-committed). |
 | `getKoraContext()` | The route context. |
-| `getStatus()` | `{ running, connectedClients, port, totalOperations, uptime, version, schemaVersion, connectedNodeIds, peakConnections, connectionsTotal }`. |
+| `getStatus()` | `{ running, connectedClients, port, totalOperations, uptime, version, schemaVersion, connectedNodeIds, peakConnections, connectionsTotal, operationsReceived, operationsSent, errorCount, authRequired, protocolVersion }`. |
 | `getConnectionCount()`, `getMetricsCollector()`, `getLogger()`, `getLiveBlobRefs()` | Introspection. |
 | `authoritativeNodeIds` | Node ids whose writes win `merge('server-authoritative')` fields. |
 
@@ -171,7 +187,7 @@ Configure with `readThrough` (all optional):
 | `cursorSecret` | random per process | Signs cursors. Set the same value on every instance behind a load balancer, or a cursor only continues on the instance that issued it. |
 | `rate.perSecond` / `rate.burst` | 20 / 20 | Token bucket per principal. |
 | `rate.concurrent` / `rate.maxConcurrent` | 4 / 64 | Reads in flight per principal / server. |
-| `rate.anonymous` | 200/s, burst 200, 16 | Reads without an identity (no auth provider or an anonymous principal), one bucket per address. |
+| `rate.anonymous` | 200/s, burst 200, 16 | Reads without an identity (no auth provider or an anonymous principal), one bucket per client address (an IPv6 address counts as its /64). |
 | `authGuard.ttlMs` | 5,000 | How long an authentication is remembered, never past the credential's expiry. `0` turns the cache off. |
 | `authGuard.maxConcurrent` / `perSecond` / `burst` | 16 / 100 / 100 | Global cap on auth-provider calls for tokens the server has not seen (a quarter of it is a separate lane for addresses that recently failed). |
 | `authGuard.timeoutMs` | 8,000 | Deadline of one provider call; past it the slot is freed and the read answers 503. A late answer is not cached. |
@@ -259,9 +275,10 @@ Every store implements `ServerStore`:
 | `materializeCollection(collection)` | Every record (from the log when no schema is set). |
 | `applyRemoteOperation(op, options?)` | Ingest path used by the sync server. With `authorize` and `previewResult`, the store folds the operation onto the record in the same critical section and passes the resulting record to `authorize` as `context.resulting` (access rules judge it). A custom store without it limits atomic intents in access-ruled collections to 4 per operation. |
 | `getMaxDeliverySequence()`, `getOperationsAfterDelivery(after, limit)` | The delivery sequence behind gap-free downloads. |
-| `exportBackup()`, `importBackup(data, merge?)` | The operation log plus the users' encryption key records (`merge: false` replaces the log, `true` merges into it); an import reconciles key records (replace mode takes the backup's; merge mode adds missing ones and advances an older revision of the same ring). Used by `/__kora/backup/*` and `kora backup`. With access rules, call `server.revalidateAccessSessions()` after an `importBackup` you run yourself (the backup route does). |
+| `exportBackup()`, `importBackup(data, merge?)` | The operation log plus the users' encryption key records (`merge: false` replaces the log, `true` merges into it); an import reconciles key records (replace mode takes the backup's; merge mode adds missing ones and advances an older revision of the same ring). Used by `/__kora/backup/*` and `kora backup`. A damaged or truncated file is refused before anything changes (`BACKUP_CHECKSUM_MISMATCH`; HTTP 400 on the import route), and a replace-mode import clears the materialized records in the transaction that replaces the log. With access rules, call `KoraSyncServer.revalidateAccessSessions()` after an `importBackup` you run yourself (the backup route does; otherwise the next delivery poll does). |
 | `getMembershipIntervals(userId)`, `getAccessIndexState()`, `isAccessIndexReady()`, `accessIndexGeneration()` | The membership index access rules are judged against: a user's intervals; the index state (`frontier`, `generation`, `rebuilding`); `false` while this store rebuilds the index or another instance's restore is rebuilding it; the generation this instance last saw. A custom store needs the first two for access rules (`ACCESS_RULES_UNSUPPORTED_STORE` otherwise). The other two are optional: without them, sessions follow the generation and rebuilding state `getAccessIndexState()` reports at every delivery poll, so a rebuild reaches them within one poll instead of at their next send. |
 | `refoldOutdatedRecords(limit?)` | Optional. Re-folds a batch of records an instance on another fold plan wrote (a rolling deploy that changed transforms or merge rules), when this instance runs the plan the database records; returns how many. The sync server calls it on every delivery poll. The built-in SQLite and Postgres stores implement it. |
+| `close()` | Lets the calls and background work already running finish, then closes the connection the store opened (`createSqliteServerStore`, `createPostgresServerStore`; a store built on your own connection leaves it to you). Later calls fail with `... is closed`. |
 | `getEncryptionKeyRecord`, `putEncryptionKeyRecord`, `getEncryptedKeyIds`, `listEncryptionKeyRecords` | The key service's storage (compare-and-set). A custom store without the first two makes the key service answer `unsupported`; see [Sync Encryption](/guide/sync-encryption#server-requirements). |
 
 Server writes go through the same fold as devices; never write materialized tables directly. Use
@@ -438,8 +455,19 @@ A refused operation reaches its author as `sync:operation-rejected` with `{ code
 retriable }` and stays in `app.sync.getRejectedOperations()`. `RETRIABLE_REJECTION_CODES` contains
 `RATE_LIMIT`; `isRetriableRejection(code)` tests membership. Every other code is permanent, for
 example `SCOPE_VIOLATION`, `CONSTRAINT_VIOLATION`, `RESTRICTED`, `INVALID_OPERATION_ID`,
-`OPERATION_TOO_LARGE` and `NODE_ID_MISMATCH`. The [Error Codes reference](/api/errors#wire-codes)
-lists them all.
+`OPERATION_TOO_LARGE`, `NODE_ID_MISMATCH`, `INVALID_ATOMIC_OP` (an atomic intent of an unknown
+type, with an invalid operand, on a delete, or whose `data` is not the intent applied to
+`previousData`) and `INVALID_DELETE_PAYLOAD` (an uploaded delete carrying `data`, `previousData`
+or `atomicOps`; `fieldVersions` and `foldState` are stripped from every upload instead). The
+[Error Codes reference](/api/errors#wire-codes) lists them all.
+
+A whole session is refused at its handshake for: a sync protocol 1 client (Kora 1.0.0-beta.12 and
+earlier), before authentication, with the non-retriable `PROTOCOL_VERSION_UNSUPPORTED` (logged as
+`session.protocol_refused`); a client too old for the grant it would get (`CLIENT_TOO_OLD`: a
+grant with `$or`, a schema with access rules, or access rules without a delivery watermark); a
+grant predicate other than a lone `$in`, or one with more than `maxScopePredicateValues` values
+(`SCOPE_PREDICATE_LIMIT`); a malformed or oversized `syncQueries` list (`INVALID_SYNC_QUERIES`,
+`SYNC_QUERIES_LIMIT`).
 
 ## Awareness relay
 

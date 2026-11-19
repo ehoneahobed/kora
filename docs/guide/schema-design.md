@@ -33,8 +33,11 @@ export default defineSchema({
 })
 ```
 
-`defineSchema` validates the schema when it runs (at app start) and throws a
-`SchemaValidationError` naming the problem. It keeps the exact builder types, so
+`defineSchema` validates the schema and reports a `SchemaValidationError` naming the problem. In
+development builds, on the server and in tests it throws when it runs; in a production browser
+build only the fields are checked at the call and the rest is validated when the Kora runtime
+loads, so an invalid schema rejects `app.ready` with the same error (see
+[defineSchema](/api/core#defineschema)). It keeps the exact builder types, so
 `createApp({ schema })` returns typed collections with no code generation.
 
 ### Organizing large schemas
@@ -137,6 +140,7 @@ without one.
 | `.merge(strategy)` | How concurrent writes merge: `'lww'`, `'counter'`, `'max'`, `'min'`, `'union'` (arrays, the default), `'append-only'` (arrays), `'server-authoritative'`. See [Conflict Resolution](/guide/conflict-resolution#merge-strategies). |
 | `.transitions(map)` | Enums only: the allowed state changes. |
 | `.hashed()` / `.encrypted()` | Secrets only: at-rest protection. |
+| `.stamp('userId')` | Strings only, in a collection with [access rules](/guide/access-rules): Kora fills the field with the signed-in user on insert (leave it out), and no client may set another user or change it later. |
 
 ## Inferred types
 
@@ -145,15 +149,17 @@ without one.
 | Field | Record (read) type | `insert()` | `update()` |
 |-------|--------------------|------------|------------|
 | required | `T` | required | `T` |
-| `.optional()` | `T \| null` | may be omitted (`null` is refused: omit the key) | `T \| null` |
-| `.default(v)` | `T \| null` | may be omitted | `T \| null` |
+| `.optional()` | `T \| null` | may be omitted | `T \| null` |
+| `.default(v)` | `T \| null` | may be omitted (`null` is refused) | `T \| null` |
 | `t.timestamp().auto()` | `number` | cannot be set | cannot be set |
 | `t.number()` / `t.timestamp()` | `number` | | also `op.increment`, `op.decrement`, `op.max`, `op.min` |
 | `t.array(item)` | `Item[]` | | also `op.append(item)`, `op.remove(item)` with an `Item` |
 | `t.richtext()` | `Uint8Array` | `string \| Uint8Array \| ArrayBuffer` | same as insert |
 
 Every record also has `id: string`, `createdAt: number` and `updatedAt: number`. A defaulted
-field reads as `T | null` because an update can clear it with `null`. An `op.*` helper on a field
+field reads as `T | null` because an update can clear it with `null`. The insert type has no
+`null`, but at runtime an insert accepts `null` for an optional field without a default and leaves
+it empty (a form's "None" choice); a required or defaulted field refuses it. An `op.*` helper on a field
 of another kind (`op.append` on a number, `op.increment` on an array) or with an item of the wrong
 type is a compile error.
 
@@ -409,6 +415,15 @@ const schema = defineSchema({
 
 The server grants the values from the verified identity; a client can only narrow them. See
 [Authentication](/guide/authentication#sync-scopes).
+
+## Access rules
+
+A schema can instead declare who reads and writes each collection: a top-level `access` block (the
+memberships collection, the ordered roles and the group collections) and a per-collection `access`
+block of `read`, `create`, `update`, `delete` (or `write`) and per-field rules built from
+`owner()`, `member()`, `memberOfKey()`, `where()` and the other rule helpers. A collection uses
+either access rules or a sync scope, not both. The rules are validated by `defineSchema` and
+enforced by the sync server; see [Access Rules](/guide/access-rules).
 
 <!-- docs-check-prelude -->
 

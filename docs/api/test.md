@@ -49,7 +49,9 @@ try {
 | `encryption` / `serverEncryption` | none | Device encryption key material (`{ config, salt, iterations? }`) and the server's encryption policy. |
 | `deviceMaxOperationBytes` | 256 KiB | Each device store's `maxOperationBytes`. |
 
-`TestNetwork`: `server`, `devices`, `tmpDir` and `close()`.
+`TestNetwork`: `server`, `devices`, `tmpDir` and `close()`. The network removes its `kora-test-*`
+temporary directory on `close()` (even when closing a device or the server throws), when its
+creation fails part way, and, for a network that is never closed, before the process exits.
 
 `createMixedTestNetwork(serverSchema, serverOptions, deviceConfigs)` creates devices on different
 schema versions (`{ name, schema, syncSchemaVersion?, operationTransforms? }`) to test migrations
@@ -60,8 +62,9 @@ and operation transforms.
 | Member | Description |
 |--------|-------------|
 | `name`, `store`, `emitter` | The device's name, `Store` and event emitter (`emitter.clear()` resets recorded events). |
-| `collection(name)` | Collection accessor: `insert`, `update`, `delete`, `findById`, `where`. |
-| `sync()` | Connects (first call) and flushes pending operations. |
+| `open()` | Opens the store (`createTestNetwork` does this for you; call it on a `TestDevice` you construct). |
+| `collection(name)` | Collection accessor: `insert`, `insertMany`, `update`, `delete`, `findById`, `where`. |
+| `sync()` | Connects (first call) and flushes pending operations, writes made before the first sync included. |
 | `disconnect()` / `reconnect()` / `isConnected()` | Connection control. |
 | `getState(collection)` | Every record as a plain object, for assertions. |
 | `getNodeId()`, `getVersionVector()`, `getSyncEngine()`, `getRejectedOperations()` | Introspection. |
@@ -70,6 +73,11 @@ and operation transforms.
 | `close()` | Closes the store and sync. |
 
 Merge decisions are recorded in the device's audit trail as in an app.
+
+`new TestDevice(options)` takes `name`, `schema`, `server`, `tmpDir` and `createTransportPair`,
+plus `user` (sign in to a `TestServer` created with `auth: true`; see below), `principal`,
+`syncSchemaVersion`, `operationTransforms`, `maxOperationBytes`, `nodeId`, `dbFile`, `scopeExit`,
+`reconnectable`, `encryption`, `batchSize` and `bulkReplication`.
 
 ## TestServer
 

@@ -1,8 +1,8 @@
 # @korajs/server
 
 The self-hosted sync server for Kora.js: stores every operation, folds records exactly as devices
-do, enforces scopes, constraints and your validators, and relays changes between devices over
-WebSocket or HTTP long-polling. SQLite and Postgres stores are built in.
+do, enforces scopes, access rules, constraints and your validators, and relays changes between
+devices over WebSocket or HTTP long-polling. SQLite and Postgres stores are built in.
 
 ## Install
 
@@ -35,7 +35,10 @@ console.log(`Listening on ${await server.start()}`) // PORT, default 3001
 
 For production use Postgres (`await createPostgresServerStore({ connectionString })`), an auth
 provider (`createKoraAuthServer().auth` from `@korajs/auth/server`, or your own
-`TokenAuthProvider`), and the operational tokens.
+`TokenAuthProvider`), and the operational tokens. The server reads the settings a host sets when
+the app passes none: `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_BACKUP_TOKEN`,
+`KORA_INSIGHTS_TOKEN`, `KORA_TRUST_PROXY`, `KORA_ALLOWED_ORIGINS`, and `KORA_BLOB_STORE_URL` or
+`KORA_BLOB_DIR` for the bytes behind `t.blob()` fields.
 
 <!-- docs-check: standalone -->
 ```typescript
@@ -81,6 +84,7 @@ DATABASE_URL="postgres://user:pass@localhost:5432/kora_test" pnpm --filter @kora
 ## Documentation
 
 [Production Server](https://korajs.dev/guide/production-server),
+[Access Rules](https://korajs.dev/guide/access-rules),
 [Server-side Validation](https://korajs.dev/guide/server-side-validation) and the
 [Server API reference](https://korajs.dev/api/server).
 

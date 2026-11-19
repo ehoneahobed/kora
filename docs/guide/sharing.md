@@ -149,7 +149,7 @@ function Members() {
 }
 ```
 
-The hooks read the local store inside `<KoraProvider app={app}>`: they work offline and update as memberships sync and as memberships and invitations expire. Members are user ids, owner first; join your own profiles with `profile`. `useMyRole` is for showing and hiding controls; the server decides every action.
+The hooks read the local store inside `<KoraProvider app={app}>`: they work offline and update as memberships sync and as memberships and invitations expire. They render before the store has opened (as with first-visit read-through), returning empty lists and no role until it has. Members are user ids, owner first; join your own profiles with `profile`. `useMyRole` is for showing and hiding controls; the server decides every action.
 
 ## Who may do what
 
@@ -192,6 +192,7 @@ Responses are `{ error: { code, message } }`; `message` is written for people.
 
 | Code | Status | Meaning |
 |---|---|---|
+| `INVALID_REQUEST` | 400 | Not a `POST` with a JSON object, or a field is missing or malformed. |
 | `UNAUTHENTICATED` | 401 | No signed-in user. |
 | `FORBIDDEN` | 403 | The caller's role does not allow this action on this target. Someone who cannot manage the space's members gets this whatever the space's state, before anything about the space or the target is checked, so the refusal reveals nothing about it. That includes the creator of a space the server does not have yet (created offline), whom the server cannot tell apart from a stranger: retry after it syncs. |
 | `ROLE_TOO_HIGH` | 403 | Granting a role at or above your own. |
@@ -207,7 +208,9 @@ Responses are `{ error: { code, message } }`; `message` is written for people.
 | `TOO_MANY_PENDING`, `RATE_LIMITED` | 429 | A limit. |
 | `INVITE_REFUSED` | 403 | `beforeInvite` refused. |
 | `DELIVERY_FAILED` | 502 | Saved but not sent; re-send. |
-| `CONFLICT` | 503 | Lost a race the server could not retry; try again. |
+| `WRITE_REFUSED` | 409 | The server refused the action's writes (for example a constraint or validator). |
+| `CONFLICT` | 503 | Lost a race the server could not retry, or the server is rebuilding its membership index; try again. |
+| `INTERNAL` | 500 | An unexpected failure, logged on the server; try again. |
 
 ## When not to use the kit
 

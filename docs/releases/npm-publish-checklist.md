@@ -1,21 +1,37 @@
 ---
 title: npm Publish Checklist
-description: "The maintainer checklist for validating, publishing, and verifying a Kora.js release on npm."
+description: "The maintainer checklist for validating, publishing, and verifying a Kora.js release on npm through the Changesets Version Packages pull request."
 ---
 
-# npm publish checklist — 1.0.0-beta.11
+# npm publish checklist
 
-Use this checklist with the [beta.11 release notes and sign-off](./v1.0.0-beta.11.md).
-The manifests are already versioned for beta.11; do **not** run `pnpm beta:bump`,
-`pnpm beta:release`, or `pnpm changeset version` for this release.
+The current release is **1.0.0-beta.15** (draft): [release notes](./v1.0.0-beta.15.md),
+[security advisory](./security-advisory-beta15.md), [upgrade guide](../guide/upgrading-to-beta15.md).
+Releases since beta.12 go through the Changesets flow below; do **not** run `pnpm beta:bump` or
+`pnpm beta:release`, which belong to the older manual flow.
 
-## Pre-publish gates
+## How a release is made
 
-Run from the repository root on the exact commit that will be released:
+The repository is in Changesets prerelease mode (`.changeset/pre.json`, tag `beta`). Every push to
+`main` runs [the release workflow](../../.github/workflows/release.yml), which builds the workspace and
+runs `changesets/action`:
+
+- while changesets are pending, it opens or updates the **"Version Packages (beta)"** pull request
+  (for beta.15: #19), which bumps every manifest, writes the `CHANGELOG.md` files and consumes the
+  changesets;
+- when that pull request is merged, the next run finds nothing pending and runs `pnpm release`
+  (`pnpm build && changeset publish`), publishing under the `beta` dist-tag with the repository's
+  `NPM_TOKEN`.
+
+## Before merging the Version Packages pull request
+
+Run from the repository root on the exact commit of the pull request's head:
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm test:pre-release
+pnpm test:e2e:offline
+pnpm release:matrix
 pnpm release:dry-run
 ```
 
@@ -23,80 +39,72 @@ pnpm release:dry-run
 packed manifests, resolves `workspace:` dependencies, and checks declared entry points without
 contacting or writing to the npm registry.
 
-Expected publish set: 15 packages. The 13 linked packages are `1.0.0-beta.11`,
-`create-kora-app` is `0.1.25-beta.10`, and `@korajs/tauri` is `0.4.3-beta.10`.
+Then check:
+
+1. **The publish set.** 16 public packages: the 14 linked packages (`korajs`, `@korajs/auth`, `cli`,
+   `core`, `devtools`, `merge`, `react`, `server`, `spaces`, `store`, `svelte`, `sync`, `test`,
+   `vue`) at `1.0.0-beta.15`, plus `create-kora-app` and `@korajs/tauri` at the versions the pull
+   request sets. `@korajs/spaces` is published for the first time. The pull request also versions the
+   private workspace packages (`kora-e2e-fixture`, `kora-e2e-tauri-app`, `kora-full-stack`,
+   `@korajs/parity-bench-apps`); they are `private: true` and are not published.
+2. **The release notes and advisory** are re-checked against the pull request's head (see their
+   "Open items" and "Before publishing"), and the package versions in the notes are filled in from
+   the pull request.
+3. **The latest parity nightly on `main`** passed every cell and K3.
+4. The repository `NPM_TOKEN` can publish `@korajs/*`, `korajs` and `create-kora-app`, including a
+   new package under `@korajs`.
 
 ## Publish
 
-Choose exactly one publishing path. A push to `main` triggers
-[the release workflow](../../.github/workflows/release.yml), so do not run a local publish at the
-same time.
+Merge the Version Packages pull request and monitor the `release` workflow. Do not run a local
+publish at the same time.
 
-### Option A — GitHub Actions (recommended)
+If the workflow cannot publish (for example a token problem), publish locally from the merged
+commit instead:
 
-1. Commit the release changes on a branch, open a pull request, and ensure CI is green.
-2. Confirm the repository `NPM_TOKEN` can publish `@korajs/*`.
-3. Merge the exact reviewed commit to `main`.
-4. Monitor the `release` workflow; with versions already prepared and changesets consumed in
-   prerelease metadata, it runs `pnpm release` and publishes the package set.
+```bash
+npm whoami
+pnpm release:dry-run
+pnpm release
+```
 
-### Option B — Local maintainer publish
-
-Use this only when the automated release workflow will not publish the same commit.
-
-1. Check out the exact reviewed, CI-green release commit.
-2. Authenticate with an npm account that can publish `@korajs/*` and confirm it with:
-
-   ```bash
-   npm whoami
-   ```
-
-3. Re-run the safe package validation:
-
-   ```bash
-   pnpm release:dry-run
-   ```
-
-4. Publish through Changesets:
-
-   ```bash
-   pnpm release
-   ```
-
-The repository is in Changesets prerelease mode with tag `beta`, so prerelease packages are
-published under npm's `beta` dist-tag. Complete any npm two-factor authentication prompt; do not
-retry blindly if the command reports a partial publish.
+Complete any npm two-factor authentication prompt; do not retry blindly if the command reports a
+partial publish (see Troubleshooting).
 
 ## Verify
 
-Check the primary package, dist-tags, and each version in the publish set:
-
 ```bash
-npm view korajs@1.0.0-beta.11 version
 npm view korajs dist-tags
-npm view @korajs/auth@1.0.0-beta.11 version
-npm view @korajs/cli@1.0.0-beta.11 version
-npm view @korajs/core@1.0.0-beta.11 version
-npm view @korajs/devtools@1.0.0-beta.11 version
-npm view @korajs/merge@1.0.0-beta.11 version
-npm view @korajs/react@1.0.0-beta.11 version
-npm view @korajs/server@1.0.0-beta.11 version
-npm view @korajs/store@1.0.0-beta.11 version
-npm view @korajs/svelte@1.0.0-beta.11 version
-npm view @korajs/sync@1.0.0-beta.11 version
-npm view @korajs/test@1.0.0-beta.11 version
-npm view @korajs/vue@1.0.0-beta.11 version
-npm view create-kora-app@0.1.25-beta.10 version
-npm view @korajs/tauri@0.4.3-beta.10 version
+npm view @korajs/spaces dist-tags
+for p in korajs @korajs/auth @korajs/cli @korajs/core @korajs/devtools @korajs/merge @korajs/react \
+  @korajs/server @korajs/spaces @korajs/store @korajs/svelte @korajs/sync @korajs/test @korajs/vue; do
+  npm view "$p@1.0.0-beta.15" version
+done
+npm view create-kora-app dist-tags
+npm view @korajs/tauri dist-tags
 ```
 
-Then smoke-test installation from outside the monorepo, tag the released commit, push the tag,
-and create the GitHub release from the beta.11 release notes:
+`changeset publish` sets only the `beta` dist-tag. Before beta.15, `latest` of `korajs`, the other
+`@korajs/*` packages, `create-kora-app` and `@korajs/tauri` pointed at the versions published with beta.14, and
+`latest` of `@korajs/spaces` at a canary. Decide whether to move `latest`
+(`npm dist-tag add <package>@<version> latest`); the `@korajs/spaces` `latest` dist-tag is listed in
+the release notes as a 1.0 release-candidate item.
+
+Then smoke-test installation from outside the monorepo (`npx create-kora-app@beta my-app`, and
+`npx kora upgrade --to 1.0.0-beta.15` in a beta.14 app), tag the released commit and push the tag:
 
 ```bash
-git tag v1.0.0-beta.11
-git push origin v1.0.0-beta.11
+git tag v1.0.0-beta.15
+git push origin v1.0.0-beta.15
 ```
+
+Finally:
+
+1. Publish the GitHub security advisory, then replace the `GHSA-xxxx-xxxx-xxxx` and CVSS
+   placeholders in the advisory and link it from the release notes.
+2. Remove the "Draft. Not published." notes from the release notes, the advisory and the upgrade
+   guide, and record the verification results in the notes.
+3. Create the GitHub release from the release notes.
 
 ## Troubleshooting
 
@@ -107,16 +115,4 @@ git push origin v1.0.0-beta.11
 | A package is skipped | Compare its local version with `npm view <package> versions --json`. |
 | A publish partially succeeds | Verify every package individually, then rerun only through Changesets; already-published versions will be skipped. |
 | A packed manifest contains `workspace:` | Stop the release and fix packaging; `pnpm release:dry-run` is expected to catch this. |
-
-## Future releases
-
-After beta.11, use the normal Changesets flow or merge the Version Packages PR created by
-[the release workflow](../../.github/workflows/release.yml):
-
-```bash
-pnpm changeset
-pnpm changeset version
-pnpm test:pre-release
-pnpm release:dry-run
-pnpm release
-```
+| `kora upgrade` reports `UPGRADE_TAG_MISMATCH` | A dist-tag points at different versions across packages (a half-published release, or `latest` moved for some packages only). Finish the publish or align the tags. |

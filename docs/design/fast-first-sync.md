@@ -2,7 +2,11 @@
 
 Status: the visibility index (C2), batched delivery apply (C3), batch-level content-id
 verification (C1.0(a)) and batched device reads (C3b) are shipped. The record snapshot (C1,
-section 3) is designed but **not built**; section 4 explains why.
+section 3) is designed but **not built**; section 4 explains why. Staged replication, which
+applies a large first sync into an in-memory replica to avoid the OPFS journal cost section 8 ends
+on, shipped separately with first-visit parity
+([first-visit parity, section 6](first-visit-parity.md#6-staged-replication)); the measurements
+below predate it.
 
 Targets for a new device syncing an LMS-shaped scope (20,000 operations, 30 scoped collections,
 4G): **first usable data under 2 s**, **full scope under 10 s**. Related:
@@ -271,8 +275,9 @@ failing statements; not covering encryption, transforms or scope-entry fold stat
 
 ## 9. Known limits and follow-ups
 
-- Browser full scope for 20,000 operations is still far above 10 s; the floor is page and journal
-  I/O. The practical target is fast first data plus progressive completion.
+- Browser full scope for 20,000 operations was still far above 10 s after C3b; the floor was page
+  and journal I/O, which staged replication (first-visit parity) addresses outside this
+  workstream. The practical target is fast first data plus progressive completion.
 - Provider-granted scopes need declared partition fields (`scope` or `deliveryPartitions`) to use
   the index; learning them from live sessions was rejected as implicit and harder to prove.
 - The handshake pre-pass remains for older clients and `kora compact`; a v2 opt-out would save a log

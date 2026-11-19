@@ -80,7 +80,9 @@ client's own operations the server still needs) and for local dedup.
 - A delivery batch is applied in one storage transaction with its quarantine rows and its
   watermark advance (`SyncStore.applyDeliveryBatch` in `packages/sync/src/engine/sync-store.ts`). Anything that would leave it partly applied
   rolls it back and the batch is applied operation by operation instead, so the watermark still
-  stops at the base.
+  stops at the base. A device's large first sync of a view may be staged in a scratch replica
+  (`sync.bulkReplication`); the live watermark is then written by the merge that makes the
+  replica live, so a crash before it resumes from the live watermark.
 - Any throw, retriable or terminal, stalls the watermark, and a failed batch is not acknowledged,
   so the server keeps re-sending it. An operation the device cannot apply yet (unknown
   collection, failed decrypt, far-future timestamp) goes to a durable quarantine and counts as

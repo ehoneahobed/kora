@@ -255,8 +255,10 @@ Shows recent output from your deployed app. Useful for debugging issues.
 - `GET /__kora/metrics` for Prometheus-format metrics.
 - `GET /__kora/events` for live Server-Sent Events.
 - `GET /__kora` for the built-in dashboard.
+- `GET /__kora/insights` for device, sync and operation counts without record values or user ids ([operator insights](/guide/production-server#operator-insights-kora-insights)).
+- `POST /__kora/backup/export` and `/__kora/backup/import` for [server backups](/guide/backup-restore#sync-server-backups).
 
-Set `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, and `KORA_BACKUP_TOKEN` in production. Then call protected endpoints with:
+Set `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, and `KORA_BACKUP_TOKEN` in production (`KORA_INSIGHTS_TOKEN` opens `/__kora/insights` and nothing else). `createProductionServer` reads them from the environment when the app passes no `operationalAuth` token; with `NODE_ENV=production`, an endpoint group without a token is disabled (403). Then call protected endpoints with:
 
 ```bash
 curl -H "Authorization: Bearer $KORA_ADMIN_TOKEN" https://your-app.example.com/__kora/status
@@ -630,7 +632,15 @@ server.start().then((url) => {
 })
 ```
 
-`createProductionServer` serves both your built frontend files and the WebSocket sync endpoint on a single port. `/health` is public for deploy platform health checks. `/__kora/*` operational endpoints are token-protected when you set the matching token environment variables.
+`createProductionServer` serves both your built frontend files and the WebSocket sync endpoint on a single port. `/health` is public for deploy platform health checks. `/__kora/*` operational endpoints are token-protected when you set the matching token environment variables (the server reads `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_BACKUP_TOKEN` and `KORA_INSIGHTS_TOKEN` itself, so passing them as above is optional); with `NODE_ENV=production`, an endpoint group without a token is disabled.
+
+The server also reads these settings from the environment:
+
+| Variable | Effect |
+|----------|--------|
+| `KORA_TRUST_PROXY` | Reverse proxies trusted for the client address (a hop count, or comma-separated IPs and CIDR ranges). Set it behind a load balancer so sign-in rate limits are per client. |
+| `KORA_BLOB_STORE_URL`, `KORA_BLOB_DIR` | Where the bytes behind `t.blob()` fields are kept (an S3 bucket or Azure Blob container, or a directory that survives restarts). Unused bytes are swept daily. See [Central blob storage](/guide/production-server#central-blob-storage-and-scheduled-garbage-collection). |
+| `KORA_ALLOWED_ORIGINS` | Comma-separated origins whose pages may call your HTTP routes and `/health`. Native app shells (Tauri) are always allowed. |
 
 ### Build and run
 
@@ -653,7 +663,7 @@ const app = createApp({
   schema,
   sync: {
     url: 'wss://your-domain.com/kora-sync',
-    autoConnect: true, // or `await app.sync?.connect()` after `app.ready`
+    autoConnect: true, // or call `app.sync?.connect()` yourself (it need not wait for `app.ready`)
   },
 })
 ```

@@ -16,7 +16,7 @@ npx -p @korajs/cli@beta kora agents-md
 (`npx kora` alone works inside projects that have `@korajs/cli` installed; elsewhere it would fetch
 an unrelated npm package named `kora`.)
 
-Commit it so agents pick up the conventions automatically. Re-run with `--force` to regenerate it after an upgrade.
+Commit it so agents pick up the conventions automatically. Besides the rules below, it covers sync and sign-in, file storage and settings (`.env.example` tags), tests across users, and deploying. Re-run with `--force` to regenerate it after an upgrade.
 
 ## Machine-readable docs
 
@@ -64,7 +64,7 @@ const unsubscribe = app.todos
   })
 ```
 
-In components, use the hooks instead. The mutation object exposes `mutate` (fire-and-forget), `mutateAsync` (awaitable), `reset`, `isLoading`, and `error`. Sync state comes from `useSyncStatus().status`, which is one of `connected`, `reconnecting`, `syncing`, `synced`, `offline`, `clock-error`, `error`, `schema-mismatch`, `auth-required` or `encryption-locked`.
+In components, use the hooks instead. The mutation object exposes `mutate` (fire-and-forget), `mutateAsync` (awaitable), `reset`, `isLoading`, `error`, and `rejected` (a write the sync server refused later). Sync state comes from `useSyncStatus().status`, which is one of `connected`, `reconnecting`, `syncing`, `synced`, `offline`, `clock-error`, `error`, `schema-mismatch`, `auth-required` or `encryption-locked`.
 
 ```tsx
 import { createKoraHooks } from '@korajs/react'

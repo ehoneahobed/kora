@@ -76,7 +76,10 @@ fields, but three common needs fall outside them:
   the reference calls `app.blobs.pull(ref)`: it fetches the manifest, then only the chunks it does
   not already hold, over the sync connection's blob-chunk messages, and verifies every chunk and
   the reassembled blob by re-hashing. Identical chunks across blobs are stored and sent once.
-  Without a connection local reads still work and `pull` reports that none is available.
+  Without a connection local reads still work and `pull` rejects with `BLOB_SYNC_UNAVAILABLE`.
+  An unanswered chunk request is re-sent under the same request id (after 5 s, then a wait
+  doubling to 30 s) and on every reconnect, and fails with `BlobTransferError` only after 2
+  minutes without any answer.
 - **Garbage collection.** `collectBlobGarbage` keeps every blob reachable from a live reference
   (the blob, its manifest and its chunks) and deletes the rest, sparing unreferenced blobs written
   within a grace period (default 24 hours): a device uploads bytes before the record that points
@@ -98,8 +101,9 @@ fields, but three common needs fall outside them:
   last-write-wins on that key.
 - A hashed secret cannot be read back, by design; an encrypted secret is readable by anyone who
   holds the app's encryption key.
-- Blob bytes are fetched on demand; a device that never called `pull` for a reference does not
-  have the file offline.
+- Blob bytes are fetched on demand: a device has a file offline only after `pull` fetched it, or
+  when an `app.offline.keep(query, { files: true })` pin fetched the files its records reference
+  in the background (`docs/guide/offline-readiness.md`).
 - There is no inline fast path for tiny blobs: every blob goes through the store and the chunk
   channel.
 

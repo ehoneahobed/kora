@@ -28,13 +28,13 @@ pnpm dev
 | `kora dev` | Vite, the sync server (`server.ts` or a managed one from `kora.config.ts`) and the schema watcher. |
 | `kora migrate` | Diff the schema against its snapshot and write up/down SQL, an operation-transform stub and a manifest; `--apply` runs them on the configured server databases. |
 | `kora generate types` / `kora generate hooks` | Optional generated types and React hook stubs (types are already inferred from `defineSchema`). |
-| `kora doctor` | Check the project setup and the sync server; `--db` preflights a production database before a deploy. |
+| `kora doctor` | Check the project setup and the sync server; `--db` preflights a production database before a deploy, `--production` audits what a deploy depends on. |
 | `kora status`, `kora logs` | A running server's status and live events. |
 | `kora backup create \| restore \| info` | Server backups. |
 | `kora compact` | Compact a local SQLite operation log after server acknowledgement. |
-| `kora deploy` | Build and deploy to Kora Cloud, Fly.io, Railway, AWS ECS or AWS Lightsail (`status`, `logs`, `rollback`). |
+| `kora deploy` | Build and deploy to Kora Cloud, Fly.io, Railway, AWS ECS or AWS Lightsail (`status`, `logs`, `restart`, `rollback`). |
 | `kora login`, `kora logout`, `kora whoami` | Sign in to Kora Cloud on this machine. |
-| `kora export`, `kora import` | Bundle an app's database and files into one file; bring a bundle or a backup into Kora Cloud. |
+| `kora export`, `kora import` | Bundle an app's database and files into one file; load a bundle or a backup into Kora Cloud or your own PostgreSQL database. |
 | `kora upgrade` | Move every Kora package to one version, install, flag changed APIs, then run `kora doctor`. |
 | `kora studio` | Inspect a database, run a multi-device sync lab, or watch a live server. |
 | `kora agents-md` | Write an `AGENTS.md` with Kora's rules for AI coding agents. |

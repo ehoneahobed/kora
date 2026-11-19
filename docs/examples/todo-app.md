@@ -58,12 +58,13 @@ export const app = createApp({
 export type Todo = CollectionRecordOf<typeof app, 'todos'>
 
 // Hooks typed by the schema
-export const { useMutation, useQuery, useSyncStatus } = createKoraHooks<typeof app>()
+export const { useMutation, useQueryState, useSyncStatus } = createKoraHooks<typeof app>()
 ```
 
 Without `sync` the app is local-only and fully functional. With it, every write is uploaded when a
-connection exists and other devices' writes arrive in real time. `autoConnect: true` connects once
-the local store is ready (otherwise call `app.sync?.connect()` yourself).
+connection exists and other devices' writes arrive in real time. `autoConnect: true` opens the
+connection while the local store opens (otherwise call `app.sync?.connect()` yourself; it need not
+wait for `app.ready`).
 
 ## Root
 
@@ -97,7 +98,7 @@ import { useState } from 'react'
 import { AddTodo } from './AddTodo'
 import { SyncIndicator } from './SyncIndicator'
 import { TodoItem } from './TodoItem'
-import { app, useQuery } from './app'
+import { app, useQueryState } from './app'
 
 type Filter = 'all' | 'active' | 'completed'
 
@@ -132,8 +133,9 @@ function TodoList({ filter }: { filter: Filter }) {
     filter === 'all'
       ? app.todos.where({}).orderBy('createdAt', 'desc')
       : app.todos.where({ completed: filter === 'completed' }).orderBy('createdAt', 'desc')
-  const todos = useQuery(query)
+  const { data: todos, ready } = useQueryState(query)
 
+  if (!ready) return null
   if (todos.length === 0) {
     return <p>No {filter === 'all' ? '' : filter} todos.</p>
   }
@@ -148,9 +150,10 @@ function TodoList({ filter }: { filter: Filter }) {
 }
 ```
 
-Local queries need no network: `useQuery` renders `[]` first and the rows right after mount, then
-re-renders whenever the result changes, from a local write or an incoming sync. Switching the
-filter subscribes to the new query.
+Local queries need no network: the rows arrive right after mount (or, on a first visit, once the
+local store opens), then the list re-renders whenever the result changes, from a local write or an
+incoming sync. `ready` is false until the first result, so the "No todos" message never flashes
+before the data is there. Switching the filter subscribes to the new query.
 
 ## AddTodo
 
@@ -185,8 +188,8 @@ export function AddTodo() {
 }
 ```
 
-`useMutation` returns `mutate` (fire and forget), `mutateAsync` (awaitable), `reset`, `isLoading`
-and `error`. The write lands in the local database at once and the list updates; uploading happens
+`useMutation` returns `mutate` (fire and forget), `mutateAsync` (awaitable), `reset`, `isLoading`,
+`error` and `rejected` (a write the sync server refused later). The write lands in the local database at once and the list updates; uploading happens
 in the background. Render `error`: a refused local write (an invalid value, for example) reports
 there.
 

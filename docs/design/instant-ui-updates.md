@@ -79,7 +79,7 @@ Otherwise the write runs as with the option off and is reported as a miss with a
 
 - Common: the store has `instantUpdates`; no `{ durable: true }`; the write gate is open and the adapter is not refusing writes (`refusesWrites()`); the collection's circuit breaker has not tripped; the registry has room and the write touches at most `maxRecordsPerWrite` records; the collection has no secret fields (their stored form is computed asynchronously) and the write touches no `richtext` field; not an internal table.
 - **insert**: always, once the common conditions hold.
-- **update**: a base row is available (5.6); no written field is `server-authoritative` or folds through a resolver or other fold the predictor cannot run; the state machine allows it (`validateUpdateStateMachine` on the base, as the write path does). Atomic operations, `counter`/`max`/`min`/`append-only` fields and arrays go through the fold (5.10); with `legacyMerge` they are misses.
+- **update**: a base row is available (5.6); no written field is `server-authoritative` or folds through a resolver or other fold the predictor cannot run; the state machine allows it (`validateUpdateStateMachine` on the base, as the write path does). Atomic operations, `counter`/`max`/`min`/`append-only` fields and arrays go through the fold (5.10).
 - **delete**: the collection is not the target of a relation with `onDelete` `cascade`, `set-null` or `restrict` (`cascade-target`). Cascades write rows found by SQL inside the transaction, and a `restrict` refusal would arrive after the row was hidden.
 
 ### 5.3 The predicted row must equal the committed row
@@ -170,7 +170,7 @@ Verification re-predicts from what the transaction really read (the committed `p
 | Success | Retires; display kept until the settle | Patched, then committed row | Resolves (after the barrier on the fallback) |
 | Refused before the transaction | No entry | Nothing | Rejects |
 | Fails in the transaction (not found, state machine, size, referential, statement, quota, `BridgeTerminatedError`) | Entry and dependents removed | Row leaves or old values return | Rejects with the original error |
-| `COMMIT` rejected, outcome unknown | `unknown`, kept shown; the write's last operation id is looked up. Found: committed, published once. Absent: rolled back. Unreadable: decided later | Stays until decided | Resolves if found |
+| `COMMIT` rejected, outcome unknown | `unknown`, kept shown; the write's last operation id is looked up. Found: committed, published once. Absent: rolled back. Unreadable: decided by the next successful read, also when the witness is learned only after the entry turned `unknown`. A write with no operation (an update that changed nothing) is rolled back | Stays until decided | Resolves if found |
 | Barrier fails after commit (`WriteNotDurableError`) | Already retired | Stays | Rejects ("exists, do not retry") |
 | Never settles | `unknown` after `pendingTtlMs` | Stays until decided | Rejects on adapter timeout |
 | Tab killed | Gone | After reload the database decides | Never resolves |
@@ -183,6 +183,7 @@ Other tabs never see the overlay: the cross-tab bus announces only committed ope
 
 ## 9. Interactions and API
 
+<!-- docs-check: skip fragment: app, schema and id come from the application -->
 ```ts
 createApp({ schema, store: { instantUpdates: true } }) // or { maxPendingWrites, maxPendingBytes, maxRecordsPerWrite }
 await app.todos.update(id, { done: true }, { durable: true }) // show only after commit
@@ -214,7 +215,7 @@ Settle re-runs are the same work as before, now off the critical path; under sus
 All tests are deterministic (held commits, latches, injected clocks, counted event-loop turns).
 
 - **Differential tests** (`overlay/query-eval.test.ts`): generated rows (NULLs, non-BMP text, lone surrogates, NUL, U+FFFF, `-0`, 2^53, 1e308, ties) and descriptors run through the real `buildSelectQuery` on `better-sqlite3` and through `SqliteWasmAdapter` over the mock worker bridge; membership, order, tie groups and `limit` boundaries must agree. 10,000 cases per engine in CI (`KORA_QUERY_EVAL_CASES`, `KORA_QUERY_EVAL_SEED` for more or a pinned seed). Refusals are asserted by reason, and deliberately broken evaluators are caught.
-- **Equivalence** (`overlay/overlay-equivalence.test.ts`, `overlay-atomic.test.ts`): a real `Store` on a gated adapter plus a peer supplying real remote operations, with commits delayed, reordered, failed and ambiguous, single writes and transactions, fold and legacy modes. After every step the display equals an independent model; after the drain it equals a fresh `SELECT` modulo metadata, with zero divergences and an empty registry. Coverage guards fail runs that skipped predictions, declines or rollbacks. `core/src/fold/local-update.test.ts` checks `predictLocalUpdate` against the real fold.
+- **Equivalence** (`overlay/overlay-equivalence.test.ts`, `overlay-atomic.test.ts`): a real `Store` on a gated adapter plus a peer supplying real remote operations, with commits delayed, reordered, failed and ambiguous, single writes and transactions, under both materialization modes of the store (the default fold and the internal `'legacy'` mode kept for tests). After every step the display equals an independent model; after the drain it equals a fresh `SELECT` modulo metadata, with zero divergences and an empty registry. Coverage guards fail runs that skipped predictions, declines or rollbacks. `core/src/fold/local-update.test.ts` checks `predictLocalUpdate` against the real fold.
 - **Fault injection** (`overlay/overlay-faults.test.ts`): a failure after every statement (of every group member), `COMMIT` lost, landed-but-rejected, unreadable log, bridge terminated, quota, barrier failure, TTL, breaker, strict mode, every clear point, caps, option off. Each asserts the promise, the entry state, display equal to `SELECT`, and exactly one `operation:created` per committed write.
 - **Invariants**: `module-graph.test.ts` (I1), `overlay-log-identity.test.ts` (I2, byte for byte), `overlay-crash.test.ts` (worker killed before `BEGIN`, with the commit held, and after `COMMIT`: the row exists after reopen exactly when the commit landed), `kora/src/instant-updates-two-tabs.test.ts` (real leader election and bus: nothing uncommitted reaches the other tab), plus `write-order`, `overlay-seed`, `overlay-cascade-order` and `overlay-transactions` tests.
 - **Node gates** (`src/benchmarks/overlay-patching-gates.test.ts`, commit held): write to callback on a 1,000-row result under 2 ms; one write into 1,000 subscriptions of 100 rows under 8 ms.
@@ -235,7 +236,7 @@ All tests are deterministic (held commits, latches, injected clocks, counted eve
 - **A shown row can be lost** if the tab closes, crashes or loses its leader inside the pending window. Drive save state from the promise or `isLoading`, and warn on unload while `pendingWriteCount()` is non-zero.
 - **Rollback flicker**: a row can appear and disappear (remote delete, quota). An app that calls `mutate` without reading `error` sees it vanish with no message.
 - **An extra callback** at settle for corrected metadata, with the same visible rows.
-- **Commit path only** for `include` queries, offsets, unpatchable field kinds, cascade/`restrict` delete targets, `richtext` and secret fields, `server-authoritative` fields and resolvers, `legacyMerge` atomic and array writes, writes over the caps, and transactions containing any of these. Patching many-to-one `include`, predicting cascades and a pre-commit read-through for unpatchable queries are not built.
+- **Commit path only** for `include` queries, offsets, unpatchable field kinds, cascade/`restrict` delete targets, `richtext` and secret fields, `server-authoritative` fields and resolvers, writes over the caps, and transactions containing any of these. Patching many-to-one `include`, predicting cascades and a pre-commit read-through for unpatchable queries are not built.
 - **Base reads can time out** for records outside the seeded part of the row cache (below the first 512 rows of a large result, or after turnover); re-seeding a large result can evict the rows seeded from its top first.
 - **Same-millisecond order** by `createdAt`/`updatedAt` can differ until settle, and a group's inserts share a predicted millisecond, so a query ordered by `createdAt` alone ties and waits for the commit.
 - **Untested divergences** (collation, affinity, planner order) are possible; they last one SQL round trip, are never persisted, and trip the breaker on repetition.

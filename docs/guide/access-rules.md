@@ -251,6 +251,9 @@ A user who holds both a grant and a membership of the group is judged on the mem
 | `IMMUTABLE_ACCESS_FIELD` | A client tried to change a field that decides access. |
 | `GROUP_EXISTS` | A client insert reused the id of an existing group record. |
 | `STAMP_REQUIRED`, `STAMP_MISMATCH` | A stamped field was missing or named another user. |
+| `INVALID_ATOMIC_OP` | An atomic intent of an unknown type, with an invalid operand, or whose data disagrees with it (or more than 4 intents under a custom store without `previewResult`). |
+
+A session can also be refused as a whole: `CLIENT_TOO_OLD` for a client from before 1.0.0-beta.15, and a retriable `ACCESS_RULES_CHANGED` while the rules are not in force for it (see [Current limits](#current-limits)); it reconnects on its own.
 
 ## Adopting access rules in an existing app
 

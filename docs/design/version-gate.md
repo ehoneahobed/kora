@@ -187,9 +187,14 @@ In order. Steps 1 and 2 run in the same task, so no write is refused before the 
    already rejected to their callers and the replacing lineage is authoritative. From the moment
    retirement starts, `close()` saves every admitted write first and is refused
    (`UNSAVED_WRITES`) when that fails.
-5. **Stop sync.** The sync engine disconnects. Unsent operations are already in the persisted
-   outbound queue, so the new build uploads them; content-addressed ids mean nothing is lost or
-   sent twice.
+5. **Stop sync.** The sync engine is destroyed, not just stopped: a permanent fence, so an auth
+   reconnect or a `connect()` already in flight never opens a session or touches persisted sync
+   state, and retirement waits (bounded) for those attempts before releasing the tab lock. Every
+   sync API that connects or changes persisted sync state (`connect`, `reconnect`, `retryNow`,
+   `setQuerySubsets`, `clearRejectedOperations`, `assignHeld`, `discardHeld`) then refuses with
+   `BuildSupersededError`, and no automatic reconnect starts. Unsent operations are already in
+   the persisted outbound queue, so the new build uploads them; content-addressed ids mean nothing
+   is lost or sent twice.
 6. **Give up storage roles.** Leader: release leadership (rule 4); after the drain no follower
    holds an open transaction span on this worker, and a span cut by the release fails retriably.
    Follower: cancel the promotion watch.
@@ -237,7 +242,10 @@ would sidestep Kora's at-rest protection. So:
 ## 7. Service-worker updates
 
 The offline shell (`packages/cli/src/vite/service-worker.ts`) waits for the user to accept an
-update before activating it. Accepting it in one tab reloads that tab into the new build; its tab
+update before activating it. Once accepted, it also waits until no write is still committing
+(`store.pendingWriteCount()` and `store.whenWritesSettled()`, published to the page as
+`__KORA_WRITES__`), dispatching `kora:update-waiting` meanwhile, so a reload never loses a write
+on screen. Accepting it in one tab reloads that tab into the new build; its tab
 lock and hello retire every other old tab, which then shows the prompt instead of writing on. A
 page loaded online that bypassed an older active worker is a newer build than the worker's
 offline copy; whichever tab has the higher key wins.

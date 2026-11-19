@@ -1,6 +1,6 @@
 ---
 title: API Reference
-description: "API reference for every Kora.js package: core, store, merge, sync, server, auth, react, vue, svelte, devtools, test, the CLI and error codes."
+description: "API reference for every Kora.js package: core, store, merge, sync, server, auth, react, vue, svelte, tauri, devtools, test, the CLI and error codes."
 ---
 
 # API Reference
@@ -15,6 +15,7 @@ Kora.js is a set of focused packages. Each owns one layer of the offline-first s
 | A Vue or Svelte app | `korajs`, `@korajs/vue` or `@korajs/svelte` |
 | A sync server | `@korajs/server` |
 | Sign-in, organizations, MFA | `@korajs/auth` |
+| Sharing: invitations, roles, members | `@korajs/spaces` (see [Sharing](/guide/sharing)) |
 | A Tauri desktop app | `@korajs/tauri` in addition |
 | Sync tests | `@korajs/test` (dev dependency) |
 
@@ -28,11 +29,12 @@ with; it depends on `@korajs/core`, `@korajs/store`, `@korajs/merge`, `@korajs/s
 korajs               The app API (createApp, defineSchema, t, op, types)
   @korajs/core       Schema, types, operations, hybrid logical clock, the record fold
   @korajs/store      Local storage (SQLite WASM on OPFS, IndexedDB, native SQLite), queries
-  @korajs/merge      Constraint and referential checks; the deprecated pairwise merge
+  @korajs/merge      Constraint and referential checks, rich-text helpers
   @korajs/sync       Sync engine, protocol v2, transports, encryption keyring, presence
   @korajs/devtools   Instrumentation, the DevTools panel and overlay
 @korajs/server       Self-hosted sync server
 @korajs/auth         Authentication, sessions, MFA, organizations, RBAC
+@korajs/spaces       Sharing on top of access rules: invitations, roles, members, ownership
 @korajs/react        React bindings
 @korajs/vue          Vue bindings
 @korajs/svelte       Svelte bindings
@@ -52,9 +54,10 @@ create-kora-app      npx entry point of `kora create`
 | [Sync](/api/sync) | `app.sync`, status types, `SyncEngine`, transports, protocol constants, encryption, presence |
 | [Server](/api/server) | `createProductionServer`, `KoraSyncServer`, stores, the route context, auth providers, validation |
 | [Auth](/api/auth) | Auth client, sync binding, passkeys, the auth server, sessions, MFA, organizations, RBAC, OAuth |
-| [React](/api/react) | `KoraProvider`, `createKoraHooks`, `useQuery`, `useMutation`, `useSyncStatus`, rich text, presence |
+| [React](/api/react) | `KoraProvider`, `createKoraHooks`, `useQuery`, `useMutation`, `useSyncStatus`, `useOfflineReady`, `useFormDraft`, rich text, presence |
 | [Vue](/api/vue) / [Svelte](/api/svelte) | The same bindings for Vue and Svelte |
-| [Offline readiness](/api/offline) | `app.offline.status()`, `useOfflineReady`, completion marks, storage loss |
+| [Offline readiness](/api/offline) | `app.offline.status()`, `keep`, `useOfflineReady`, completion marks, storage loss |
+| [Tauri desktop](/guide/tauri-desktop) | `@korajs/tauri`: native SQLite, the OS credential store, desktop apps that also ship on the web |
 | [DevTools](/api/devtools) | The complete event catalog, `Instrumenter`, panel building blocks |
 | [Test](/api/test) | `createTestNetwork`, `TestDevice`, `TestServer`, convergence assertions |
 | [CLI](/api/cli) | Every `kora` command and flag |

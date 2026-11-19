@@ -37,7 +37,7 @@ over server-sent events).
 
 ```bash
 kora studio --lab            # built-in demo schema, 2 devices
-kora studio --lab --devices 3 --schema ./kora/schema.ts
+kora studio --lab --devices 3 --schema ./src/schema.ts
 ```
 
 An interactive multi-device sync laboratory. Every device is a REAL Kora
@@ -64,7 +64,7 @@ The Lab only ever touches throwaway databases in a temp directory.
 ## Spectator mode
 
 ```bash
-kora studio --connect wss://your-server.com/kora --schema ./kora/schema.ts [--token …]
+kora studio --connect wss://your-server.com/kora-sync --schema ./src/schema.ts [--token …]
 ```
 
 Live, read-only inspection of a PRODUCTION sync server. The spectator is a
@@ -82,9 +82,10 @@ on the live replica, and the Sync tab shows the live event feed.
    corrupt the append-only log and violate content addressing.
 2. **Zero dependencies, works offline.** One self-contained UI served by
    `node:http`; no CDN, no build step.
-3. **Local only.** Binds to 127.0.0.1.
+3. **Local only.** Binds to 127.0.0.1, on port 4321 by default (`--port`, `0` for a random
+   free port).
 
-## Roadmap (post-0.7.0)
+## Roadmap
 
 - Browser-app inspection: unify with the DevTools extension so OPFS stores
   get the same surface.

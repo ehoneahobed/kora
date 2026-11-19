@@ -62,6 +62,7 @@ test('offline edits converge', async () => {
 - `createMixedTestNetwork` runs devices on different schema versions against one server, to test `supportedSchemaVersions` and operation transforms.
 - `expectConverged(devices, schema)` throws with the differences unless every device holds the same records. `checkConvergence` returns them instead. `expectConvergedEventually` retries until a chaotic network settles.
 - `TestDevice`, `TestServer`, `ChaosTransport` and `createTestAuthBinding`. The auth binding moves a device between loading, signed out and several users with no auth server.
+- Access rules across users: `new TestServer(schema, { auth: true })` and `new TestDevice({ user: 'alice', ... })` sign devices in, so the schema's access rules apply as in production, and `server.access` (`grant`, `revoke`, `transfer`) changes memberships during a test.
 
 ## Playwright helpers
 

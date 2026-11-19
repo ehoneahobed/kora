@@ -39,7 +39,7 @@ features:
     details: Full TypeScript inference flows from your schema to your queries, mutations, and hooks. Your IDE knows your data shape everywhere.
   - icon: 🚀
     title: Scaffold to Deployed in Two Commands
-    details: create-kora-app scaffolds a working offline-first app with an offline app shell. kora deploy ships your sync server to Fly.io, Railway or AWS with the Dockerfile and platform config generated for you.
+    details: create-kora-app scaffolds a working offline-first app with an offline app shell. kora deploy ships your sync server to Kora Cloud, Fly.io, Railway or AWS with the Dockerfile and platform config generated for you.
 ---
 
 <div class="home-section">
@@ -54,7 +54,7 @@ cd my-app
 npm run dev
 ```
 
-Upgrading an app from 1.0.0-beta.12? Read [Upgrading to beta.13](/guide/upgrading-to-beta13) first: the release is breaking, and servers upgrade before clients.
+Upgrading an app from 1.0.0-beta.14? Read [Upgrading to beta.15](/guide/upgrading-to-beta15). From 1.0.0-beta.12, read [Upgrading to beta.13](/guide/upgrading-to-beta13) first: that release is breaking, and servers upgrade before clients.
 
 Your data layer is just a schema. Everything else is inferred:
 
