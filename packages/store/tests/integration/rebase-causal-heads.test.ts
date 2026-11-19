@@ -108,4 +108,48 @@ describe('a clock rebase keeps causal heads pointing at the log', () => {
 		}
 		await store.close()
 	})
+
+	// Review round 2 of #306: when the rewrite fails at commit, the heads it remapped must not be
+	// seen by a write the database lock wakes before the store has undone the remap.
+	test('a rewrite that fails at commit leaves no queued write depending on its ids', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const store = new Store({ schema, adapter })
+		await store.open()
+		const ahead = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10 * 60_000)
+		await store.collection('todos').insert({ title: 'written with a clock ahead' })
+		ahead.mockRestore()
+		const before = [...(await opIds(adapter))]
+		const original = adapter.transaction.bind(adapter)
+		let calls = 0
+		let queued: Promise<unknown> | null = null
+		vi.spyOn(adapter, 'transaction').mockImplementation(async (fn, options) => {
+			const call = ++calls
+			if (call !== 1) return original(fn, options)
+			// The rewrite's body runs (the remap included), then its commit fails: rolled back.
+			const failure = new Error('commit failed')
+			await original(async (tx) => {
+				await fn(tx)
+				throw failure
+			}, options).catch(() => {})
+			// The lock is free again; a write starts before the store sees the failure. It is given
+			// a moment to run; held back by the store, it runs after the undo instead.
+			queued = store.collection('todos').insert({ title: 'queued behind the failed rewrite' })
+			await Promise.race([queued, new Promise((resolve) => setTimeout(resolve, 100))])
+			throw failure
+		})
+		await expect(store.rebaseUnsyncedOperations(before, Date.now())).rejects.toThrow(
+			'commit failed',
+		)
+		await queued
+		const log = await opIds(adapter)
+		// Rolled back: the original operation is still there under its old id.
+		for (const id of before) expect(log.has(id)).toBe(true)
+		const rows = await adapter.query<{ id: string; causal_deps: string }>(
+			'SELECT id, causal_deps FROM _kora_ops_todos',
+		)
+		for (const row of rows) {
+			for (const dep of JSON.parse(row.causal_deps) as string[]) expect(log.has(dep)).toBe(true)
+		}
+		await store.close()
+	})
 })
