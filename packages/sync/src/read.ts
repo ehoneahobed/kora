@@ -10,4 +10,4 @@ export type {
 	ReadFetchResponse,
 	ReadThroughClientOptions,
 } from './read/read-through-client'
-export type { ReadQuery, ReadRecord, ReadResult } from './read/read-types'
+export type { ReadQuery, ReadRecord, ReadRequest, ReadResult } from './read/read-types'
