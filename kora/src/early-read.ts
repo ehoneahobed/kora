@@ -22,6 +22,8 @@ export interface EarlyReads {
 	stop(): void
 	/** The fetch the chunk's read client uses. */
 	readonly fetch: ReadFetch
+	/** Settles once the first batch was sent (or decided not to be). */
+	readonly firstSend: Promise<void>
 }
 
 /** As the read client: queries asked in one turn travel in one request, at most this many. */
@@ -59,18 +61,22 @@ export function createEarlyReads(
 	const inFlight = new Map<string, Promise<ReadFetchResponse>>()
 	let turn: ReadQuery[] = []
 	let stopped = false
+	let sent: () => void = () => {}
+	const firstSend = new Promise<void>((resolve) => {
+		sent = resolve
+	})
 
 	const send = async (queries: ReadQuery[]): Promise<void> => {
 		try {
-			await sendNow(queries)
+			await sendNow(queries, sent)
 		} finally {
 			// Each query was counted when it was asked for.
 			for (const _ of queries) tracker?.end()
 		}
 	}
 
-	const sendNow = async (queries: ReadQuery[]): Promise<void> => {
-		if (!(await firstVisit) || queries.length === 0) return
+	const sendNow = async (queries: ReadQuery[], onSent: () => void): Promise<void> => {
+		if (!(await firstVisit) || queries.length === 0) return onSent()
 		const headers: Record<string, string> = {
 			'content-type': 'application/json',
 			accept: 'application/json',
@@ -79,12 +85,14 @@ export function createEarlyReads(
 			try {
 				headers.authorization = `Bearer ${(await auth()).token}`
 			} catch {
-				return // No credential (signed out, still loading): the client decides, as before.
+				// No credential (signed out, still loading): the client decides, as before.
+				return onSent()
 			}
 		}
 		const body = JSON.stringify({ v: READ_VERSION, schemaVersion, queries } satisfies ReadRequest)
 		const response = fetch(url, { method: 'POST', headers, body }) as Promise<ReadFetchResponse>
 		inFlight.set(body, response)
+		onSent()
 		// Counted until the response arrives; one nobody takes over is dropped, and its failure
 		// is not unhandled.
 		await response.catch(() => {})
@@ -99,6 +107,7 @@ export function createEarlyReads(
 	}
 
 	return {
+		firstSend,
 		ask(descriptor) {
 			if (stopped) return
 			const query = toReadQuery(descriptor, schema)

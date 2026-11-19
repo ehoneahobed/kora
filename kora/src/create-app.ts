@@ -882,9 +882,11 @@ export function createApp<const S extends SchemaInput>(
 
 	const reservedProperties = new Set(Reflect.ownKeys(app))
 	const collectionNames = Object.keys(config.schema?.collections ?? {})
-	// Help for a rare mistake, loaded only when it is made: its message is not first-paint code.
+	// Help for a rare mistake, loaded only when it is made, and after the first screen is
+	// answered: its download must not share the link with the first read (S0 P2).
 	if (collectionNames.some((name) => reservedProperties.has(name))) {
-		void import('./reserved-app-properties')
+		void firstAnswer
+			.then(() => import('./reserved-app-properties'))
 			.then((m) => m.warnShadowedCollections(collectionNames, reservedProperties))
 			.catch(() => {})
 	}
@@ -904,6 +906,9 @@ export function createApp<const S extends SchemaInput>(
 
 /** Longest the runtime waits for the first read-through answer before it starts anyway. */
 const FIRST_ANSWER_WAIT_MS = 1200
+
+/** Longest the answers chunk waits for the first early read to leave (S0 P2). */
+const FIRST_SEND_WAIT_MS = 50
 
 /** Longest the store's start waits for read-through reads in flight (S0 P7). */
 const READ_YIELD_MAX_MS = 1000
@@ -989,6 +994,13 @@ function loadPreReadyAnswers(config: KoraConfig): {
 	)
 	const answers = returning.then(async (isReturning) => {
 		if (isReturning) return null
+		// The first read leaves before the chunk is requested, so it takes a connection that is
+		// already open instead of opening one (a round trip on a slow link). A screen that asks
+		// nothing does not hold the chunk back for long.
+		await Promise.race([
+			early.firstSend,
+			new Promise<void>((resolve) => setTimeout(resolve, FIRST_SEND_WAIT_MS)),
+		])
 		const { createPreReadyAnswers } = await import('./pre-ready-answers-loader')
 		return createPreReadyAnswers(sync, schema, early.fetch, tracker)
 	})
