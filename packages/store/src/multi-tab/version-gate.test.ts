@@ -735,4 +735,30 @@ describe('state rechecks after every await', () => {
 		expect(tab.getState()).toBe('open')
 		tab.close()
 	})
+
+	// Review of #299: only a retryable failure is forgotten. A gate closed while it opened stays
+	// closed: a later open() returns the same rejection and starts no new open.
+	test('open(): a gate closed while opening keeps its rejection; a later open() starts nothing', async () => {
+		const control = controllableLocks(locks)
+		const tab = gate('A', 'tab', {
+			runtime: {
+				browser: true,
+				locks: control.locks,
+				createChannel: (name) => new MockBroadcastChannel(name, 'tab'),
+			},
+		})
+		const release = control.holdQuery(1)
+		const first = tab.open()
+		first.catch(() => {})
+		await vi.waitFor(() => expect(control.queries()).toBeGreaterThanOrEqual(1))
+		tab.close()
+		release()
+		await expect(first).rejects.toBeInstanceOf(VersionGateClosedError)
+		const queriesAfterClose = control.queries()
+		const second = tab.open()
+		await expect(second).rejects.toBeInstanceOf(VersionGateClosedError)
+		expect(second).toBe(first)
+		expect(control.queries()).toBe(queriesAfterClose)
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"tab"'))).toBe(false)
+	})
 })
