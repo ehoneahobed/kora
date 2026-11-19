@@ -46,6 +46,8 @@ export function recordsFromAnswer(
 export interface PreReadyAnswersOptions {
 	source: AnswerSource
 	schema: SchemaDefinition
+	/** Settles when no read waits for its answer, or after `maxMs` (the store's start waits, S0 P7). */
+	readsIdle?: (maxMs: number) => Promise<void>
 }
 
 /**
@@ -170,6 +172,11 @@ export class PreReadyAnswers {
 	}
 
 	constructor(private readonly options: PreReadyAnswersOptions) {}
+
+	/** Settles when no read waits for its answer, or after `maxMs` at most. */
+	readsIdle(maxMs: number): Promise<void> {
+		return this.options.readsIdle?.(maxMs) ?? Promise.resolve()
+	}
 
 	private held: AnswerHandoff[] = []
 	private seeding: Promise<void> = Promise.resolve()
