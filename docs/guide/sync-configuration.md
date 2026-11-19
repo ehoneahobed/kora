@@ -36,9 +36,9 @@ const app = createApp({
 })
 ```
 
-Kora does not connect on its own: set `autoConnect: true`, or call `await app.sync?.connect()`
-after `app.ready` (for example once a user signed in). `app.sync` is `null` when `sync` is not
-configured.
+Kora does not connect on its own: set `autoConnect: true`, or call `app.sync?.connect()` (for
+example once a user signed in). Neither waits for `app.ready`: the connection starts in parallel
+with opening the local store. `app.sync` is `null` when `sync` is not configured.
 
 ## Options
 
@@ -46,9 +46,10 @@ configured.
 |--------|---------|-------------|
 | `url` | (required) | Sync server URL: `wss://` (or `ws://` locally) for WebSocket, `https://` for HTTP. |
 | `transport` | `'websocket'` | `'http'` for HTTP long-polling where WebSockets are blocked. `createProductionServer` serves WebSocket sync only: map an HTTP endpoint to `KoraSyncServer.handleHttpRequest` (with the `authorization` and `x-kora-session` headers, as in [Upgrading to beta.13](/guide/upgrading-to-beta13#an-http-long-poll-endpoint)). |
-| `autoConnect` | `false` | Connect after `app.ready`. |
+| `autoConnect` | `false` | Connect at start, in parallel with opening the store. |
 | `auth` | | `async (options?) => ({ token })`, called before every connection attempt; with `{ forceRefresh: true }` after the server ended a session as expired or revoked. |
-| `authClient` | | A binding from `createKoraAuthSync({ authClient, schema })` (`@korajs/auth`); overrides `auth`. |
+| `authClient` | | A binding from `createKoraAuthSync({ authClient, schema })` (`@korajs/auth`); overrides `auth`. Wrap it in `lazyAuthSync(() => import('./auth-sync').then((m) => m.binding))` (from `korajs`) to load the sign-in client after the first paint, as the sync templates do. |
+| `firstVisit` | | `{ readThrough: true }` answers queries made before the store opens from the sync server's read endpoint (`POST <sync url>/read`, enabled by the server's `readThrough`), so a first visit shows data before the database fills. It uses the credential of `authClient` (only while a user is signed in) or else `auth`, and does nothing when the server has no read endpoint. A device whose data is complete does not read through. |
 | `unassignedWrites` | `'hold'` | Writes made before the app knew who was signed in, on a database that never synced: `'hold'` them for the app to assign, or `'assign-to-first-user'` (single-user apps). See [held writes](#held-writes). |
 | `scope` | | Flat scope values (`{ orgId }`) the client asks for, combined with the schema's scope declarations. They can only narrow the server's grant. |
 | `scopes` | | Per-collection scope functions, for the same purpose. |
@@ -59,7 +60,7 @@ configured.
 | `schemaVersion` | `schema.version` | The schema version sent in the handshake. |
 | `batchSize` | `100` | Operations per upload batch. |
 | `strictHandshake` | `false` | Wait for the server's acknowledgment of each handshake delta batch before streaming. |
-| `bulkReplication` | on for browser OPFS | Apply a large first sync into a scratch in-memory database and merge it into yours once, instead of one journaled transaction per batch. Used only for a device's first sync of a view with at least 2000 server operations (`{ minOperations }` changes that), and only where the database can stage. A browser OPFS database stages by default. Node's native SQLite (`better-sqlite3`) has no per-batch journaling cost to avoid, so it stages only when you ask (`true` or an object). IndexedDB and Tauri databases never stage. `false` applies the stream directly. Nothing of a staged stream is in your database, or counted in its sync watermark, until the merge: a reload mid-way starts the stream again. |
+| `bulkReplication` | on for browser OPFS | Apply a large first sync into a scratch in-memory database and merge it into yours once, instead of one journaled transaction per batch. Used only for a device's first sync of a view with at least 2000 server operations and more than one batch (`{ minOperations }` changes that; `0` stages every multi-batch first sync), and only where the database can stage. A scope above `maxOperations` (default 150000) is applied directly, and a replica that grows past `maxBytes` (default 256 MiB) is merged as it is and the rest of the stream applied directly. A browser OPFS database stages by default. Node's native SQLite (`better-sqlite3`) has no per-batch journaling cost to avoid, so it stages only when you ask (`true` or an object). IndexedDB and Tauri databases never stage. `false` applies the stream directly. Nothing of a staged stream is in your database, or counted in its sync watermark, until the merge: a reload mid-way starts the stream again. |
 | `autoReconnect` | `true` | Reconnect after an unexpected disconnect. |
 | `reconnectInterval` | `1000` | First reconnect delay (ms). |
 | `maxReconnectInterval` | `30000` | Longest reconnect delay (ms). |
@@ -126,9 +127,15 @@ from `scopeValues` or `resolveScopes` on the server. A grant value that cannot b
 closed (`SCOPE_REQUIRED`, `INVALID_SCOPE_PREDICATE`).
 
 Grants may use bounded `$in` lists (`{ courses: { offeringId: { $in: ['a', 'b'] } } }`): values
-are deduplicated and sorted, an empty list denies, and more than 100 values per predicate fails
-the handshake (`SCOPE_PREDICATE_LIMIT`). The same matcher filters downloads, relays, backfills and
-uploads.
+are deduplicated and sorted, an empty list denies, and more than the server's
+`maxScopePredicateValues` (default 100) per predicate fails the handshake (`SCOPE_PREDICATE_LIMIT`).
+A predicate object other than exactly `{ $in: [...] }` is refused the same way, and a `null` or
+non-object collection grant denies the collection. A grant may also be a disjunction,
+`{ $or: [conjunction, ...] }` with up to 8 branches ("my own records or records of my teams"); a
+client from before 1.0.0-beta.15 cannot read `$or` and is refused with `CLIENT_TOO_OLD`. With a
+disjunctive upload grant, a write must keep the record in every branch it matched before. The same
+matcher filters downloads, relays, backfills and uploads. A schema with [access rules](/guide/access-rules)
+gets its grants from the rules instead, and the download stream follows membership changes.
 
 A local write outside the session's upload scope is not silently kept local: it is reported with
 `sync:operation-rejected` (`OUT_OF_UPLINK_SCOPE`) and kept in the rejected list.
@@ -194,9 +201,15 @@ await staticApp.sync?.setQuerySubsets([{ collection: 'courses', where: { orgId }
 - **`'disabled'`**: no subsets; the device downloads its whole scope.
 
 Subsets are canonicalized (key order and duplicates do not matter; a broader predicate removes
-contained narrower ones). Each view has its own delivery watermark, so returning to a view resumes
+contained narrower ones). Registrations made in a burst (a list mounting one query per row) switch
+the view once. Each view has its own delivery watermark, so returning to a view resumes
 it; a new view back-fills once. The number of remembered views is bounded (least recently used
 first, never the current one).
+
+A handshake carries at most 500 query views: past that the client widens the collections with
+the most views to the whole collection (a collection beyond the cap syncs whole), which syncs more,
+never less. The server refuses more than its `maxSyncQueries` (default 1000) with
+`SYNC_QUERIES_LIMIT`, and a malformed list with `INVALID_SYNC_QUERIES`.
 
 ## Delivery guarantees
 
@@ -204,7 +217,9 @@ Once the server stores an operation, every client whose scope includes it receiv
 is ever silently skipped, across dropped messages, reconnects and restarts:
 
 - **Downloads** follow a durable, gap-free delivery watermark per view: the client advances it only
-  after a batch is fully applied, in the same transaction, so a dropped or failed batch is re-sent.
+  after a batch is fully applied, in the same storage transaction as the batch's operations, so a
+  dropped or failed batch is re-sent. A large first sync is staged (`bulkReplication`) and nothing
+  of it counts until the merge.
 - **Operations a device cannot apply yet** (unknown collection after a server upgrade, missing
   encryption key, a far-future timestamp, a transform it lacks) are quarantined durably and
   replayed on every start and when keys arrive (`sync:apply-failed`, `sync:apply-recovered`). A
@@ -219,7 +234,8 @@ is ever silently skipped, across dropped messages, reconnects and restarts:
   `localDurability: 'degraded'` (`sync:durability-degraded`, then `sync:durability-restored`).
 - **Devices and the server recover from each other.** A device that lost its newest writes gets
   them back from the server; a server restored from an older backup gets the missing writes
-  re-uploaded; a cloned database (copied app data) moves to a fresh node id (a store with a pinned node id,
+  re-uploaded, and devices ahead of it resync, also after a database-level restore Kora never saw
+  (each batch carries a delivery anchor the device reports back); a cloned database (copied app data) moves to a fresh node id (a store with a pinned node id,
   as with `createKoraAuthSync`, reports `NODE_ROTATION_FAILED` instead).
 - The outbound queue lives in the local database: writes survive reloads, restarts and reboots.
 
@@ -231,9 +247,13 @@ See [Sync Protocol](/guide/sync-protocol#delivery-watermark) for the mechanics.
 `SyncStatusInfo`: `status` (`connected`, `reconnecting`, `syncing`, `synced`, `offline`,
 `clock-error`, `error`, `schema-mismatch`, `auth-required`, `encryption-locked`), `phase`, `pendingOperations`,
 `heldOperations` and `heldNodes`, `localDurability`, `serverProtocolVersion` and
-`protocolDeprecated`, `clockSkewMs`, `initialSync` progress, `deliveryWatermark` and
-`serverFrontier`, and `blockedFailure`. See [React Hooks](/guide/react-hooks#usesyncstatus) for
-the full table.
+`protocolDeprecated`, `clockSkewMs`, `initialSync` progress (`initialSync.first` is true only for
+the device's first download), `deliveryWatermark` and `serverFrontier`, and `blockedFailure`. See
+[React Hooks](/guide/react-hooks#usesyncstatus) for the full table.
+
+For an indicator, `useSyncSummary()` (React, Vue, Svelte) or `summarizeSyncStatus(status)` gives a
+tone, a title and one line of detail, with `downloading` true only while the first download runs
+(see [Sync API](/api/sync#status-controllers)).
 
 ### Waiting for sync
 
@@ -263,7 +283,9 @@ const rejected = (await app.sync?.getRejectedOperations()) ?? []
 await app.sync?.clearRejectedOperations(rejected.map((r) => r.operationId))
 ```
 
-Rejected operations are kept in a durable list (they survive reloads) until you clear them.
+Rejected operations are kept in a durable list (they survive reloads) until you clear them. In a
+component, `useMutation(fn, { onRejected })` and its `rejected` state report a refusal to the
+component that made the write (React, Vue and Svelte).
 Common codes: `CONSTRAINT_VIOLATION`, `SCHEMA_VALIDATION_ERROR`, `OPERATION_TOO_LARGE`,
 `OUT_OF_UPLINK_SCOPE`, `RESTRICTED`, `RATE_LIMIT` (retriable), and your validator's own codes.
 See [Error Codes](/api/errors).
@@ -278,6 +300,9 @@ See [Error Codes](/api/errors).
 | `sync:apply-failed`, `sync:apply-blocked`, `sync:apply-retrying`, `sync:apply-recovered`, `sync:apply-abandoned` | An inbound operation could not be applied, and what happened next. |
 | `sync:auth-failed`, `sync:suspended` | The credential was refused; sync paused (`auth-required`, `device-revoked`, `encryption-locked`, ...). |
 | `sync:node-id-rotated`, `sync:local-node` | The device's node identity changed (claimed node, clone, principal switch, adoption of a closed tab's writes, held writes). |
+| `sync:operations-acknowledged`, `sync:operations-rewritten` | The server stored these operation ids; unsent operations were re-authored under new ids (`reason`: clock rebase, node rotation, sequence renumbering; `idMapping`). |
+| `sync:scope-retracted` | Records left this device's view (access rules, `scopeExit: 'retract'`). |
+| `sync:staging-started`, `sync:staging-merged`, `sync:staging-discarded` | A staged first sync (`bulkReplication`) began, was merged into the database, or was dropped. |
 | `sync:durability-degraded`, `sync:durability-restored` | Local storage stopped (or resumed) persisting. |
 | `sync:clock-skew`, `sync:clock-rebase` | This device's clock differs from the server's; unsynced writes were re-stamped. |
 | `sync:schema-mismatch` | Version mismatches. |

@@ -83,6 +83,12 @@ This is the only durable SQLite WASM multi-tab path. OPFS synchronous access han
 
 Kora also keeps open tabs reactive on this path. Local operations committed in one tab are announced over a database-scoped same-origin channel, and sibling tabs invalidate only the affected queries. The operation is not re-applied by receivers; the shared local database remains the source of truth. Worker RPC is serialized across complete transaction spans at the leader boundary, and abandoned follower spans are rolled back so closing a tab mid-transaction cannot freeze the database for other tabs. The crash-case idle reclaim defaults to 10s.
 
+A transaction span stays exclusive until its owner commits or rolls back, and a follower's
+transaction is bound to the leader worker that answered its `BEGIN`: if the leader changes in the
+middle, the rest of the transaction is refused with a retriable `BridgeTerminatedError` instead of
+running on the new leader's worker. A follower asks a silent leader for a sign of life before it
+declares it gone (`NoLeaderError`, retriable).
+
 ### Per-tab isolation
 
 `store: { isolation: 'per-tab' }` gives each tab its own sync node id (the default `'shared'` uses
@@ -91,7 +97,12 @@ adopts the orphaned node), never lost.
 
 ### Journal Mode
 
-Browser databases on OPFS use SQLite's default rollback journal (`journal_mode = delete`), not WAL. WAL needs shared-memory support from the file system layer, and the OPFS SyncAccessHandle pool (`opfs-sahpool`) that Kora uses does not provide it: SQLite keeps `delete` whatever is requested. Earlier releases issued `PRAGMA journal_mode = WAL` there, which silently had no effect. Each open database holds one OPFS pool slot at rest plus one transient slot for its `-journal` file during a write transaction. The IndexedDB fallback runs SQLite in memory (`journal_mode = memory`). Native SQLite (`better-sqlite3` on Node.js and Electron) runs in WAL mode.
+Browser databases on OPFS use SQLite's default rollback journal (`journal_mode = delete`), not WAL. WAL needs shared-memory support from the file system layer, and the OPFS SyncAccessHandle pool (`opfs-sahpool`) that Kora uses does not provide it: SQLite keeps `delete` whatever is requested. Earlier releases issued `PRAGMA journal_mode = WAL` there, which silently had no effect. Each open database holds one OPFS pool slot at rest plus one transient slot for its `-journal` file during a write transaction. The IndexedDB fallback runs SQLite in memory (`journal_mode = memory`). Native SQLite (`better-sqlite3` on Node.js and Electron) runs in WAL mode with
+`synchronous = FULL` (the Tauri plugin too), so a resolved write survives an operating-system crash
+or power loss.
+
+New OPFS databases use 16 KiB pages (SQLite's default is 4 KiB), which makes the commit of a large
+write cheaper; existing databases keep their page size.
 
 The adapter reports the mode it actually got as `journalMode` in `getStorageOpenState()`.
 
@@ -115,6 +126,20 @@ button.onclick = () => app.storage.persistence.request()
 ```
 
 Every check and request is also a `storage:persistence` event. `request()` never throws.
+
+### Durable writes on the IndexedDB fallback
+
+The IndexedDB fallback runs SQLite in memory and saves snapshots of it to IndexedDB. A local write
+(insert, `insertMany`, update, delete, a mutation or a transaction) resolves only once a snapshot
+that holds it has been saved with `durability: 'strict'`; background snapshots stay relaxed and
+never stand in for that wait. In a follower tab the leader tab saves the snapshot, and concurrent
+writes from any tab share one. When the snapshot cannot be saved, the write stays committed and its
+promise rejects with `WriteNotDurableError` (`WRITE_NOT_DURABLE`; its `context.causeCode` is
+`QUOTA_EXCEEDED` when storage is full). Do not retry the write: it exists. A write whose worker database was replaced
+before a snapshot held it (the leader tab closed or froze) is lost, and the barrier rejects with
+`SNAPSHOT_SUPERSEDED`; reload before making more changes. `app.storage.writes.status()` reports
+`durable` or `failing` (`permanent` after a superseded snapshot). OPFS and native SQLite commits are
+durable when they resolve and pay no extra wait. See [Offline Readiness](/guide/offline-readiness).
 
 ### Detecting browser storage loss
 
@@ -161,6 +186,20 @@ and other devices keep their data:
 const { databaseName } = app.storeInfo()
 await app.close()
 await app.storage.deleteDatabase(databaseName)
+```
+
+To copy a closed database out of the browser (a support export, a migration), `exportLocalDatabase`
+from `@korajs/store/sqlite-wasm` returns it as a standard SQLite file. It holds the database's
+exclusive lock while it reads, never changes the source, and rejects with `StorageInUseError`
+while a tab has it open and `LocalDatabaseNotFoundError` (`LOCAL_DATABASE_NOT_FOUND`) when no copy
+exists:
+
+<!-- docs-check: skip workerUrl comes from your bundler setup -->
+```typescript
+import { exportLocalDatabase } from '@korajs/store/sqlite-wasm'
+
+const bytes = await exportLocalDatabase('kora-db', { workerUrl })
+const file = new Blob([bytes], { type: 'application/vnd.sqlite3' })
 ```
 
 `app.storeInfo()` reports the current
@@ -225,6 +264,10 @@ In most cases, let Kora auto-detect the adapter. Only override when you have a s
 | `allowNonDurable` | `boolean` | `false` | Accept in-memory storage when nothing durable is available, instead of refusing writes. |
 | `maxOperationBytes` | `number` | 256 KiB | Largest operation a write may produce; set it to the server's value. |
 | `persistence` | `'auto' \| 'manual'` | `'auto'` | When Kora asks the browser for persistent storage. See [Durable Storage](#durable-storage-persist). Never delays `app.ready`. |
+| `instantUpdates` | `boolean \| { maxPendingWrites?, maxPendingBytes?, maxRecordsPerWrite? }` | `false` | Show this tab's own writes in its live queries before they commit. See [Instant updates](/guide/instant-updates). |
+| `onBuildSuperseded` | `(info) => void` | | Replaces Kora's reload prompt when a newer build of the app supersedes this tab. See [App updates](/guide/app-updates). |
+| `buildPrompt` | `boolean` | `true` | Show Kora's built-in version gate prompts. |
+| `allowUncoordinatedTabs` | `boolean` | `false` | Open without tab coordination where Web Locks are missing in a secure context, instead of refusing with `TabCoordinationUnavailableError`. For test environments (jsdom, happy-dom) only. |
 | `workerResponseTimeoutMs` | `number` | `30000` | Longest wait for a worker reply (for example `open`). |
 
 ---

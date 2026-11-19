@@ -1,7 +1,7 @@
 # create-kora-app
 
-Scaffold a new [Kora.js](https://korajs.dev) offline-first application. Kora 1.0 is in beta, so use
-the `beta` tag (the `latest` tag is the older 0.x line):
+Scaffold a new [Kora.js](https://korajs.dev) offline-first application. Kora 1.0 is in beta; the `beta`
+tag always names the current beta:
 
 ```bash
 npx create-kora-app@beta my-app
@@ -34,6 +34,10 @@ dependencies. `--yes` takes the recommended setup (`react-tailwind-sync`).
 | `--pm pnpm\|npm\|yarn\|bun` | Package manager. |
 | `--yes`, `-y` | Accept the defaults. |
 | `--skip-install` | Do not install dependencies. |
+
+An unknown `--template`, `--pm` or `--framework` value exits with an error that names the valid
+values, instead of falling back to the default. Every new app starts with a `.gitignore` that
+keeps `.env` files and local databases out of git.
 
 See [Getting Started](https://korajs.dev/getting-started) and the
 [CLI reference](https://korajs.dev/api/cli).

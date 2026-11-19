@@ -108,8 +108,14 @@ Precompiled component JS is also published under `dist/components/` for non-Vite
 | `KoraProvider.svelte` | Root provider: sets context and renders at once (`waitForStorage` holds the children until `app.ready`) |
 | `KoraStoreProvider.svelte` | Store-only provider (advanced / tests) |
 | `createQueryStore(query)` | Svelte readable store of results |
-| `createMutation(fn)` | Mutation controller |
+| `createQueryStateStore(query)` | Store of `{ data, error, ready, source, complete }` |
+| `createMutation(fn)` | Mutation controller, with server-refusal (`rejected`) state |
 | `createSyncStatusStore()` | Sync status readable store |
+| `createSyncSummaryStore()` / `useSyncSummary()` | The sync status summarized for an indicator |
+| `createOfflineReadyStore()` / `useOfflineReady()` | Whether a reload with no network would open the app with its data |
+| `createOfflineKeepStore(query, { files })` / `useOfflineKeep()` | Keep a query's records on the device while the component lives |
+| `useFormDraft(formKey, initial, { fields })` | Keep typed input across a new version's reload |
+| `createKoraHooks<typeof app>()` | Helpers typed by your schema |
 | `getApp()` / `getCollection()` | Context accessors |
 | `createRichTextBinding()` / `useRichText()` | Yjs richtext editor binding |
 | `applyPresence(user)` | Set local presence; use it in `$effect(() => applyPresence(user))` |

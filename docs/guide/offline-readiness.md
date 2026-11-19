@@ -175,7 +175,12 @@ declare const keychain: {
 // A platform keychain survives a restart, so say so. Without `durability` the store reads as
 // `unknown`: Kora does not guess that a custom store is durable.
 const tokenStorage = createAuthTokenStorage({ store: keychain, durability: 'durable' })
+// createKoraAuth({ serverUrl, storage: tokenStorage })
 ```
+
+Pass it to `createKoraAuth` as `storage`. A store passed as `credentialStore` is adapted without a
+durability, so it reads `unknown`. On Tauri, `createTauriCredentialStore()` from `@korajs/tauri`
+keeps the tokens in the operating system's keychain (see [Desktop apps](/guide/tauri-desktop)).
 
 If your sign-in is something Kora cannot see (a bare `sync.auth` token function), declare it:
 
@@ -304,5 +309,6 @@ it in Chromium with the network cut. `KORA_OFFLINE_TEMPLATES=react-basic,vue-syn
   restart.
 - **An app with a bare `sync.auth` token function** reads `not-ready` until it declares
   `offline.auth`.
-- **Reserved name:** `offline` is now a property of the app, so a collection or app extension named
-  `offline` collides.
+- **Reserved names:** `offline`, `schema` and `reloadForNewBuild` are now properties of the app, so
+  a collection with one of those names is reached as `app.collections.<name>` (for example
+  `app.collections.offline`).

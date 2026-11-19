@@ -13,13 +13,14 @@ description: "Add sign-up, sign-in, sessions, MFA, passkeys, organizations, and 
 
 ## Overview
 
-The auth package is split into three entry points:
+The auth package is split into these entry points:
 
 | Entry Point | Import | Purpose |
 |-------------|--------|---------|
 | `@korajs/auth` | Client code | `AuthClient`, device identity, passkeys, encrypted token store |
 | `@korajs/auth/server` | Server code | `BuiltInAuthRoutes`, `TokenManager`, user/session/org stores, MFA, RBAC |
 | `@korajs/auth/react` | React components | `AuthProvider`, `useAuth`, `useCurrentUser`, `useAuthStatus`, org hooks |
+| `@korajs/auth/vue`, `@korajs/auth/svelte` | Vue and Svelte | The same providers and hooks as composables and stores |
 
 The architecture follows a clean client-server split:
 
@@ -325,6 +326,29 @@ const app = createApp({
 - Suspends sync while auth is loading or signed out (`anonymous: 'allow'` syncs anonymously instead)
 - Sends a client-side scope hint built from JWT claims and your schema's scope declarations; the server only uses it to **narrow** its own grant
 - Reconnects when auth state changes (sign-in, sign-out, a different user)
+- Loads the stored session itself when nobody called `authClient.initialize()` (an app that uses
+  the client without `AuthProvider`, such as a desktop till), so sync resumes after a restart
+- Tells [offline readiness](/guide/offline-readiness#signing-in) whether the session would restore
+  on an offline reload
+
+The sync templates load the sign-in client after the first paint with `lazyAuthSync` from
+`korajs`:
+
+```typescript
+import { lazyAuthSync } from 'korajs'
+
+const lazyApp = createApp({
+  schema,
+  sync: {
+    url: 'wss://my-server.com/kora-sync',
+    // The auth client's module loads after the first paint
+    authClient: lazyAuthSync(() =>
+      import('./auth').then(({ authClient }) => createKoraAuthSync({ authClient, schema })),
+    ),
+    autoConnect: true,
+  },
+})
+```
 
 #### Manual auth wiring (advanced)
 
@@ -426,8 +450,12 @@ export const explicitAuthServer = createKoraAuthServer({
   arrives complete.
 - Rich-text updates, presence and blobs are authorized and delivered within scope too.
 - When a user's grant changes (removed from a team), live sessions end with `SCOPE_CHANGED`
-  within `sessionRevalidationIntervalMs` and reconnect with the new grant. Call
-  `server.refreshScopes(userId)` after the change to apply it at once.
+  within `sessionRevalidationIntervalMs` and reconnect at once (without growing the reconnect
+  backoff) with the new grant. Call `server.refreshScopes(userId)` after the change to apply it at
+  once.
+- With [access rules](/guide/access-rules) the schema decides what each user may read and write
+  in its access collections from memberships, and the download stream follows membership changes
+  without ending the session.
 
 ### Node ids belong to users
 
@@ -499,6 +527,20 @@ const authClient = createKoraAuth({
 ```
 
 Use Tauri secure storage on desktop, Expo SecureStore or React Native Keychain on mobile, and iOS Keychain or Android Keystore for native integrations. The adapter may be synchronous or asynchronous.
+
+A store passed as `credentialStore` does not say whether it survives a restart, so [offline readiness](/guide/offline-readiness#signing-in) reports the sign-in `unknown` and the app is never `ready`. To have the session counted, pass the tokens' store as `storage` with its durability:
+
+```typescript
+import { createAuthTokenStorage } from '@korajs/auth'
+
+const durableAuthClient = createKoraAuth({
+  serverUrl: 'https://acme.example.com',
+  storage: createAuthTokenStorage({ store: secureStore, durability: 'durable' }),
+  deviceKeyStore,
+})
+```
+
+On Tauri, `createTauriCredentialStore()` from `@korajs/tauri` is such a store, backed by the operating system's keychain (see [Desktop apps](/guide/tauri-desktop)).
 
 `createKoraAuth()` creates a stable local device identity automatically when persistent key storage exists. For React Native and other runtimes without IndexedDB, pass a platform-backed `deviceKeyStore`:
 
@@ -959,6 +1001,13 @@ const totp = new TotpManager({
 })
 ```
 
+Checks are atomic: one code never signs in twice, a recovery code works once, and parallel wrong
+guesses are each counted toward the lockout, also across server processes. That relies on the
+store: `InMemoryTotpStore` is for development and tests, and a database-backed `TotpStore` must
+implement `saveIf(secret, expectedRevision)` as an atomic conditional update
+(`UPDATE ... WHERE user_id = ? AND revision = ?`, checking the affected row count) and store the
+`revision` field as given. `TotpManager` refuses a store without `saveIf` (`TOTP_STORE_NOT_ATOMIC`).
+
 ### Step 1: Enable MFA
 
 The user initiates MFA setup. Return the URI for a QR code and the recovery codes.
@@ -1331,6 +1380,9 @@ todos:*          -> all actions on todos
 ```
 
 ### React Organization Hooks
+
+`OrgProvider` is safe under React StrictMode: org sessions are shared per client and
+reference-counted, like `AuthProvider`'s.
 
 ```tsx
 import { OrgProvider, useOrg, useOrgMembers, usePermission } from '@korajs/auth/react'
@@ -1720,7 +1772,7 @@ const rotatingTokenManager = new TokenManager({
 })
 ```
 
-To rotate: add the new secret at index 0, then remove the old secret after all tokens signed with it have expired (at most 90 days for refresh tokens).
+To rotate: add the new secret at index 0, then remove the old secret after all tokens signed with it have expired (at most 90 days for refresh tokens). With `createKoraAuthServer`, set the environment variables instead: see [Changing the sign-in secret](#changing-the-sign-in-secret).
 
 ### Rate Limiting
 
@@ -1753,7 +1805,7 @@ Device proof-of-possession challenges are:
 - [ ] Use a persistent token revocation store (the SQLite and Postgres user stores include one)
 - [ ] Use a persistent session store (not `InMemorySessionStore`)
 - [ ] Use a persistent TOTP store (not `InMemoryTotpStore`) whose `saveIf` is an atomic conditional update (`UPDATE ... WHERE user_id = ? AND revision = ?`, checking the affected row count)
-- [ ] Set `KORA_AUTH_SECRET` as an environment variable (at least 32 characters)
+- [ ] Set `KORA_AUTH_SECRET` as an environment variable (at least 32 characters); when changing it, keep the old one in `KORA_AUTH_SECRET_PREVIOUS` until sessions have refreshed
 - [ ] Set `trustProxy` on the production server when it runs behind a proxy
 - [ ] Configure `passwordReset` and `emailVerification` with your mailer, and wire the `AdminApi` `revokeAllForUser` (a password reset or change through `createKoraAuthServer` ends sessions on its own)
 - [ ] Serve all auth endpoints over HTTPS

@@ -187,3 +187,19 @@ Device events are on `device.emitter` (for example `merge:conflict` or
 `createMixedTestNetwork(serverSchema, serverOptions, devices)` runs devices on different schema
 versions against one server, to test `supportedSchemaVersions` and operation transforms. See the
 [Test API](/api/test).
+
+## Testing access rules across users
+
+`new TestServer(schema, { auth: true })` and `new TestDevice({ user: 'alice', ... })` sign devices
+in, so the schema's access rules decide what each device receives and may write, as in
+production. `server.access.grant(...)`, `revoke(...)` and `transfer(...)` change memberships during
+the test. See [Testing access rules across users](/api/test#testing-access-rules-across-users).
+
+## End-to-end offline tests
+
+`@korajs/test/playwright` has helpers for Playwright tests in a real browser: cut the network,
+crash a tab, restart a browser profile, skew the clock, and assert that an app whose
+`app.offline.status()` reads `ready` really opens offline with its data
+(`assertReadyMeansOffline`, `expectNeverReady`). See
+[Playwright helpers](/api/test#playwright-helpers) and
+[Offline Readiness](/guide/offline-readiness#testing-it).

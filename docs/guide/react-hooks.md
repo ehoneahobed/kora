@@ -1,6 +1,6 @@
 ---
 title: React Hooks
-description: "Kora.js React bindings: KoraProvider, typed hooks with createKoraHooks, useQuery and useQueryState, useMutation, useSyncStatus, useRichText and presence."
+description: "Kora.js React bindings: KoraProvider, typed hooks with createKoraHooks, useQuery and useQueryState, useMutation, useSyncStatus and useSyncSummary, offline readiness, form drafts, useRichText and presence."
 ---
 
 # React Hooks
@@ -256,7 +256,8 @@ parent side adds an array of children.
 
 ## useQueryState
 
-`useQueryState(query, options?)` returns `{ data, error, ready }` instead of throwing:
+`useQueryState(query, options?)` returns `{ data, error, ready, source, complete }` instead of
+throwing:
 
 ```tsx
 import { useQueryState } from '@korajs/react'
@@ -271,7 +272,10 @@ function SafeTodoList() {
 
 `ready` is false until the first result of the current query has arrived (always false on the
 server). While `error` is set, `data` holds the last good rows; the error clears when results flow
-again. The object keeps its identity until one of the three changes.
+again. `source` is `'server'` for rows read through before the local store opened, `'local'` or
+`'pending'`, and `complete` is false while a first visit is still replicating, so you can say
+"showing what is on this device so far". The object keeps its identity until one of its values
+changes.
 
 ## useMutation
 
@@ -298,7 +302,7 @@ function AddTodo() {
 
 `mutate`, `mutateAsync` and `reset` keep their identity for the component's lifetime, so they are
 safe in effect dependencies and as memoized props; the result object changes only when
-`isLoading` or `error` changes. The latest `fn` and options are always used. Options are the
+`isLoading`, `error` or `rejected` changes. The latest `fn` and options are always used. Options are the
 lifecycle callbacks `onMutate`, `onRollback` (called with the `onMutate` context when the write fails), `onSuccess`, `onError`, `onSettled` and `onRejected` (below).
 
 ```tsx
@@ -401,9 +405,50 @@ function SyncIndicator() {
 | `deliveryWatermark`, `serverFrontier` | How far delivery has been applied, and how far the server is |
 | `blockedFailure` | An inbound operation that blocks delivery, with its code |
 
+For an indicator, `useSyncSummary()` turns the same status into `{ state, tone, title, detail,
+pending, lastSyncedAt, downloading, progress }` with wording that never claims the server has what
+it has not confirmed:
+
+```tsx
+import { useSyncSummary } from '@korajs/react'
+
+function SyncChip() {
+  const sync = useSyncSummary()
+  return <span className={sync.tone} title={sync.detail}>{sync.title}</span>
+}
+```
+
+## Offline readiness
+
+`useOfflineReady()` reports whether a reload with no network would open the app with its data
+(`app.offline.status()`): `state` is `ready`, `preparing` or `not-ready`, with `reasons`.
+`useOfflineKeep(query, { files })` keeps the records of a query on the device while the component
+is mounted, and returns `{ held, error }`.
+
+```tsx
+import { useOfflineKeep, useOfflineReady } from '@korajs/react'
+
+function Course({ projectId }: { projectId: string }) {
+  useOfflineKeep(app.todos.where({ projectId }))
+  const offline = useOfflineReady()
+  return <span>{offline.state === 'ready' ? 'Available offline' : 'Preparing offline copy'}</span>
+}
+```
+
+Every template renders an `<OfflineBadge />` built on `useOfflineReady()`. See the
+[Offline Readiness guide](/guide/offline-readiness).
+
+## Form drafts
+
+`useFormDraft(formKey, initial, { fields })` keeps what the user was typing across the reload a
+new version of the app asks for. Only the listed fields are drafted, never password or
+`t.secret()` fields. See
+[App updates and multiple tabs](/guide/app-updates#keeping-what-the-user-typed-form-drafts).
+
 ## useCollection
 
-`useCollection(name)` returns a collection accessor. The plain hook is untyped; the one from
+`useCollection(name)` returns a collection accessor (`insert`, `insertMany`, `update`, `delete`,
+`findById`, `where`). The plain hook is untyped; the one from
 `createKoraHooks` is typed (see above).
 
 ```tsx
@@ -477,7 +522,8 @@ See the [Presence guide](/guide/presence).
 ## Server rendering
 
 All hooks render on the server: `useQuery` returns `[]`, `useQueryState` returns
-`{ data: [], error: null, ready: false }`, `useSyncStatus` reports `offline`, `useMutation` is idle
-and `useCollaborators` is empty. An app created where there is no `window` stays inert (no
+`{ data: [], error: null, ready: false, ... }`, `useSyncStatus` reports `offline`,
+`useOfflineReady` reports `not-ready` (`server-rendering`), `useMutation` is idle and
+`useCollaborators` is empty. An app created where there is no `window` stays inert (no
 database, no sync) and `KoraProvider` renders its children with empty values (its `fallback`
 with `waitForStorage`); the client takes over after hydration with no mismatch. See [Next.js App Router](/guide/nextjs-app-router).

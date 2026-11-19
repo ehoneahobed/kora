@@ -12,7 +12,7 @@
  *   cleared with `update(id, { field: null })`, and rows written before a field existed
  *   hold null).
  * - Insert: a required field must be provided; optional and defaulted fields may be
- *   omitted (not `null`: insert refuses null); auto fields cannot be provided at all.
+ *   omitted (the type has no `null`; the runtime also accepts `null` for an optional field without a default); auto fields cannot be provided at all.
  * - Update: every non-auto field is optional; optional and defaulted fields accept `null`
  *   to clear them; number and timestamp fields also accept the numeric `op.*` helpers, and
  *   array fields `op.append` / `op.remove` with an item of the element type.
@@ -132,7 +132,7 @@ export type InferRecord<Fields extends FieldMap> = Simplify<
 /**
  * Infers the insert input type.
  * - Required non-auto fields are required keys
- * - Optional/defaulted non-auto fields are optional keys (omit them; `null` is refused)
+ * - Optional/defaulted non-auto fields are optional keys (omit them; the type has no `null`)
  * - Auto fields are excluded entirely
  */
 export type InferInsertInput<Fields extends FieldMap> = Simplify<

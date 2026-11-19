@@ -75,6 +75,8 @@ const missing = await computeDelta(localVector, remoteVector, log) // causal ord
 - **Record fold**: `foldRecord`, `mergeOp`, `materialize`, `joinStates`: one deterministic per-field CRDT
 - **Atomic ops**: `op.increment`, `op.append` and friends
 - **Migrations**: `migrate()` builders for schema versions
+- **Access rules**: `owner`, `member`, `memberOfKey`, `where`, `or`, `and` and friends for a schema's `access` blocks, and `t.string().stamp('userId')`
+- **App settings**: `parseEnvExample` and `missingRequiredEnv` read the tagged settings of `.env.example`
 - **Error types**: structured `KoraError` base class with codes
 
 ## License

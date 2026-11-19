@@ -345,9 +345,9 @@ export interface KoraSyncServerConfig {
 	 * pre-release shared anonymous owner, and provisional claims that expired without
 	 * the device ever confirming its node token (beta.12 and older clients have no
 	 * token support). Accepted with a deprecation warning and re-issued a token.
-	 * Defaults to `true` for 1.0.0-beta.13; the default flips to `false` in the next
-	 * release, after which such devices rotate to a fresh node id instead (beta.12
-	 * clients cannot rotate and stay refused).
+	 * Defaults to `true` (deprecated; the flip to `false` is not scheduled yet). With
+	 * `false`, such devices rotate to a fresh node id instead (beta.12 clients cannot
+	 * rotate and stay refused).
 	 *
 	 * With `MixedAuthProvider`, a node with pre-claims history may also be a signed-in
 	 * user's beta.12 device: an anonymous device can take such a node, as it could on

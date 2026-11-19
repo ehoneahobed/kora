@@ -337,7 +337,7 @@ The contract: **when the app says `ready`, it must work offline.**
   and a table test of the state rule.
 - **Service worker.** Reply, incomplete cache, healing, and refusing a newer deployment's bytes;
   repeated in Chromium by `packages/cli/tests/repro/A4-shell-status-browser.mjs`.
-- **End to end.** `assertReadyMeansOffline(page)` from `@korajs/test` waits for `ready`, goes
+- **End to end.** `assertReadyMeansOffline(page)` from `@korajs/test/playwright` waits for `ready`, goes
   offline, reloads, visits every route, writes, reloads offline again, then checks the upload. The
   offline suite (`e2e/offline/offline-readiness.spec.ts`) runs it on every web template, with
   negative cases that must never observe `ready` (worker blocked, final batch withheld, blob chunks

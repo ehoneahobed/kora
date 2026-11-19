@@ -54,12 +54,15 @@ Once the native window opens, you have a working offline-first app with sync rea
 my-desktop-app/
   src/
     schema.ts          # Schema entry point
-    main.tsx           # React entry
+    main.tsx           # React entry (imports @korajs/tauri)
     AppShell.tsx       # First-launch setup, then the Kora app (sync when a URL is set)
     SetupScreen.tsx    # Sync server URL entry
     sync-config.ts     # Stored sync URL
-    auth.ts            # Desktop auth client
-    updater.ts         # Update check on launch
+    auth.ts            # Desktop auth client (sessions in the OS credential store)
+    AuthBridge.tsx     # Sign-in UI, loaded after the first paint
+    updater.ts         # Update check
+    UpdateBanner.tsx   # Offers a newer version: Install or Later
+    OfflineBadge.tsx   # Offline status, from useOfflineReady()
     App.tsx            # React UI
     modules/
       todos/
@@ -71,13 +74,15 @@ my-desktop-app/
     Cargo.toml         # Rust dependencies
     tauri.conf.json    # Window size, title, build config
     capabilities/
-      default.json     # Permissions for Tauri plugins
+      default.json     # Permissions for every platform
+      desktop.json     # The updater permission, desktop only
     src/
       main.rs          # Rust entry point
-      lib.rs           # Plugin registration
+      lib.rs           # Plugin registration and the mobile entry point
   server.ts            # Sync server
   dev.ts               # Dev orchestrator (starts sync + Tauri)
   .github/workflows/release-desktop.yml  # Cross-platform release builds
+  .gitignore           # Keeps .env files, local databases and src-tauri/target out of git
   kora.config.ts       # Kora configuration
   package.json
   vite.config.ts
@@ -137,14 +142,20 @@ function TodoList() {
 
 `pnpm dev` starts the desktop app and a local sync server together. The app (`src/AppShell.tsx`)
 creates the Kora app with sync when it has a sync URL (from `VITE_SYNC_URL` or the first-launch
-setup screen) and connects once `app.ready` resolves:
+setup screen) and calls `app.sync?.connect()` at once: the socket opens while the local database
+does. The sign-in client loads after the first paint:
 
 <!-- docs-check: skip excerpt of the template's AppShell component -->
 ```typescript
 createApp({
   schema,
   ...(syncUrl
-    ? { sync: { url: syncUrl, authClient: createKoraAuthSync({ authClient, schema }) } }
+    ? {
+        sync: {
+          url: syncUrl,
+          authClient: lazyAuthSync(() => import('./auth').then((m) => m.getDesktopAuth(syncUrl).authSync)),
+        },
+      }
     : {}),
   devtools: import.meta.env.DEV,
 })
@@ -224,7 +235,10 @@ Tauri uses a capability system for security. The default capabilities in `src-ta
 }
 ```
 
-`kora-sqlite:default` grants the Kora SQLite plugin permission to read and write the local database.
+`kora-sqlite:default` lets the app open, query, migrate, inspect and close its databases, delete a
+closed database, and read and write its own entries in the credential store. The template grants
+`updater:default` in a separate `desktop.json` limited to Linux, macOS and Windows, so mobile
+builds leave the updater out.
 
 ## First-Launch Setup
 
@@ -252,7 +266,7 @@ When `VITE_SYNC_URL` is set, the setup screen is skipped and the app connects au
 
 Desktop apps use the same `@korajs/auth` client and sync-token flow as web apps. The Tauri frontend runs in a WebView, so `createKoraAuth`, `@korajs/auth/react`, token refresh, and sync authorization work normally.
 
-The WebView loads the app from its own origin (`tauri://localhost` on macOS and Linux, `http://tauri.localhost` on Windows), so every call to the server's auth routes is cross-origin. `createProductionServer` allows those origins (and `http://localhost` in development) for its HTTP routes and `/health`, with no credentials, since Kora Auth sends bearer tokens. A server older than canary 2026-11-14 does not, and sign-in from the desktop app fails with a network error. To allow another origin, such as a web build on its own domain, pass `allowedOrigins` or set `KORA_ALLOWED_ORIGINS`.
+The WebView loads the app from its own origin (`tauri://localhost` on macOS and Linux, `http://tauri.localhost` on Windows), so every call to the server's auth routes is cross-origin. `createProductionServer` allows those origins (and `http://localhost` in development) for its HTTP routes and `/health`, with no credentials, since Kora Auth sends bearer tokens. A server older than 1.0.0-beta.15 does not, and sign-in from the desktop app fails with a network error. To allow another origin, such as a web build on its own domain, pass `allowedOrigins` or set `KORA_ALLOWED_ORIGINS`.
 
 Create an auth client that points at the same remote server that hosts your auth routes:
 
@@ -341,12 +355,14 @@ This runs `kora deploy`, which supports:
 
 | Platform | Command |
 |----------|---------|
-| Fly.io (recommended) | `kora deploy --platform=fly` |
+| Kora Cloud | `kora deploy --platform kora-cloud --prod` (after `kora login`) |
+| Fly.io | `kora deploy --platform=fly` |
 | Railway | `kora deploy --platform=railway` |
 | AWS Lightsail | `kora deploy --platform=aws-lightsail` |
 | AWS ECS Fargate | `kora deploy --platform=aws-ecs` |
 
-Follow the interactive prompts. When done, you'll get a URL like `https://my-app.fly.dev`.
+Follow the interactive prompts. When done, you'll get a URL like `https://my-app.fly.dev`. Only the
+server is deployed: the app itself ships as a download (or through the app stores).
 
 ::: tip First time deploying?
 See the [Deployment Guide](/guide/deployment) for detailed step-by-step instructions, including how to install the Fly.io CLI and create an account.
@@ -389,6 +405,7 @@ Install the app on two devices. Enter the same sync server URL on both. Create d
 ```bash
 pnpm deploy:server status     # Check health and URL
 pnpm deploy:server logs       # View server logs
+pnpm deploy:server restart    # Start the running version again (Kora Cloud)
 pnpm deploy:server rollback   # Revert to previous deploy
 ```
 
@@ -430,7 +447,7 @@ Set `DATABASE_URL` in your deployment environment. Most cloud platforms (Neon, S
 
 ## Auto-Updates
 
-The template includes `tauri-plugin-updater` for automatic updates. When you release a new version, installed apps detect and install the update automatically.
+The template includes `tauri-plugin-updater`. When you release a new version, installed apps find it and offer it; nothing is installed until the user agrees.
 
 ### Setup
 
@@ -457,21 +474,29 @@ The template includes `tauri-plugin-updater` for automatic updates. When you rel
    - `TAURI_SIGNING_PRIVATE_KEY`: contents of `~/.tauri/myapp.key`
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: password used during generation
 
+Installed apps download `latest.json` and the installers without signing in, so the release must
+be public. For a private repository, publish them somewhere public and point the endpoint there.
+
 ### Releasing
 
 Push a version tag to trigger the CI/CD workflow:
 
 ```bash
-# Update version in src-tauri/tauri.conf.json and package.json
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-The included GitHub Actions workflow (`.github/workflows/release-desktop.yml`) builds for macOS (ARM + Intel), Windows, and Linux, then creates a GitHub Release with all installers plus an `latest.json` update manifest.
+The tag is the version: before building, the workflow writes it into `package.json`,
+`src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`, and refuses a tag that is not a version
+(`v1.2.3`). A release started by hand uses the tag you type in. The included GitHub Actions
+workflow (`.github/workflows/release-desktop.yml`) builds for macOS (ARM + Intel), Windows, and
+Linux, then creates a draft GitHub Release with all installers plus a `latest.json` update
+manifest. It turns on `createUpdaterArtifacts` for its own builds only, so a local `pnpm build`
+works without the signing key.
 
 ### How it works
 
-On each launch (`src/updater.ts`), the app checks the endpoint once. If a newer version exists, it downloads and installs it; the new version runs from the next start. The check is skipped silently while the updater is not configured (empty `pubkey` and `endpoints` in `tauri.conf.json`, the template default) or the network is unavailable, so the app works fully offline.
+On launch, `checkForUpdate()` (`src/updater.ts`) asks the endpoint and reports what it found: up to date, a newer version, or why it could not check (offline, updates not set up for this build, a signature that did not match). When a newer signed version exists, `<UpdateBanner />` offers it with **Install** and **Later**; it is downloaded and installed only after the user chooses Install. A failed check never blocks the app, so it works fully offline.
 
 ## CI/CD for Desktop Releases
 
@@ -522,6 +547,41 @@ This produces platform-specific installers:
 | Linux | `.deb`, `.rpm`, `.AppImage` |
 
 The built binaries are in `src-tauri/target/release/bundle/`.
+
+## Mobile (iOS and Android)
+
+The template has a mobile entry point (`#[cfg_attr(mobile, tauri::mobile_entry_point)]` in
+`src-tauri/src/lib.rs`), so the same app builds for Tauri's iOS and Android targets with the same
+local database, sync and offline behaviour. In-app updates are desktop only (phones update through
+their app stores): the updater is left out of mobile builds in code, dependencies and
+capabilities.
+
+```bash
+npx tauri ios init        # needs Xcode
+npx tauri ios dev
+npx tauri android init    # needs Android Studio and the NDK
+npx tauri android dev
+```
+
+The OS credential store is not used on mobile yet: sessions fall back to WebView storage (see
+[Authentication](#authentication)).
+
+## Local data on the device
+
+- **Erasing one device's copy.** `app.storage.deleteDatabase()` works in Tauri apps: it deletes
+  the database file and SQLite's companion files from the app's data directory, with the same
+  refusals as in a browser (an open database, unsynced writes unless `force`). Use it for a "reset
+  this device" button: unlike deleting records, it writes nothing that syncs to other devices.
+  `@korajs/tauri` also exports `inspectTauriDatabase`, `readTauriDatabase` and
+  `deleteTauriDatabase` for files you manage yourself.
+- **Durability.** The plugin runs SQLite with `synchronous = FULL`, so a write whose promise
+  resolved survives an operating-system crash or power loss.
+- **Binary values.** Rich text and blobs round-trip through the plugin as real BLOBs. Update the
+  Rust plugin together with the npm package (rebuild the app) when you upgrade.
+- **Offline status.** A native build has no service worker: `app.offline.status().shell` reports
+  `bundled`, since the app's files ship inside the binary.
+- **Tabs and builds.** Tauri apps are not subject to the browser version gate: one process owns
+  the database file.
 
 ## Differences from Web
 

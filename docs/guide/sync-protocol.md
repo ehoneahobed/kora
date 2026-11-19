@@ -39,6 +39,7 @@ Client                                      Server
   |<-- operation-batch (base..max delivery) ---|  delivery stream, chained
   |--- acknowledgment (deliverySequence) ----->|
   |<-- heartbeat (every 25 s) -----------------|
+  |--- device-status (when it changes) ------->|  only to a server that accepts it
   |    awareness-update, yjs-doc-update, blob-chunk-* (side channels, scoped)
 ```
 
@@ -50,6 +51,11 @@ Client                                      Server
   `batchSize` (default 100; the server refuses batches over `maxOpsPerBatch`, default 1000, with
   `BATCH_TOO_LARGE`).
 - **Downloads (server to client)** are a gap-free delivery stream (below).
+- **Device health.** A client sends `device-status` (counts and a failure code only: whether
+  delivery is blocked and its code, operations quarantined, writes pending and held, local
+  durability) once per session and whenever one changes, debounced, and only to a server whose
+  handshake response set `acceptsDeviceStatus`. Servers that record it show it in operator
+  insights.
 - Each operation the server refuses is answered with `operation-rejected` (operation id, code,
   message, `retriable`); the rest of the batch is acknowledged. Connection-level problems are
   `error` messages. A `NODE_ID_CLAIMED` error from a beta.14 server also carries
@@ -82,6 +88,11 @@ has applied, or durably quarantined, every in-scope operation with no gap.
   one), and resyncs the client from 0 through the same advertised-frontier reset.
 - `acceptedScopeKey` and `acceptedScopeWatermark` resume an auth-scoped client's accepted view
   after a reconnect instead of restarting it.
+- A device's first sync of a view (watermark 0, at least 2000 server operations, more than one
+  batch) can be staged: the client applies the batches into a scratch in-memory replica through
+  the same batch path and merges it into the live database once, writing the live watermark and
+  completion mark in the merge. Until then nothing staged is live, so a crash or reload resumes
+  from the live watermark. This is client-side only (`sync.bulkReplication`); the wire is the same.
 - First sync streams in chunks with backpressure: the server pauses a client's stream above
   `deliveryHighWaterBytes` (1 MiB) and disconnects a consumer that leaves more than
   `maxBufferedBytes` (32 MiB) unsent.
@@ -119,6 +130,21 @@ has applied, or durably quarantined, every in-scope operation with no gap.
   view restarts from 0 the first time the device streams under it after the request. A custom
   `ServerStore` must implement `requestFullResync`, `getFullResyncState` and `completeFullResync`
   together; otherwise `forceFullResync` refuses with `FULL_RESYNC_UNSUPPORTED`.
+
+### Access narrowing
+
+With [access rules](/guide/access-rules), the download stream follows membership changes. When it
+reaches a change to the user's memberships, the server sends a re-scope unit that starts a batch:
+`accessNarrowing` (per access collection, the read grant now in force, or `null` for none) and
+`accessRulesKey` (the key of the read rules the device is re-scoped under), followed by scope
+entries for records the user may now read. The client removes every record of those collections
+that the grant no longer matches, judged on the values it holds and keeping records with unsent
+writes, before it applies the batch's retractions and operations; it then keeps `accessRulesKey`
+and reports it at its next handshake. A server running other read rules re-scopes the device in
+full. If the store cannot apply a narrowing, delivery stops at that batch and says so
+(`sync:apply-blocked`, `blockedFailure` with `ACCESS_NARROWING_FAILED`, or
+`ACCESS_NARROWING_UNSUPPORTED` for a store without `applyCollectionNarrowing`), and resumes with
+`sync:apply-recovered` once it applies.
 
 The design note is `docs/design/durable-delivery.md` in the repository.
 
@@ -161,14 +187,19 @@ transient (a busy database) instead **stalls** delivery (`sync:apply-blocked`, s
 | `handshake` | `protocolVersion` | `2`. Absent means protocol 1 (Kora 1.0.0-beta.12 and earlier), which the server refuses. |
 | `handshake` | `nodeId`, `versionVector`, `schemaVersion` | The device's node, what it holds, its schema version. |
 | `handshake` | `authToken` | The credential, unless the transport sends it out of band. |
-| `handshake` | `syncScope`, `syncQueries` | What the client asks for; the server's grant can only be narrowed by it. |
+| `handshake` | `syncScope`, `syncQueries` | What the client asks for; the server's grant can only be narrowed by it. The client sends at most 500 query views; the server refuses more than `maxSyncQueries` (default 1000, `SYNC_QUERIES_LIMIT`) or a malformed list (`INVALID_SYNC_QUERIES`). |
 | `handshake` | `lastDeliverySequence`, `acceptedScopeKey`, `acceptedScopeWatermark` | Where the delivery stream resumes. |
+| `handshake` | `lastDeliveryAnchor`, `acceptedScopeAnchor` | The delivery anchors that go with those watermarks (see [Delivery watermark](#delivery-watermark)). |
+| `handshake` | `accessRulesKey` | The read rules the device was last fully re-scoped under (access rules). |
+| `handshake` | `scopeExitPolicy` | `'retract'` when the app set `scopeExit: 'retract'`. |
+| `handshake` | `supportsScopeDisjunction`, `orderedRetractions` | Capabilities (beta.15): the client reads `$or` grants (without it, a grant with `$or` is refused `CLIENT_TOO_OLD`), and applies retractions at their stream position. |
 | `handshake` | `nodeToken` | An anonymous device's secret for its node id. |
 | `handshake` | `supportsHeartbeat`, `sequenceReservation` | Capabilities; a protocol-2 client always sends `sequenceReservation: true`. |
 | `handshake` | `supportedWireFormats` | Always `['json']`: protobuf is never negotiated (below). |
 | `handshake-response` | `accepted`, `rejectReason`, `supportedSchemaMin/Max` | The verdict. |
 | `handshake-response` | `acceptedScope`, `acceptedDownlinkScopes`, `acceptedUplinkScopes` | The scopes the server granted. |
-| `handshake-response` | `serverTime`, `serverMaxDeliverySequence`, `heartbeatIntervalMs`, `blobStorageEnabled`, `blobPossessionProof`, `nodeToken` | Session facts. |
+| `handshake-response` | `serverTime`, `serverMaxDeliverySequence`, `heartbeatIntervalMs`, `blobStorageEnabled`, `blobPossessionProof`, `nodeToken`, `protocolVersion` | Session facts. |
+| `handshake-response` | `acceptsDeviceStatus` | The server records device health; the client may send `device-status`. |
 | `handshake-response` | `authoritativeNodeIds` | The explicit authoritative node ids: legacy server ids (from before beta.13) and configured extras. Every `kora:server:` id is authoritative by its prefix whether listed or not. Clients keep the union of every id they learn and re-fold affected records when it grows. |
 | `handshake-response` | `revokedAuthoritativeNodeIds` | Explicit ids the deployment revoked (permanent): clients drop them for good and re-fold. |
 | `handshake` | `probeOperationIds` | At most 500 operation ids of a node the client's database retired (below): which does the server store? |
@@ -306,8 +337,10 @@ Older decoders skip unknown fields. The unused `DynamicProtobufSerializer` was r
 
 ## Compatibility
 
-Upgrade sync servers first, then clients. Verified against the last published release,
-1.0.0-beta.12 (tag `v1.0.0-beta.12`), with
+Upgrade sync servers first, then clients. Within protocol 2, new handshake and delivery fields
+are optional: a client or server that does not know one ignores it, and a beta.15 server cuts
+delivery batches for a client that does not declare `orderedRetractions`. The protocol-1 rows below
+were verified against 1.0.0-beta.12 (tag `v1.0.0-beta.12`), when protocol 2 shipped, with
 `node scripts/remediation/compat-beta12.mjs <beta12-build>` (clients and servers both ways,
 databases upgraded in place, mixed fleets under chaos; results in
 `remediation/evidence/compat-beta12.md`) and
@@ -317,5 +350,6 @@ suites.
 | Client | Server | Result |
 |---|---|---|
 | protocol 2 | protocol 2 | Full protocol 2: ids verified on both sides, encrypted operations stored opaquely. |
+| protocol 2, beta.13 or beta.14 | beta.15 | Syncs, except where the session's grant contains `$or` or the schema declares access rules: refused at the handshake (`CLIENT_TOO_OLD`), because such a client cannot apply them. Update the app. |
 | protocol 1 (beta.12) | protocol 2 | Refused at the handshake (`PROTOCOL_VERSION_UNSUPPORTED`). Update the app. |
 | protocol 2 | protocol 1 | Plaintext sync converges, but an old server drops `hashVersion` (relayed operations are treated as version 1) and `op.encrypted` (encrypted sync does not work: receivers quarantine). There is no key service (`KEY_SERVICE_UNSUPPORTED`). Do not run this way: upgrade the server first. |

@@ -1,6 +1,6 @@
 ---
 title: Merge API
-description: "@korajs/merge API reference: constraint checking, referential integrity, rich-text helpers, and the deprecated pairwise merge engine and strategies."
+description: "@korajs/merge API reference: constraint checking, referential integrity, and rich-text helpers. The pairwise merge engine was removed in 1.0.0-beta.15."
 ---
 
 # Merge API Reference
@@ -14,7 +14,7 @@ records and some helpers:
 |------|--------|
 | Constraint checking (`checkConstraints`, `resolveConstraintViolation`) | Used by the sync server (authoritative) and by devices (optimistic, for `constraint:violated`). |
 | Referential integrity (`checkReferentialIntegrityOnDelete`, `resolveDeleteVsInsertConflict`, `buildMergeRelationLookup`) | Used on the deleting device and on the server. |
-| Rich-text helpers (`richtextToString`, `stringToRichtextUpdate`, `mergeRichtext`) | Current. |
+| Rich-text helpers (`richtextToString`, `stringToRichtextUpdate`, `mergeRichtext`, `mergeRichtextUpdate`) | Current. |
 
 Application code does not call this package: `createApp()` and the sync server wire it.
 
@@ -103,7 +103,20 @@ type RichtextValue = string | Uint8Array | ArrayBuffer | KoraBytesValue | null |
 function richtextToString(value: RichtextValue): string     // plain text of a Yjs state
 function stringToRichtextUpdate(value: string): Uint8Array  // a Yjs update holding the text
 function mergeRichtext(local: RichtextValue, remote: RichtextValue, base: RichtextValue): Uint8Array
+
+// mergeRichtext(local, remote, null), also reporting whether the merged document is complete
+function mergeRichtextUpdate(local: RichtextValue, remote: RichtextValue): RichtextUpdateMerge
+
+interface RichtextUpdateMerge {
+  merged: Uint8Array
+  complete: boolean   // false when an update referenced content neither value holds
+}
 ```
+
+`mergeRichtextUpdate` (beta.15) is for incremental materialization: merging one more update onto
+an earlier merge gives the same bytes as merging the whole set from scratch only when every merge
+involved was complete. The sync server uses it to merge each rich-text write onto its cached merge
+of the field, and starts from scratch when a merge is incomplete.
 
 To combine the stored updates of a field, the fold uses `mergeYjsUpdates` from `@korajs/store`.
 

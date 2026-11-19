@@ -1,6 +1,6 @@
 ---
 title: Svelte API
-description: "@korajs/svelte API reference: Kora stores and helpers for reactive queries, mutations, and sync status in Svelte apps."
+description: "@korajs/svelte API reference: Kora stores and helpers for reactive queries, mutations, sync status, offline readiness and form drafts in Svelte apps."
 ---
 
 # Svelte API Reference
@@ -59,6 +59,16 @@ Root layout component that sets Kora context and renders children at once, befor
 </script>
 
 <KoraProvider app={kora}>
+  <App />
+</KoraProvider>
+```
+
+To hold the children back until the store is open, pass `waitForStorage` and, for a loading
+message, a `fallback` snippet:
+
+<!-- docs-check: skip Svelte markup fragment -->
+```svelte
+<KoraProvider app={kora} waitForStorage>
   {#snippet fallback()}Loading...{/snippet}
   <App />
 </KoraProvider>
@@ -187,6 +197,37 @@ Readable store of `SyncSummary`, the status summarized for an indicator: `tone` 
 </script>
 
 <span class="chip {$sync.tone}" title={$sync.detail}>{$sync.title}</span>
+```
+
+---
+
+## createOfflineReadyStore() / useOfflineReady()
+
+Readable store of `OfflineStatus`: whether a reload with no network would open the app with its
+data (`app.offline.status()`). `state` is `ready`, `preparing` or `not-ready`, and `reasons` says
+why not. See [Offline readiness](/api/offline).
+
+## createOfflineKeepStore() / useOfflineKeep()
+
+`createOfflineKeepStore(query, options?)` keeps the records a query matches on the device while
+the component is alive (call it during component initialization; the hold is released on
+destroy). It returns a readable store of `{ held, error }` and `release()`. Outside a component
+the caller owns the hold and calls `release()`. `{ files: true }` also keeps the files of its
+records.
+
+```svelte
+<script lang="ts">
+  import { createOfflineKeepStore, createOfflineReadyStore, getApp } from '@korajs/svelte'
+  import type { app as koraApp } from '../kora'
+
+  let { courseId } = $props()
+  const app = getApp<typeof koraApp>()
+  const kept = createOfflineKeepStore(app.lessons.where({ courseId }), { files: true })
+  const offline = createOfflineReadyStore()
+</script>
+
+<span>{$offline.state === 'ready' ? 'Available offline' : 'Not available offline yet'}</span>
+{#if $kept.error}<p role="alert">{$kept.error.message}</p>{/if}
 ```
 
 ---

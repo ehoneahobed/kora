@@ -148,16 +148,23 @@ off()
 
 `query:subscribed`, `query:invalidated`, `query:executed`, `state-machine:transition`,
 `state-machine:rejected` and `sync:apply-abandoned` are part of the `KoraEvent` type but no Kora
-package emits them in 1.0.0-beta.13. Do not build on them. State-machine refusals surface as
+package emits them as of 1.0.0-beta.15. Do not build on them. State-machine refusals surface as
 `InvalidStateTransitionError` from the write.
 
 ---
 
 ## createApp integration
 
-With `devtools: true`, `createApp` creates an `Instrumenter` on the app's emitter, forwards events to
-the browser extension through `window.postMessage` and mounts the in-page overlay (toggle with
-Ctrl+Shift+K, Cmd+Shift+K on macOS). In Node and server renders only the instrumenter runs.
+With `devtools: true`, `createApp` loads `@korajs/devtools` with a dynamic `import()` (it is never
+in the bundle's first-paint code, and not loaded at all when `devtools` is off), creates an
+`Instrumenter` on the app's emitter, forwards events to the browser extension through
+`window.postMessage` and mounts the in-page overlay (toggle with Ctrl+Shift+K, Cmd+Shift+K on
+macOS). Events emitted before DevTools finished loading are held and replayed into the
+instrumenter in order, so the panel shows the same history as if it had loaded first. In Node and
+server renders only the instrumenter runs.
+
+The overlay redraws only when events arrive. Mounting it again (on HMR, or for a second app) tears
+down the previous overlay first.
 
 ## Instrumenter
 
@@ -172,8 +179,9 @@ class Instrumenter {
 }
 ```
 
-Methods: `getBuffer()`, `getBridge()`, `pause()`, `resume()`, `isPaused()`, `destroy()`. Events
-received while paused are dropped. The recorded types are listed in the tables above.
+Methods: `getBuffer()`, `getBridge()`, `pause()`, `resume()`, `isPaused()`, `replay(events)`
+(records `{ event, receivedAt }` entries emitted before the instrumenter existed, in order),
+`destroy()`. Events received while paused are dropped. The recorded types are listed in the tables above.
 
 ```typescript
 import { Instrumenter } from '@korajs/devtools'
@@ -187,7 +195,7 @@ instrumenter.destroy()
 
 | Export | Description |
 |--------|-------------|
-| `EventBuffer(capacity = 10000)` | Ring buffer of `TimestampedEvent` (`{ id, event, receivedAt }`): `push`, `getAll`, `getRange(startId, endId)`, `getByType`, `clear`, `size`, `capacity`. |
+| `EventBuffer(capacity = 10000)` | Ring buffer of `TimestampedEvent` (`{ id, event, receivedAt }`): `push`, `getAll`, `getRange(startId, endId)`, `getByType`, `clear`, `size`, `capacity`, and `version` (changes on every push and clear, so a view redraws only when it moved). |
 | `MessageBridge(channelName = 'kora-devtools')` | `window.postMessage` transport: `send`, `onReceive`, `destroy`; a no-op without `window`. |
 | `filterEvents(events, { categories?, types?, timeRange?, collection? })` | AND-combined filter. |
 | `getEventCategory(type)` | `'operation' \| 'merge' \| 'sync' \| 'query' \| 'connection'`. |

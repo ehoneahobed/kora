@@ -27,8 +27,10 @@ const devApp = createApp({
 ```
 
 With `devtools: true`, `createApp` records events in a ring buffer (10 000 events), forwards them
-to the extension with `window.postMessage`, and mounts the overlay. Leave it off in production: the
-instrumentation runs only when enabled.
+to the extension with `window.postMessage`, and mounts the overlay. DevTools is loaded with a
+dynamic `import()` after the app starts, so it never weighs on the first paint; events emitted
+before it loaded are replayed into it in order. Leave it off in production: with `devtools` off
+the package is not loaded at all.
 
 ## The in-page overlay
 

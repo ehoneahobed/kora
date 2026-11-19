@@ -116,6 +116,8 @@ await app.encryption?.unlock(passphrase)
 
 Until the keyring is unlocked, sync is paused (`sync:suspended` with reason `encryption-locked`) and nothing leaves the device. Local reads and writes keep working; writes queue and upload, encrypted, once the keyring is unlocked.
 
+With encryption enabled, writes a component makes before the local store has opened (through `useMutation`, while `KoraProvider` renders before `app.ready`) wait in memory only: they are not saved to the small pre-open write journal, which would keep their values in plaintext in IndexedDB. They are applied once the store opens; a tab closed before that loses them (`journal:memory-only` reports such a write).
+
 You can also pass the passphrase (or an async provider of it) in the config. The keyring is then opened automatically at the first sync handshake:
 
 <!-- docs-check: continue -->
@@ -331,7 +333,7 @@ In beta.12, `createApp` derived the key from the passphrase with a random salt i
 
 New data is encrypted under the user's keyring from the first beta.13 handshake on.
 
-Encrypted beta.12 (protocol 1) clients cannot sync with a server of this release: their uploads are refused terminally (`PLAINTEXT_REJECTED` when the server requires encryption, `SCHEMA_VALIDATION_ERROR` otherwise; `allowPlaintextMigration` admits plaintext only, never protocol-1 ciphertext), as a schema-aware beta.12 server already refused them. Writes refused that way stay on the device after it upgrades; they are not uploaded again.
+Encrypted beta.12 (protocol 1) clients cannot sync with a current server. Since 1.0.0-beta.15 the server refuses every protocol-1 handshake (`PROTOCOL_VERSION_UNSUPPORTED`). A beta.13 or beta.14 server accepted the handshake but refused their encrypted uploads terminally (`PLAINTEXT_REJECTED` when the server requires encryption, `SCHEMA_VALIDATION_ERROR` otherwise; `allowPlaintextMigration` admits plaintext only, never protocol-1 ciphertext), as a schema-aware beta.12 server already did. Writes refused that way stay on the device after it upgrades; they are not uploaded again.
 
 ## Performance Considerations
 

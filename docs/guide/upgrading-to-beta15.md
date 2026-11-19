@@ -21,7 +21,7 @@ Which guide to read:
 |---|---|
 | beta.14 | This page. |
 | beta.13 | [From beta.13 to beta.14](/guide/upgrading-to-beta13#from-beta-13-to-beta-14), then this page. |
-| beta.12 or earlier | [Upgrading to beta.13](/guide/upgrading-to-beta13) (breaking, with a security advisory), then this page. Upgrade every client first: beta.15 servers refuse protocol 1. |
+| beta.12 or earlier | [Upgrading to beta.13](/guide/upgrading-to-beta13) (breaking, with a security advisory), then this page. Move every client to beta.13 or later before the server goes to beta.15: beta.15 servers refuse protocol 1 (beta.12 and earlier). |
 
 **Order: servers first, then clients**, as for every beta since beta.13. The new handshake and
 delivery fields are optional, and the server cuts delivery batches for a client that does not
@@ -66,8 +66,11 @@ What it does **not** do:
   See [`kora doctor --db`](/api/cli#production-preflight-db). To check a server that is already
   deployed, `kora doctor --production --url https://sync.example.com` needs no credentials.
 - **Read the custom code you own** against the tables below: a custom `AuthTokenStorage`,
-  `ContentAddressedBlobStore`, `ServerStore`, `SyncStore`, `PasswordResetManager` or
-  `EmailVerificationManager`.
+  `ContentAddressedBlobStore`, `ServerStore`, `SyncStore`, `UserStore`, `TotpStore`,
+  `PasswordResetManager` or `EmailVerificationManager`, and calls to `AdminApi` or
+  `RbacEngine.resolveScopes`.
+- **Check the server's environment** for the `KORA_*` names `createProductionServer` now reads
+  ([below](#behaviour-changes-on-the-server)).
 - **Install the beta tag everywhere**, and keep `korajs`, `@korajs/auth` and `@korajs/cli` in the
   same release as the rest.
 
@@ -151,6 +154,11 @@ Changing this list rebuilds the index in the background. The store remembers the
 | `SqliteServerStore.close()` now closes the database connection `createSqliteServerStore` opened, and waits for running calls; calls after it fail with `SqliteServerStore is closed`. A store built on your own Drizzle connection leaves that connection to you. | Scripts and tests that closed a store and kept using the file handle | Close once, at the end. |
 | Servers refuse sync protocol 1 (Kora 1.0.0-beta.12 and earlier) at the handshake: `PROTOCOL_VERSION_UNSUPPORTED`, logged as `session.protocol_refused`. The protocol-1 session counters, `sync:protocol-deprecated` and `sync:unverified-legacy-operation` are gone. | Anyone with beta.12 clients | Update every client before upgrading the server. |
 | `/health` also reports `authRequired` and `protocolVersion` (booleans and numbers only). | Monitoring | `kora doctor --production --url` uses them to verify handshake authentication without credentials. |
+| `createProductionServer` **reads host settings the app leaves out**: `KORA_TRUST_PROXY` (a hop count or comma-separated ranges), the operational tokens `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_BACKUP_TOKEN` and `KORA_INSIGHTS_TOKEN` (the new `/__kora/insights`), `KORA_BLOB_STORE_URL` or `KORA_BLOB_DIR` (the server then keeps `t.blob()` bytes there and sweeps unused ones daily), and `KORA_ALLOWED_ORIGINS`. `httpRoutes` and `/health` answer CORS preflights for native app origins (`tauri://localhost`), `KORA_ALLOWED_ORIGINS`, the new `allowedOrigins` option and, outside production, `http://localhost` on any port, never with credentials. A value the app passes always wins. | Servers whose environment already sets one of these names | Check the environment. Remove a token you do not want to open its endpoint; pass `blobStore: false` to keep no file store. An app that wires blob callbacks itself is unchanged. |
+| `trustProxy: 0`, a negative count or `trustProxy: []` now **count as unset**, as `KORA_TRUST_PROXY=0` already did, and the server warns at start that per-address protection is off. Before, every client behind a proxy shared one per-address slot and sign-in failure bucket. | `createProductionServer` behind a proxy | Set the real hop count or the proxy's address ranges. |
+| `maxRequestBodyBytes`, `maxConcurrentRequestBodies`, `maxBackupBytes` and the new `routeBodyTimeoutMs` **must be positive whole numbers** (`routeBodyTimeoutMs` at most 2³¹−1 ms); anything else throws `InvalidServerConfigError` (`INVALID_SERVER_CONFIG`) when the server is created. Before, `NaN` turned a limit off and `0` refused every request it covered. | `createProductionServer` | Pass a positive whole number, or leave the option out for the default. |
+| **New limits with defaults.** A custom route body (`httpRoutes`: auth, webhooks, app APIs) must arrive within 2 s plus 1 s per KiB, never longer than a ceiling that grows with `maxRequestBodyBytes` (66 s at the 1 MiB default; `routeBodyTimeoutMs` sets it), or it gets `408`; at most `maxConcurrentRequestBodies` (128) bodies are read at once, past which `503` with `Retry-After`. A session may queue 16 messages before its handshake is accepted and `maxQueuedMessages` / `maxQueuedBytes` (10,000 / 64 MiB) after, then it is closed with the retriable `INBOUND_QUEUE_FULL`. A handshake may carry at most `maxSyncQueries` (1,000) query views (`SYNC_QUERIES_LIMIT`, not retried). Live rich-text updates are capped at `maxYjsUpdatesPerMinute` (1,200) and `maxYjsUpdateBytes` (1 MiB). Delivery pauses at `deliveryMaxUnackedBytes` (2 MiB) sent and unacknowledged. | Servers with slow uploaders, custom clients, beta.14 clients that mount very many live queries | Nothing for Kora clients of this release: they stay under the query-view cap (they widen views past 500). A beta.14 client with more than 1,000 views is refused until it updates; raise `maxSyncQueries` during the rollout if you have one. Raise the other limits only for traffic you expect. |
+| The memory, SQLite and Postgres **server stores answer queries the same way** (route queries, scoped route queries, constraint lookups, `countCollection`): `where { field: null }` matches null or absent fields (it matched nothing), `where { done: true }` works on SQLite (it threw), `orderBy` puts nulls last in both directions, strings compare by code point (Postgres no longer uses the database locale, `orderBy: 'id'` included), `id` breaks ties and is the default order, and SQLite accepts `offset` without `limit`. | Server routes that query | Re-check a route that relied on the old null match or a locale order. |
 
 ### Account flows in `@korajs/auth`
 
@@ -178,6 +186,16 @@ returned in responses; your `send` receives them. A custom `UserStore` needs `up
 password reset, and `UserStore.update()` now writes the profile only (email, name, `emailVerified`).
 TypeScript reports every one of these as a compile error. The password-reset row of the
 [beta.13 guide](/guide/upgrading-to-beta13#auth-contracts) (`onResetRequested`) describes the old API.
+
+Other changes in `@korajs/auth`:
+
+| Change | Applies to | What to do |
+|---|---|---|
+| Every **`AdminApi` method takes the acting admin's id first** and checks it with `isAdmin`: `listUsers(adminId, query?)`, `getUserSessions(adminId, userId)` and `getStats(adminId)` skipped that check before, and each call is now audited. `deleteUser` and `revokeUserSessions` throw `AdminRevocationUnavailableError` (`ADMIN_REVOCATION_UNAVAILABLE`) before deleting anything when the user store has no revocation store and no `revokeAllForUser` is configured (the built-in stores have one). | Code that calls `AdminApi` | Pass the admin's id as the first argument. TypeScript reports the old calls. |
+| **`RbacEngine.resolveScopes` and `OrgScopeResolver.resolve` return a directional `SyncGrant`** (`{ type: 'sync-grant', downlinkScopes, uplinkScopes }`) instead of one scope map, and the `__readonly` key is gone (it made viewers sync nothing). `resolveScopes` results are recognised by the `type` marker, not by key names. | RBAC users | Return the grant as is from `createKoraAuthServer({ resolveScopes })` or `ExternalJwtProvider({ resolveScopes })`: `(await rbac.resolveScopes(userId, orgId, collections)) ?? {}`. Read `grant.downlinkScopes` where you read the old map. A grant built by hand needs `type: 'sync-grant'`. |
+| A custom **`TotpStore` needs `saveIf(secret, expectedRevision)`**, an atomic conditional update (for example `UPDATE ... WHERE user_id = ? AND revision = ?` that checks the affected row count). `TotpManager` refuses a store without it (`TOTP_STORE_NOT_ATOMIC`). | Custom TOTP stores | Implement `saveIf` and store the new `revision` field as is. `InMemoryTotpStore` has it. |
+| **Passkey sign-in requires user verification by default**: `generateAuthenticationOptions` asks for `userVerification: 'required'`, matching `verifyAuthenticationResponse`. A new `requireUserVerification` option keeps the two in step. | Passkey users | Nothing, or pass `requireUserVerification: false` to both to accept sign-ins without user verification. |
+| **`oauth.autoLinkVerifiedEmail` links only to an account that verified its address.** Before, an OAuth sign-in with a verified email was linked to any account holding that email, verified or not. Accounts created before email verification existed have not verified theirs. `AdminApi.updateUser` resets `emailVerified` when it changes the address (unless it sets `emailVerified` too). | Apps with OAuth auto-linking | Turn on `emailVerification` so existing users can verify. Until they do, an OAuth sign-in with their address is answered `409` ("Sign in and link this provider first"). |
 
 ## 4. Upgrade the clients
 
@@ -213,6 +231,75 @@ points that affect an upgrade:
 - Keep what users were typing across the reload with `useFormDraft` (opt in per form; password
   fields and `t.secret()` fields are never drafted; nothing is drafted when `app.encryption` is on).
 
+### `KoraProvider` renders before the store opens
+
+`KoraProvider` (React, Vue, Svelte) renders its children before `app.ready`, and the SQLite WASM and
+the store runtime load after the first paint. What to change:
+
+- **Empty states.** Hooks return empty values until the store opens (`useQueryState(...).ready` is
+  `false`). Render an empty state ("No tasks yet") only once `ready` is true, or the first paint
+  shows it for a moment on every load.
+- **The startup `fallback`.** It is used only with the new `waitForStorage` prop, which restores the
+  old gate. Remove a `fallback` that only covered startup, or add `waitForStorage` to keep it. The
+  Svelte provider with `waitForStorage` and no `fallback` now renders nothing until the store opens,
+  as React and Vue do (it rendered `<div>Loading...</div>`); pass a `fallback` snippet to keep a
+  message.
+- **Writes before the store opens.** Writes made through `useMutation` are queued, saved to an
+  IndexedDB journal and applied in order once the store opens. A direct `await app.todos.insert(...)`
+  before `app.ready` still throws `AppNotReadyError`. `await app.ready` keeps its meaning.
+- **Validation in production builds.** `defineSchema` and `createApp` validate when the runtime loads
+  instead of at the call, so a schema or configuration mistake rejects `app.ready` with the same
+  `KoraError` (reading `schema.access` before then throws `AccessNotLoadedError`). A runtime chunk
+  that cannot load triggers one page reload (offline, once the connection returns); if it still
+  cannot load, `app.ready` rejects with `RUNTIME_LOAD_FAILED`.
+  Development builds, servers and tests validate at the call as before. Make sure your app handles a
+  rejected `app.ready`.
+- **Connect without waiting.** The templates call `app.sync?.connect()` without awaiting `app.ready`;
+  a connection now starts in parallel with the store open.
+
+### Other client changes
+
+| Change | What to do |
+|---|---|
+| An **update whose values already match the record writes no operation** (`update(id, { title: 'same' })` returns the record untouched; a mixed update writes only the fields that changed). Atomic ops, rich text and secret fields are always applied. An **insert accepts `null`** for an optional field without a default and leaves it empty; a required or defaulted field still refuses `null`, with a clearer message. | Nothing, unless code counts operations or relies on an update always producing one. |
+| **`count()` applies `limit` and `offset`** and returns what `exec()` would return. It ignored both before. | To count every match, leave `limit` and `offset` out of the counted query. |
+| `store:write-pending` has a new **`kind: 'transaction'`** (with `collections`), emitted once per transaction when `instantUpdates` is on. | Handle the new member where you switch over `insert`, `update`, `delete`. |
+| **protobufjs is opt-in.** The sync engine's default serializer is `JsonMessageSerializer` (the negotiated default already chose JSON), and `ProtobufMessageSerializer` and `NegotiatedMessageSerializer` are also exported from `@korajs/sync/protobuf`, so a bundle that does not use them drops them. | Nothing; a custom setup that passes a protobuf serializer keeps working. |
+| `@korajs/devtools` loads with a dynamic `import()` only when `devtools` is on; events emitted before it loads are replayed. | Nothing. |
+
+### Desktop apps (Tauri)
+
+- **Update the Rust plugin and `@korajs/tauri` together, and rebuild.** Binary values (rich text,
+  blobs) now travel as `{ $koraBytes: base64 }` in both directions, statements queue behind an open
+  transaction, and the plugin's commands run off the main thread. The keychain commands need Rust
+  1.88 or newer.
+- **Import `@korajs/tauri` in your entry file** (`import '@korajs/tauri'` in `src/main.tsx`, as the
+  `tauri-react` template does) so its adapter registers. Without it, storage auto-detection inside a
+  built app fails and the error says what to add.
+- Sign-in sessions move to the OS credential store when you pass `createTauriCredentialStore()` to
+  `createAuthTokenStorage` (the template does); a session saved in WebView storage moves on first
+  read.
+- **Give the app its own identifier.** Apps scaffolded before beta.15 use `com.kora.app`, and Tauri
+  keys the data folder on it, so two such apps share one database. `kora doctor` warns about it.
+  Changing the identifier moves where data lives: do it before users have data under the old one,
+  or plan a migration.
+- Template-only changes that do not arrive with the package bump: the update banner (updates are
+  offered, not forced), the release workflow that writes the tag's version into `package.json`,
+  `tauri.conf.json` and `Cargo.toml`, the mobile entry point and the `.gitignore`.
+
+### CLI
+
+- `@korajs/cli/create` is ESM only (no `require` condition). Import it, or call `create-kora-app`.
+- `create` refuses an unknown `--template`, `--pm` or `--framework` value (it used to fall back to
+  the default) and exits 1.
+- `DeployResult.liveUrl` can be `null` (`kora deploy --platform aws-ecs` with no service or no load
+  balancer), with `pendingSetup` saying what is left.
+- `kora doctor --production` now fails on a setting tagged `[required]` in `.env.example` that is
+  not set, and on Kora canary packages pinned to different releases. A CI job that runs it may need
+  the settings in its environment.
+- `kora deploy --platform aws-lightsail` forwards `KORA_AUTH_SECRET` (it forwarded only
+  `AUTH_SECRET`, so sign-in was off). Redeploy Lightsail apps.
+
 ### Offline readiness
 
 `app.offline.status()` and `useOfflineReady()` report whether a reload with no network would open
@@ -224,11 +311,12 @@ conditions. The upgrade-relevant points:
 |---|---|
 | **Update `korajs`, `@korajs/auth` and `@korajs/cli` together.** An older `@korajs/auth` cannot report offline sign-in (`auth-unknown`, never `ready`); an older `@korajs/cli` plugin publishes no shell status (`shell-none`). | `kora upgrade` does this. |
 | A custom `AuthTokenStorage` that does not declare `durability` reads as `unknown` and is **never `ready`**. | Pass `durability: 'durable'` (or `'session'`, `'memory'`) to `createAuthTokenStorage({ store, durability })`, or declare `offline.auth`. The default `localStorage` store is durable. |
+| `createKoraAuth({ credentialStore })` (a desktop or mobile app keeping tokens in a custom store) reads `unknown` for offline sign-in, because a credential store declares no durability. | Pass `storage` with a declared durability instead (`createAuthTokenStorage({ store, durability })`, or `createTauriCredentialStore` on desktop). |
 | An app with a bare `sync.auth` token function reads `not-ready` until it declares `offline.auth`. | `createApp({ offline: { auth: () => ({ restorable: true, until }) } })`. |
 | A custom `ContentAddressedBlobStore` that does not declare `durable` counts as **not durable**: a pin that keeps files reports `storage-non-durable`. | Declare `readonly durable = true` on a store whose bytes survive a restart. (The member is optional; custom stores still compile.) |
 | On the **IndexedDB fallback** a write waits for a snapshot that holds it before its promise resolves, and can reject with `WriteNotDurableError` (`WRITE_NOT_DURABLE`) if the snapshot cannot be saved. Before, it resolved anyway. OPFS and native SQLite pay no extra wait. | Treat the error as "saved here, not yet confirmed". **Do not retry the write**: it exists. Use `insertMany` or one `app.transaction` for bulk writes. `app.storage.writes.status()` reports `durable` or `failing`. |
 | Native SQLite (`better-sqlite3`, the Tauri plugin) now sets `synchronous = FULL`, so a resolved write survives an operating-system crash or power loss. | Nothing. |
-| `offline` and `reloadForNewBuild` are **reserved app property names**. A collection with one of these names is not exposed as `app.offline`; it is `app.collections.offline` and `tx.offline`. `createApp` warns once in development. | Rename the collection, or use `app.collections.<name>`. |
+| `schema`, `offline`, `setReadOnly`, `readOnlyReason` and `reloadForNewBuild` are **new reserved app property names** (`app.schema` is the app's schema). A collection with one of these names is not exposed as `app.<name>`; it is `app.collections.<name>` and `tx.<name>`. `createApp` warns once in development. | Rename the collection, or use `app.collections.<name>`. |
 | A database that existed and vanished is reported (`store:storage-evicted`, `app.storage.evicted`) instead of being mistaken for a new device. It is never reported after `app.storage.deleteDatabase()`, a move between IndexedDB and OPFS, a first open, a changed `store.name`, or when the user clears all site data. | Show it to the user and call `app.offline.acknowledgeEviction()`. |
 
 Features that live in the **templates**, not in the libraries, do not arrive with the package
@@ -274,14 +362,6 @@ the server and `kora.config.ts`. Copy them from a fresh `npx create-kora-app@bet
 - Batches are decrypted and their operation ids verified before the transaction opens. Every operation
   is still verified exactly once.
 
-- `KoraProvider` (React, Vue, Svelte) renders its children before the local database opens, and the
-  SQLite WASM and store runtime load after the first paint. Remove a `fallback` that only covered
-  startup (it is only used with the new `waitForStorage` prop). Hooks return empty values until the
-  store opens, so render an empty state only when `useQueryState(...).ready` is true. Writes made
-  through `useMutation` before the store opens are queued and saved to an IndexedDB journal, and
-  applied in order once it opens. `await app.ready` keeps its meaning. A direct
-  `app.todos.insert(...)` before `app.ready` still throws `AppNotReadyError`.
-
 ### New and opt in
 
 - **`insertMany(rows)`** on every collection (also `tx.<collection>.insertMany` and `useCollection`):
@@ -303,12 +383,12 @@ const app = createApp({
 
   Read [Instant Updates](/guide/instant-updates) before turning it on. A shown row is **not saved**
   until the write's promise resolves, and a row can disappear if the transaction fails. It predicts
-  only inserts, updates and deletes of one record on queries it can evaluate in memory; writes inside
-  `app.transaction` or `app.mutation`, atomic operations (`op.increment`, ...), cascading deletes,
-  custom resolvers, rich text and secret fields, and queries with `include` appear at commit, as with
-  the flag off. `app.storage.writes.pending` and `onRollback` exist but are internal and may change; do
-  not build on them. Pass `{ durable: true }` as the last argument of one write to skip the prediction
-  for that write.
+  inserts, updates and deletes, atomic operations (`op.increment`, ...) and array fields, and
+  `app.transaction` / `app.mutation` as one unit, on queries it can evaluate in memory. Writes that
+  involve rich-text, secret, auto-computed, `server-authoritative` or custom-resolver fields,
+  cascading deletes, and queries with `include` appear at commit, as with the flag off. `app.storage.writes.pending` and `onRollback` exist but are
+  internal and may change; do not build on them. Pass `{ durable: true }` as the last argument of one
+  write to skip the prediction for that write.
 - **`useMutation(fn, { onRejected })`** and a `rejected` state tell the component that made a write
   when the sync server permanently refuses it, even hours later (React, Vue and Svelte; needs
   `<KoraProvider app={app}>`).
@@ -333,8 +413,8 @@ that does not declare `access` is unaffected. If you adopt it:
 - A custom server store must implement the membership index (`getMembershipIntervals`,
   `getAccessIndexState`) or the schema is refused `ACCESS_RULES_UNSUPPORTED_STORE`. The built-in
   stores do.
-- A collection that relied on field rules alone to admit inserts now needs a `create` rule: the
-  collection's `create` rule applies to every insert (leaving it out denies every client).
+- Every insert is judged by the collection's `create` rule, even when every field has a field rule;
+  leaving it out denies every client. (Canary builds before this release skipped it in that case.)
 - Fields declared `t.string().stamp('userId')` are filled on insert from the signed-in user; naming
   another user throws `StampedFieldError`.
 - A replace-mode backup restore, or a rebuild that opens memberships at sequence 0, re-scopes every
@@ -344,15 +424,20 @@ that does not declare `access` is unaffected. If you adopt it:
 
 1. Back up the server database; run `kora doctor --db <database> --dry-run-migrations --strict`.
 2. In the server project: `npx kora upgrade --yes`. Fix compile errors from the tables above
-   (custom auth managers, stores). Deploy the server. Watch the first start
-   ([section 7](#_7-what-to-monitor)).
+   (custom auth managers, `AdminApi` calls, `SyncGrant`, `TotpStore.saveIf`, stores). Check the
+   server's environment for the `KORA_*` names it now reads, `trustProxy`, and the size options.
+   Deploy the server. Watch the first start ([section 7](#_7-what-to-monitor)).
 3. If you use `TokenAuthProvider` scopes, add `deliveryPartitions` for the fields you grant on.
 4. In each client project: `npx kora upgrade --yes`. Rebuild so `koraServiceWorker()` regenerates the
-   worker and stamps the build id.
+   worker and stamps the build id. Desktop apps: update the Rust plugin, import `@korajs/tauri`, and
+   rebuild.
 5. Add `durability` to a custom `AuthTokenStorage`, `offline.auth` to an app with its own sign-in, and
    `durable` to a custom blob store.
-6. Search for a collection named `offline` or `reloadForNewBuild`.
-7. Decide how your app handles `WriteNotDurableError` (do not retry) and the reload prompt.
+6. Search for a collection named `schema`, `offline`, `setReadOnly`, `readOnlyReason` or
+   `reloadForNewBuild`, for code that chains `limit` or `offset` before `count()`, and for empty
+   states rendered before `useQueryState(...).ready`.
+7. Decide how your app handles `WriteNotDurableError` (do not retry), a rejected `app.ready`, and
+   the reload prompt.
 8. Deploy the client. Ask users to close old tabs once (or accept the prompt).
 9. Run `kora doctor --production --url https://sync.example.com`.
 
@@ -367,6 +452,8 @@ On the server (structured log events):
 | `session.tombstone_delivery_undetermined`, `server:tombstone-delivery-undetermined` | A delete's delivery point could not be decided yet; only that write is held, and withheld from the device if the hold cannot resolve (`action: 'withheld'`, counted in `withheldDeliveries`). |
 | `operations.commit_hook_failed`, `server:commit-hook-failed` | An `onOperationsCommitted` handler threw. The commit is unaffected. |
 | `CLIENT_TOO_OLD`, `ACCESS_RULES_CHANGED` session refusals | An old client reached an access-rules server, or rules were not in force for a session (it reconnects). |
+| `SYNC_QUERIES_LIMIT`, `INBOUND_QUEUE_FULL`, `YJS_UPDATE_THROTTLED` | A client hit one of the new limits (a beta.14 client with more than 1,000 query views is refused until it updates). |
+| `session.delivery_rewind` | A client stopped acknowledging and the server retransmitted from its last acknowledgment. |
 
 On devices (forward these events to your telemetry):
 
@@ -384,13 +471,15 @@ On devices (forward these events to your telemetry):
 
 No codemod was added for beta.15. The changes that could be detected in source are either reported by
 the TypeScript compiler (the `PasswordResetManager` and `EmailVerificationManager` constructors, the
-removed error classes) or are detections that source analysis cannot make safely:
+removed error classes, the `AdminApi` signatures, `SyncGrant`, `TotpStore.saveIf`, the removed
+options) or are detections that source analysis cannot make safely:
 
 - A custom `AuthTokenStorage` or `ContentAddressedBlobStore` without `durability` / `durable`: it can be
   any object or class, so a scan cannot tell a custom store from a wrapper that already declares it.
-- A collection named `offline` or `reloadForNewBuild`: `createApp` already warns once in development.
-- Behaviour changes on the server (`spaFallback`, scope validation, `INVALID_DELETE_PAYLOAD`): they
-  depend on runtime data.
+- A collection with a newly reserved name: `createApp` already warns once in development.
+- Behaviour changes on the server (`spaFallback`, scope validation, `INVALID_DELETE_PAYLOAD`, the
+  environment settings, the new limits, the query contract) and `count()` with `limit`: they depend
+  on runtime data.
 
 If a diagnostic for one of these would help your fleet, it fits the existing report-only `Codemod`
 interface in `packages/cli/src/upgrade/codemods/`.

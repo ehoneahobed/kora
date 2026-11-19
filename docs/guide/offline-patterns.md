@@ -13,7 +13,7 @@ This guide covers how Kora's offline-first architecture works and how to build U
 
 When your app performs a mutation (insert, update, delete), Kora does three things:
 
-1. **Writes to the local store.** The record and its operation are committed to the local database (SQLite WASM on OPFS, or IndexedDB) in one transaction before the call resolves.
+1. **Writes to the local store.** The record and its operation are committed to the local database (SQLite WASM on OPFS, or IndexedDB) in one transaction before the call resolves. A write whose promise resolved is durable: on the IndexedDB fallback the call also waits for a snapshot that holds it, and rejects with `WriteNotDurableError` (the write exists; do not retry it) when that snapshot cannot be saved.
 
 2. **Creates an operation.** Every mutation produces an immutable, content-addressed Operation that captures exactly what changed, with a sequence number reserved in the same commit.
 
@@ -165,7 +165,9 @@ const found = await app.todos.findById(todo.id)
 ```
 
 Reactive queries pick up the write right after it commits: subscribers are notified after the
-commit, batched per microtask, and only when their result changed. Check the measured latency on
+commit, batched per microtask, and only when their result changed. With the opt-in
+[instant updates](/guide/instant-updates) (`store: { instantUpdates: true }`) this tab's live
+queries show the write in the same frame, before the commit. Check the measured latency on
 your target devices with the store benchmarks; see `docs/benchmarks/baseline.md` in the repository.
 
 This means your UI never waits for the network. Data is always local-first.
@@ -314,7 +316,7 @@ app.on('merge:conflict', (event) => {
 })
 ```
 
-This is optional. By default, conflicts resolve silently and the UI updates to reflect the merged state. Separately, a write the server **refuses** (a constraint, a validator) is reported with `sync:operation-rejected` and undone on its author; surface that one to the user.
+This is optional. By default, conflicts resolve silently and the UI updates to reflect the merged state. Separately, a write the server **refuses** (a constraint, a validator, an access rule) is reported with `sync:operation-rejected` and undone on its author; surface that one to the user. The component that made the write can show it directly: `useMutation(fn, { onRejected })` and its `rejected` state report a permanent refusal of that call's writes, even after a long offline period (see [React Hooks](/guide/react-hooks)).
 
 ## Offline-First Checklist
 

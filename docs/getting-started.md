@@ -58,10 +58,13 @@ my-app/
       todo.mutations.ts           # writes
       useTodos.ts                 # React binding for the feature
     App.tsx                       # the UI
+    OfflineBadge.tsx              # "Available offline", from useOfflineReady()
     main.tsx                      # createApp() and <KoraProvider>
     kora-worker.ts                # SQLite WASM worker entry
   kora.config.ts                  # `kora dev` settings
   vite.config.ts                  # Vite, cross-origin isolation, offline app shell
+  AGENTS.md                       # Kora's rules for AI coding agents
+  .gitignore                      # keeps .env files and local databases out of git
 ```
 
 `src/main.tsx` creates the app once and hands it to React:
@@ -271,8 +274,9 @@ export function TodoList() {
 }
 ```
 
-`useMutation` returns `{ mutate, mutateAsync, isLoading, error, reset }`: call `mutate(...)`
-(fire and forget) or `await mutateAsync(...)`. `useQuery` re-renders when the result changes. Its
+`useMutation` returns `{ mutate, mutateAsync, isLoading, error, rejected, reset }`: call
+`mutate(...)` (fire and forget) or `await mutateAsync(...)`; `rejected` reports a write the sync
+server refused later. `useQuery` re-renders when the result changes. Its
 very first render, before the local query has run (and before the store has opened), returns an empty array; use
 `useQueryState` when you need to tell "still loading" from "no rows" (or a query error). See
 [React Hooks](/guide/react-hooks).
@@ -290,7 +294,7 @@ export const app = createApp({
   schema,
   sync: {
     url: 'wss://my-server.example.com/kora-sync',
-    autoConnect: true, // or call `await app.sync?.connect()` after `app.ready`
+    autoConnect: true, // or call `app.sync?.connect()` yourself; it need not wait for `app.ready`
   },
 })
 ```
@@ -308,20 +312,22 @@ it waits (`auth-required`) until someone signs in; the project README explains t
 
 ```bash
 pnpm build          # tsc && vite build: dist/ with the offline app shell
-npx kora deploy     # Fly.io, Railway or AWS for sync templates
+npx kora deploy     # Kora Cloud, Fly.io, Railway or AWS for sync templates
 ```
 
 See [Deployment](/guide/deployment).
 
 ## What's next
 
-- [Upgrading to beta.13](/guide/upgrading-to-beta13): moving an existing 1.0.0-beta.12 app and
-  server to this release
 - [Upgrading to beta.15](/guide/upgrading-to-beta15): moving an existing 1.0.0-beta.14 app and
-  server, and what `kora upgrade` does for you
+  server to this release, and what `kora upgrade` does for you
+- [Upgrading to beta.13](/guide/upgrading-to-beta13): moving a 1.0.0-beta.12 app and server
 - [Schema Design](/guide/schema-design): field types, the value domain, relations, migrations
 - [Conflict Resolution](/guide/conflict-resolution): exactly how concurrent edits merge
 - [Offline Patterns](/guide/offline-patterns): sync status, pending writes, the app shell
+- [Offline Readiness](/guide/offline-readiness): what "available offline" guarantees, and
+  `app.offline`
+- [App updates and multiple tabs](/guide/app-updates): new versions, the reload prompt, form drafts
 - [React Hooks](/guide/react-hooks), [Vue](/api/vue), [Svelte](/api/svelte)
 - [Sync Configuration](/guide/sync-configuration) and [Sync Protocol](/guide/sync-protocol)
 - [Authentication](/guide/authentication) and [Sync Encryption](/guide/sync-encryption)

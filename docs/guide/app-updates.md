@@ -41,6 +41,14 @@ const app = createApp({ schema })
 After retiring, the old tab still reads (through the new build), but it never writes again. The
 reload brings it onto the new build.
 
+A tab can also meet a deployment before its runtime has loaded: `createApp` loads the store
+runtime with a dynamic `import()` after the first paint, and a chunk the server no longer has
+fails to load. Kora then reloads the page once (not again within 30 seconds) to fetch the new
+build; if that fails too, `app.ready` rejects with `RUNTIME_LOAD_FAILED`. While the browser reports
+no network (`navigator.onLine` is `false`) the reload waits for the `online` event instead, because
+a reload offline could not fetch anything: `ready` stays pending, and writes made through hooks
+meanwhile are journaled and applied when the store opens.
+
 The later-opened build wins, so rolling a deployment back works too: reopening the app on the
 previous build retires tabs of the withdrawn one. A release that changes Kora's storage format is
 the exception: older code never opens a database a newer format wrote
@@ -120,6 +128,11 @@ genuinely newer tab. So it never reloads while the page is still controlled by t
 served its own build: when no newer worker is ready (offline, a failed or slow update check) it
 resolves `false`, and the default banner says _"The new version is still downloading in this
 browser. Try again in a moment."_ with **Try again**. A custom prompt should do the same.
+
+Under the offline shell, the reload that brings in a new version waits until no write is still
+committing, so a write the user saw saved is never lost to the reload. Meanwhile the page receives
+a `kora:update-waiting` window event (`detail.pendingWrites`). The store exposes the same count as
+`store.pendingWriteCount()` and `store.whenWritesSettled()`.
 
 `BUILD_SUPERSEDED` is a local refusal, retriable after the reload: `useMutation()` reports it in
 `error`, never as a server rejection (`rejected`).

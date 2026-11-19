@@ -36,13 +36,28 @@ re-renders only when it changes. On the server it reports `not-ready` with `serv
 | `state` | `ready`, `preparing` (every missing piece is making progress) or `not-ready` |
 | `reasons` | Why not: empty exactly when `state` is `ready` |
 | `shell` | The offline app shell: `{ state, version, misses }`, see [The app shell](#the-app-shell) |
-| `data` | `complete`, `syncing`, `incomplete` or `local`; `completedAt`; `quarantined` |
-| `files` | Kept-file counts (zeros until files are kept) |
-| `storage` | `backend`, `durable`, `persisted`, `writes`, `evicted` |
+| `data` | `state` (`complete`, `syncing`, `incomplete` or `local`), `progress` (0 to 1 while syncing, approximate), `completedAt`, `quarantined` |
+| `files` | Kept-file counts: `kept`, `missing`, `bytesMissing`, `failed` (zeros until files are kept) |
+| `storage` | `backend` (`opfs`, `indexeddb`, `native` or `memory`), `durable`, `blobStoreDurable`, `persisted`, `writes`, `usage`, `quota`, `evicted` |
 | `auth` | `n/a`, `loading`, `restorable` (with `offlineUntil`), `not-restorable` or `unknown` |
 
-`unknown` is never ready. `persisted: false`, quarantined operations and an unacknowledged
-eviction are reported but never change `state`.
+`unknown` is never ready. `persisted: false`, `quota`, quarantined operations, shell `misses` and
+an unacknowledged eviction are reported but never change `state`.
+
+`reasons` lists, in order, each part that is missing. A reason that is making progress
+(`shell-installing`, `data-syncing` on a live session, `files-downloading`, `auth-loading`) leaves
+the state `preparing`; any other makes it `not-ready`. While the local database is still opening
+the status is `preparing` with `storage-opening` and `data-incomplete`: nothing is held yet, and
+nothing is wrong.
+
+| Part | Reasons |
+|---|---|
+| Shell | `shell-installing`, `shell-not-installed`, `shell-other-build`, `shell-unsupported`, `shell-none` |
+| Data | `data-syncing`, `data-incomplete`, `data-blocked` (a transient failure stalls delivery: see `app.sync.status.blockedFailure`) |
+| Files | `files-downloading`, `files-missing`, `files-failed` |
+| Storage | `storage-opening`, `storage-non-durable`, `storage-writes-failing`, `storage-other-tab` (another tab holds the database), `storage-uncoordinated` (`store.allowUncoordinatedTabs`) |
+| Sign-in | `auth-loading`, `auth-not-restorable`, `auth-unknown` |
+| Server | `server-rendering` |
 
 ## The app shell
 
@@ -146,13 +161,18 @@ watermark reset. A delivery that crashed or stalled part-way leaves the view `in
 reload, never `complete`. "Complete" means complete as of `data.completedAt`; data the server
 received after the last sync is not here, which no device can know offline.
 
-The marks are read when the sync engine starts (`sync.autoConnect`, or `await app.sync.connect()`).
+The marks are read when the sync engine starts (`sync.autoConnect`, or `app.sync.connect()`). A
+staged first sync (`sync.bulkReplication`) writes the mark in the merge that makes its data live.
 
 ## Storage loss
 
 When a database that existed on this device is reopened empty, Kora emits `store:storage-evicted`
 and keeps `app.storage.evicted` (`{ dbName, detectedAt, lastOpenedAt, evidence, lostWrites }`)
-until `app.offline.acknowledgeEviction()`. See the changeset notes for when it is not reported.
+until `app.offline.acknowledgeEviction()`. `lostWrites` is `{ count, certain }`: the unsynced
+writes the vanished copy held when last recorded (`certain: false` when writes followed, so the
+count may be low). It is not reported after `app.storage.deleteDatabase()`, a move between OPFS and
+IndexedDB, a first open, a changed `store.name`, or when the user cleared all site data (see the
+[guide](/guide/offline-readiness#if-the-browser-deleted-the-database)).
 
 
 ## Sign-in
@@ -168,7 +188,9 @@ session. `createKoraAuthSync` (`@korajs/auth`) answers from the stored credentia
 | Signed out, locked, expired, or a clock set back | `not-restorable` |
 
 An app with its own token store sets `durability: 'durable'` on it (a platform keychain, the
-Tauri store). An app whose sign-in Kora cannot see (a bare `sync.auth` token function) declares
+Tauri store): `createAuthTokenStorage({ store, durability: 'durable' })`, passed to
+`createKoraAuth` as `storage`. A store passed as `credentialStore` declares no durability and reads
+`unknown`. An app whose sign-in Kora cannot see (a bare `sync.auth` token function) declares
 it:
 
 <!-- docs-check: skip partial snippet, shows only the option -->

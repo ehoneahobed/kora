@@ -7,8 +7,8 @@ Offline-first authentication for Kora.js applications.
 `@korajs/auth` provides a complete authentication system designed for offline-first applications. It includes:
 
 - **Client-side auth management**: token storage, session restoration, sign-up/sign-in/sign-out
-- **React hooks**: `useAuth()`, `useCurrentUser()`, `useAuthStatus()`, `useOrg()`, `usePermission()`
-- **Server-side auth routes**: email/password authentication with JWT tokens
+- **React, Vue and Svelte bindings**: `useAuth()`, `useCurrentUser()`, `useAuthStatus()`, `useOrg()`, `usePermission()` (`@korajs/auth/react`, `/vue`, `/svelte`)
+- **Server-side auth routes**: email/password authentication with JWT tokens, email verification, password reset and change, and sign-in secret rotation without signing anyone out
 - **Device identity**: ECDSA P-256 key pairs for proof-of-possession
 - **Token management**: access/refresh token lifecycle with rotation and revocation detection
 - **Session management**: server-side sessions with idle timeout, max limits, and MFA awareness
@@ -38,6 +38,8 @@ const authClient = createKoraAuth({
 ```
 
 `createKoraAuth()` uses IndexedDB for the device key pair when available. React Native and other runtimes without IndexedDB should pass a platform-backed `deviceKeyStore`.
+
+A `credentialStore` does not declare whether it survives a restart, so offline readiness reports the sign-in as `unknown`. To have the stored session counted, pass `storage: createAuthTokenStorage({ store: secureStore, durability: 'durable' })` instead (on Tauri, `createTauriCredentialStore()` from `@korajs/tauri`).
 
 ## Installation
 
@@ -129,7 +131,7 @@ const userStore = await createSqliteUserStore({ filename: './auth.db' })
 const oauthStores = await createSqliteOAuthStores({ filename: './auth.db' })
 
 const auth = createKoraAuthServer({
-  jwtSecret: process.env.KORA_AUTH_SECRET, // required in production
+  // jwtSecret defaults to KORA_AUTH_SECRET (plus KORA_AUTH_SECRET_PREVIOUS); required in production
   userStore, // production refuses in-memory stores
   oauth: {
     providers: [
@@ -146,7 +148,7 @@ const auth = createKoraAuthServer({
 
 const server = createProductionServer({
   store: createSqliteServerStore({ filename: './kora-server.db' }),
-  httpRoutes: [{ path: '/auth', handle: auth.handleRequest }],
+  httpRoutes: [auth.httpRoute], // /auth, plus sign-in activity in /__kora/insights
   syncOptions: { auth: auth.auth }, // verified identity and server-granted scopes
 })
 await server.start()
@@ -192,6 +194,7 @@ await server.start()
 | Export | Description |
 |--------|-------------|
 | `createKoraAuthServer` | Quickstart server factory with auth routes and sync provider |
+| `authSecretFromEnv` / `createAppSigner` | The sign-in secret with its previous values; signed app links that survive a secret change |
 | `BuiltInAuthRoutes` | HTTP route handlers for all auth operations |
 | `TokenManager` | JWT issuing, validation, refresh rotation, revocation |
 | `createSqliteUserStore` / `createPostgresUserStore` | Durable users and token revocations |
@@ -201,9 +204,9 @@ await server.start()
 | `createSqliteOAuthStores` / `createPostgresOAuthStores` | Durable OAuth state and linked identity stores |
 | `SessionManager` / `InMemorySessionStore` | Server-side session management |
 | `TotpManager` / `InMemoryTotpStore` | TOTP MFA with recovery codes |
-| `OrgRoutes` / `InMemoryOrgStore` | Organization CRUD, invitations, member management |
+| `OrgRoutes` / `InMemoryOrgStore` / `routeOrgRequest` | Organization CRUD, invitations, member management; one route for every `OrgClient` call |
 | `RbacEngine` / `defineRoles` | Role-based access control with permission hierarchy |
-| `OrgScopeResolver` | Generate sync scope filters from org membership |
+| `OrgScopeResolver` | Generate a directional sync grant (`SyncGrant`) from org membership |
 | `EmailVerificationManager` | Email verification token flow |
 | `PasswordResetManager` | Password reset and change flows |
 | `hashPassword` / `verifyPassword` | PBKDF2-SHA512 password hashing |
@@ -215,7 +218,7 @@ await server.start()
 - JWT tokens signed with HMAC-SHA256 with constant-time comparison
 - Atomic refresh token rotation with reuse detection per token family
 - Device keys use ECDSA P-256 with non-extractable private keys (Web Crypto)
-- TOTP uses SHA-1 HMAC per RFC 6238 with 30-second time steps
+- TOTP uses SHA-1 HMAC per RFC 6238 with 30-second time steps; code checks are atomic across processes (a `TotpStore` needs `saveIf`)
 - Access tokens expire in 15 minutes and refresh tokens in 90 days (configurable)
 - Revocation (sign-out, device, password change, admin) applies to every route and ends live sync sessions
 - Sign-in is rate limited per account and per IP; MFA at sign-in with TOTP (replay protection and lockout)

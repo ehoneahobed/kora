@@ -1,6 +1,6 @@
 ---
 title: CLI Reference
-description: "Kora CLI reference: create, dev, migrate, generate, doctor, upgrade, status, logs, backup, compact, deploy, studio and agents-md."
+description: "Kora CLI reference: create, dev, migrate, generate, doctor, upgrade, status, logs, backup, compact, deploy, login, export, import, studio and agents-md."
 ---
 
 # CLI Reference
@@ -27,7 +27,16 @@ Run `kora <command> --help` for the options of any command.
   after the app's first data (the `kora:first-data` event `createApp()` dispatches), at most
   `firstDataTimeoutMs` (default 10000) after `load`, so the precache never competes with it; the
   precache reuses the HTTP cache (each file kept only when its SHA-256 matches the build) and
-  downloads byte-identical files, such as the unhashed `sqlite3.wasm` copy, once.
+  downloads byte-identical files, such as the unhashed `sqlite3.wasm` copy, once. Other options:
+  `lazy` (URL path prefixes of built files left out of the precache and cached the first time
+  they are fetched, for large files most visits never need, such as `['/guide/img']`; a lazy file
+  is stored only when its bytes match the build's digest), `bypass` (path prefixes always sent to
+  the network; defaults to `/kora-sync`, `/auth`, `/__kora` and `/health`), `updatePrompt`
+  (`false` to show your own update UI on the `kora:update-available` event),
+  `navigationTimeoutMs` (default 4000) and `fileName` (default `sw.js`). A path ending in `/`
+  opens that folder's precached `index.html`, as a static host does. Accepting an update waits
+  until no write is still committing (the page receives `kora:update-waiting` meanwhile), so a
+  reload never loses a write.
 - `koraBuildId()`: only the build id, for apps without the offline shell. After the build is
   written, every page gets `<meta name="kora-build" content="<hash of every deployed file>">`
   (HTML pages hashed with the id normalized; the generated `sw.js` excluded); in `vite dev`, `dev-<server start>`. `createApp()` reads it
@@ -51,7 +60,7 @@ offline.
 |--------|-------------|
 | `--template <id>` | Skip the questions and use a template (below). |
 | `--platform web\|desktop-tauri` | `desktop-tauri` uses the `tauri-react` template. |
-| `--framework react\|vue\|svelte` | UI framework (`solid` is listed but not available yet). |
+| `--framework react\|vue\|svelte` | UI framework. Any other value (`solid` included) exits 1. |
 | `--tailwind` / `--no-tailwind` | Tailwind CSS or plain CSS. |
 | `--sync` / `--no-sync` | Include a sync server. |
 | `--db sqlite\|postgres` | Database of the sync server. |
@@ -60,6 +69,9 @@ offline.
 | `--pm pnpm\|npm\|yarn\|bun` | Package manager. |
 | `--yes`, `-y` | Accept the defaults: `react-tailwind-sync` and the detected package manager. |
 | `--skip-install` | Do not install dependencies. |
+
+An unknown `--template` or `--pm` value exits 1 and names the valid values; it is never replaced
+by the default, with `--yes` or without.
 
 | Templates | |
 |-----------|---|
@@ -72,7 +84,11 @@ Every template is a todo app with DevTools enabled in development. Sync template
 (a `createProductionServer` that also mounts `@korajs/auth` routes when `KORA_AUTH_SECRET` is set,
 and Google OAuth when its variables are set) and `.env.example`. A project
 contains `src/schema.ts`, `src/main.*`, the feature module under `src/modules/todos/`,
-`src/kora-worker.ts` (the SQLite WASM worker), `kora.config.ts`, `AGENTS.md` and `README.md`.
+`src/kora-worker.ts` (the SQLite WASM worker), `kora.config.ts`, `AGENTS.md`, `README.md` and a
+`.gitignore` that keeps `.env` and `.env.*` (but not `.env.example`), local databases (`.kora/`,
+`*.db` and their WAL files), `node_modules`, build output and, for desktop apps,
+`src-tauri/target` out of git. A `tauri-react` app gets its own `productName` (the project name)
+and `identifier` (`com.<project-name>`).
 [Getting Started](/getting-started) walks through the first run.
 
 ---
@@ -198,14 +214,25 @@ kora doctor --db <database> [--migrations kora/migrations] [--dry-run-migrations
 kora doctor --production [--url https://sync.example.com]
 ```
 
-Checks the project root, `kora.config`, the schema, the SQLite WASM worker, dependency versions
-and, unless `--skip-network`, the sync server and its schema version. Exits non-zero when a check
+Checks the project root, `kora.config`, the schema, the SQLite WASM worker (not for a Tauri app,
+which uses native SQLite), dependency versions (Kora canary packages pinned to different releases
+fail), the settings `.env.example` declares (`settings`), a Tauri app still on the shared
+`com.kora.app` identifier (`tauri-identifier`) and, unless `--skip-network`, the sync server and
+its schema version. Exits non-zero when a check
 fails; `--strict` also exits non-zero on a warning (with `--db`, on a warning of the database preflight only, so a project-layout warning never blocks a deploy).
 
 `--json` prints one JSON document instead of text, for CI: `{ "projectRoot", "ok", "summary":
 { "pass", "warn", "fail", "skip" }, "checks": [{ "id", "title", "status", "message", "fix?" }] }`.
 Check ids are stable, `status` is `pass`, `warn`, `fail` or `skip`, and the exit code is the same
 as in text mode (`ok` is `false` exactly when it is non-zero).
+
+### Declared settings: `settings`
+
+Reads `.env.example`. Tags in a setting's comment mark what production needs (`[required]`),
+credentials (`[secret]`) and local-only settings (`[development]`); every template ships a tagged
+file. The check reports what production will need, and with `--production` it fails on a
+`[required]` setting missing from the environment, by name and purpose. Without `.env.example` it
+warns.
 
 ### One schema: `schema-duplicates`
 
@@ -293,7 +320,8 @@ turns a warning into a non-zero exit. Check id: `db-migration-dry-run`.
 ### Production audit: `--production`
 
 `kora doctor --production` audits what a deploy depends on. Each check is independent, has a
-stable id, and does not need the schema to load.
+stable id, and does not need the schema to load. It also fails when a `[required]` setting of
+`.env.example` is not set (see [`settings`](#declared-settings-settings)).
 
 | Check id | Warns when |
 |----------|-----------|
@@ -442,15 +470,97 @@ kora deploy rollback [id]
 
 Generates a Dockerfile, bundles `server.ts`, builds the client with Vite, provisions the app and
 deploys it. `--confirm` is non-interactive (for CI) and fails on missing data. State is kept in
-`.kora/deploy/` (add it to `.gitignore`); `--reset` deletes it. `render` and `docker`
+`.kora/deploy/` (the templates' `.gitignore` already leaves out `.kora/`); `--reset` deletes it. `render` and `docker`
 are listed but not implemented (refused with `DEPLOY_PLATFORM_UNAVAILABLE`). The project needs a `server.ts` (or `src/server.ts`) and Vite. The
 [Deployment guide](/guide/deployment) walks through a first deploy.
 
 | Platform | Requirement |
 |----------|-------------|
+| Kora Cloud | `kora login` (or `KORA_CLOUD_TOKEN` in CI) |
 | Fly.io | `flyctl`, `fly auth login` |
 | Railway | `@railway/cli`, `railway login` |
 | AWS ECS, AWS Lightsail | Docker running, AWS CLI with `aws configure` (Lightsail also needs `lightsailctl`) |
+
+`kora deploy restart` starts the running version again with the same release and data, on a
+platform that supports it (Kora Cloud); others point you to their own dashboard.
+
+### Kora Cloud
+
+`kora deploy --platform kora-cloud --prod` uploads the source git would commit (never
+`node_modules`, `.git`, `.kora` or `.env` files), builds it on Kora Cloud and follows the build
+and each deployment stage until the app is live, printing the end of the build log when a build
+fails. Nothing is built on your machine. A `.koraignore` (`.gitignore` syntax) at the repository
+root, or in the project's folder in a monorepo, leaves out further files the repository keeps but
+the app does not need, such as design sources and recordings. The first deploy links the directory
+to a project in `.kora/cloud.json`; later deploys, `--confirm` included, need no `--app`. After a
+deploy the CLI lists the settings production still needs (with what each is for, from
+`.env.example`) and any problems Kora Cloud found in the code, with where to fix them.
+
+Kora Cloud deploys to production from the CLI; previews come from pull requests.
+`kora deploy status` says how the running version is doing (healthy or failing, why, and when Kora
+Cloud last checked), `kora deploy logs` shows its recent log lines, and a rollback is made from
+the console.
+
+### AWS ECS
+
+`kora deploy --platform aws-ecs` checks the `ecsTaskExecutionRole` IAM role before it provisions
+or builds anything, and prints how to create it when it is missing. Without an ECS service yet it
+reports "Not deployed yet" with the `create-service` command, and it names a live URL only when
+the service is behind a load balancer. Any AWS failure other than a missing role or service stops
+the deploy with AWS's message.
+
+### AWS Lightsail
+
+`kora deploy --platform aws-lightsail` forwards `KORA_AUTH_SECRET` and
+`KORA_AUTH_SECRET_PREVIOUS`, the Google OAuth settings, the admin, backup and metrics tokens and
+`KORA_TRUST_PROXY` to the container. A legacy `AUTH_SECRET` is forwarded as `KORA_AUTH_SECRET`,
+with a warning.
+
+---
+
+## login, logout, whoami
+
+```bash
+kora login [--no-browser]
+kora logout
+kora whoami
+```
+
+Signs the CLI in to Kora Cloud with a short code you approve in the Kora Cloud console (works over
+SSH; `--no-browser` only prints the link). The sign-in is kept in `~/.config/kora/cloud.json`
+(`$XDG_CONFIG_HOME/kora/cloud.json` when set), readable by your user only. In CI, set
+`KORA_CLOUD_TOKEN` instead: it takes precedence over the file.
+
+---
+
+## export, import
+
+```bash
+kora export [--database-url <url>] [--blob-dir <dir>] [--out <file.tar>] [--pg-bin <dir>]
+kora import <bundle> --platform kora-cloud [--accept-unverified <count>]
+kora import <bundle> [--database-url <url>] [--blob-dir <dir>] [--pg-bin <dir>]
+```
+
+`kora export` bundles an app's whole PostgreSQL database (through `pg_dump`) and the files in its
+blob folder into one `.tar`, in the format Kora Cloud's backup downloads use. Nothing in the app
+is changed. `--database-url` defaults to `DATABASE_URL`, `--blob-dir` to `KORA_BLOB_DIR` (leave it
+out for an app without files), and `--out` to `<app>-export-<date>.tar`.
+
+`kora import --platform kora-cloud` uploads a bundle to the linked Kora Cloud project's backup
+storage, where it is verified like a backup and can then be loaded into production or opened as a
+recovery environment. When the import is refused because some operations do not match their
+content hashes (written by the app's own scripts around the server's checks),
+`--accept-unverified <count>` accepts exactly that many; Kora Cloud keeps checking them for later
+changes.
+
+Without `--platform`, `kora import` loads a bundle (from `kora export`, or a backup downloaded from
+Kora Cloud) into your own empty PostgreSQL database (`--database-url`, default `DATABASE_URL`) and
+files folder (`--blob-dir`, default `KORA_BLOB_DIR`). It checks the whole bundle first (the dump's
+checksum, every file against its name), refuses a database that already holds tables, restores in
+one transaction through `psql`, compares row counts with the bundle's, and copies files last. A
+server older than your `pg_restore` works: settings it does not know are left out. See
+[Backup and Restore](/guide/backup-restore). `--pg-bin` names the folder holding `pg_dump`,
+`pg_restore` and `psql` when they are not on `PATH`.
 
 ---
 

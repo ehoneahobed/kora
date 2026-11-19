@@ -121,7 +121,7 @@ The `cursor` field is optional. When present, it indicates the user's cursor pos
 
 On the server, the `AwarenessRelay` handles presence broadcasting:
 
-- **Client joins**: A session takes part after its handshake is accepted. Its first update binds its awareness client id (later updates must use it, so a client cannot impersonate another); the relay sends it every existing state it may see.
+- **Client joins**: A session takes part after its handshake is accepted. Its first update binds its awareness client id (later updates must use it, so a client cannot impersonate another); the relay sends it every existing state it may see. Each page picks a random 31-bit awareness id, and the relay keeps every connected client under an id no other client uses: a joiner whose id is taken (two pages of an older client both announce `1`) is relayed under a spare id, so two pages of one app see each other and one leaving removes only its own presence.
 - **State update**: The relay stores the state and forwards it to the other clients allowed to see it. A client that was shown an earlier state of the sender but may not see the new one (the cursor moved to a record it cannot read) receives a removal instead.
 - **Client leaves**: When a client disconnects, the relay sends a removal (`null` state) to every client that was shown its state.
 
@@ -152,7 +152,9 @@ on it (about one store read per burst of writes, however many collaborators have
 and the server runs at most 16 such reads at once. An update the relay drops (stamped with another
 client's id) changes nothing, not even which record the sender's presence names.
 A grant change ends the session (`SCOPE_CHANGED`), so a receiver never keeps presence from a
-grant it lost. Presence that should cross different grants must name its record in `cursor`:
+grant it lost. With [access rules](/guide/access-rules) the server refreshes each session's
+memberships on every delivery poll, so presence follows a membership change within one poll
+interval; a capability grant (a share link) admits its holder to presence like a member. Presence that should cross different grants must name its record in `cursor`:
 `usePresence` sets no cursor, so a "who is online" list built from it shows only users with the
 same grant; the rich-text editor sets the cursor of the field being edited.
 
