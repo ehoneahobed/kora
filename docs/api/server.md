@@ -53,7 +53,7 @@ const url = await server.start()
 | `trustProxy` | `KORA_TRUST_PROXY`, else off: `request.ip` is the socket address unless the proxy is trusted |
 | `maxRequestBodyBytes` | 1 MiB for `httpRoutes` bodies (larger requests get 413) |
 | `maxConcurrentRequestBodies` | 128 `httpRoutes` bodies read at once (more get 503 with `Retry-After`); each must arrive at 2 s plus 1 s per KiB, at most `routeBodyTimeoutMs` (slower gets 408 and the connection closes) |
-| `routeBodyTimeoutMs` | The longest an `httpRoutes` body may take; default: enough for `maxRequestBodyBytes` at 16 KiB/s after 2 s, at least 30 s (66 s for 1 MiB). A chunked body (no `Content-Length`) gets this whole time with no rate check |
+| `routeBodyTimeoutMs` | The longest an `httpRoutes` body may take; default: enough for `maxRequestBodyBytes` at 16 KiB/s after 2 s, at least 30 s (66 s for 1 MiB). A chunked body (no `Content-Length`) gets this whole time with no rate check. At most 2,147,483,647 ms (about 24.8 days, what a timer can wait); the default is capped there too |
 | `maxBackupBytes` | 256 MiB for `/__kora/backup/import` |
 
 The handle (`ProductionServer`) has `start()` (resolves to the URL), `stop()`, `kora` (the

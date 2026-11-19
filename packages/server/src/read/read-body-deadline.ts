@@ -24,6 +24,12 @@ export function readBodyDeadlineMs(contentLength: number): number {
  */
 export const ROUTE_BODY_TIMEOUT_MS = 30_000
 
+/**
+ * The longest a Node timer can wait: a `setTimeout` beyond it fires after ~1 ms, which would answer
+ * every body 408 at once. No body deadline is longer.
+ */
+export const MAX_TIMER_MS = 2 ** 31 - 1
+
 /** The rate the default ceiling lets the largest allowed body arrive at: about a 2G link. */
 export const ROUTE_BODY_SLOW_LINK_BYTES_PER_SECOND = 16 * 1024
 
@@ -37,10 +43,14 @@ export const ROUTE_BODY_SLOW_LINK_BYTES_PER_SECOND = 16 * 1024
  * @returns Milliseconds
  */
 export function routeBodyCeilingMs(maxRequestBodyBytes: number): number {
-	return Math.max(
-		ROUTE_BODY_TIMEOUT_MS,
-		READ_BODY_GRACE_MS +
-			Math.ceil(maxRequestBodyBytes / ROUTE_BODY_SLOW_LINK_BYTES_PER_SECOND) * 1000,
+	// A huge limit (a stand-in for "none") still gives a ceiling a timer can wait.
+	return Math.min(
+		MAX_TIMER_MS,
+		Math.max(
+			ROUTE_BODY_TIMEOUT_MS,
+			READ_BODY_GRACE_MS +
+				Math.ceil(maxRequestBodyBytes / ROUTE_BODY_SLOW_LINK_BYTES_PER_SECOND) * 1000,
+		),
 	)
 }
 
