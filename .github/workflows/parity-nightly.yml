@@ -37,7 +37,14 @@ jobs:
         run: pnpm exec turbo run build --filter='!kora-docs'
 
       - name: Install Chromium
-        run: pnpm --filter kora-e2e exec playwright install --with-deps chromium
+        # apt mirrors fail transiently (exit 100): retry so a mirror blip doesn't fail the run.
+        run: |
+          for attempt in 1 2 3; do
+            pnpm --filter kora-e2e exec playwright install --with-deps chromium && exit 0
+            echo "Chromium install failed (attempt $attempt); retrying in 30 s"
+            sleep 30
+          done
+          exit 1
 
       - name: Resolve Chromium path
         run: echo "PW_CHROMIUM_PATH=$(cd e2e && node -e "import('@playwright/test').then(m => console.log(m.chromium.executablePath()))")" >> "$GITHUB_ENV"
