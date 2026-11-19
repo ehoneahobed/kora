@@ -16,6 +16,7 @@ import {
 let server: ProductionServer | null = null
 const sockets: Socket[] = []
 afterEach(async () => {
+	vi.useRealTimers()
 	for (const socket of sockets.splice(0)) socket.destroy()
 	await server?.stop()
 	server = null
@@ -62,6 +63,29 @@ function stalledUpload(
 const bodiesInFlight = (): number =>
 	(server as unknown as Record<symbol, () => number>)[ROUTE_BODIES_IN_FLIGHT]?.() ?? -1
 
+/** Waits (across event-loop turns, no timers) until the server is reading `count` bodies. */
+async function untilBodiesInFlight(count: number): Promise<void> {
+	while (bodiesInFlight() !== count) await new Promise((resolve) => setImmediate(resolve))
+}
+
+/**
+ * A 40 KiB upload whose sender pauses for 35 s of (fake) time halfway: past the fixed 30 s ceiling
+ * that applied before, inside the deadline the rate rule gives 40 KiB (2 s + 40 s). Only the
+ * timers are faked; the sockets are real, and the pause costs no wall-clock time.
+ */
+async function uploadPausing35s(extra: Record<string, unknown>): Promise<number> {
+	const at = await start(extra)
+	const body = JSON.stringify({ text: 'x'.repeat(40 * 1024) })
+	const half = Math.floor(body.length / 2)
+	vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+	const { socket, reply } = stalledUpload(at, Buffer.byteLength(body), body.slice(0, half))
+	// The deadline timer is armed in the same step that counts the body as in flight.
+	await untilBodiesInFlight(1)
+	await vi.advanceTimersByTimeAsync(35_000)
+	socket.write(body.slice(half))
+	return (await reply).status
+}
+
 // No sleeps: deadlines are configured tiny (the rate arithmetic is unit-tested in
 // read-body-deadline.test.ts), and ordering waits on the server's in-flight count.
 describe('custom route bodies', () => {
@@ -86,19 +110,14 @@ describe('custom route bodies', () => {
 		expect(deadlineFor()(1000)).toBe(3_000)
 	})
 
-	// Review of #323: a sender that keeps sending inside the ceiling is answered normally. The
-	// ceiling is far above anything scheduling could add; pieces go out across event-loop turns.
-	test('a body trickled steadily inside the ceiling gets 200', async () => {
-		const at = await start({ routeBodyTimeoutMs: 60_000 })
-		const body = JSON.stringify({ text: 'x'.repeat(400) })
-		const { socket, reply } = stalledUpload(at, Buffer.byteLength(body), '')
-		const step = Math.ceil(body.length / 10)
-		for (let i = 0; i < body.length; i += step) {
-			socket.write(body.slice(i, i + step))
-			await new Promise((resolve) => setImmediate(resolve))
-		}
-		const answered = await reply
-		expect(answered.status).toBe(200)
+	// Review of #323 (round 2): the raised ceiling must let through a sender the old fixed 30 s
+	// ceiling would have cut. The same upload, with that old ceiling configured, gets 408.
+	test('a steady sender that takes longer than the old 30 s ceiling gets 200', async () => {
+		expect(await uploadPausing35s({})).toBe(200)
+	})
+
+	test('the same sender under the old fixed 30 s ceiling gets 408', async () => {
+		expect(await uploadPausing35s({ routeBodyTimeoutMs: 30_000 })).toBe(408)
 	})
 
 	test('past the in-flight cap, another body is refused with 503 at once', async () => {
