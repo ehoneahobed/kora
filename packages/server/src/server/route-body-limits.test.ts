@@ -73,6 +73,16 @@ describe('custom route bodies', () => {
 		expect(answered.closedAtMs - startedAt).toBeLessThan(5_000)
 	}, 15_000)
 
+	test('routeBodyTimeoutMs sets the ceiling: a stalled sender is cut off at it', async () => {
+		// A declared 1 KB body would get 3 s by the rate rule; the configured ceiling is shorter.
+		const at = await start({ routeBodyTimeoutMs: 300 })
+		const startedAt = Date.now()
+		const { reply } = stalledUpload(at, 1000)
+		const answered = await reply
+		expect(answered.status).toBe(408)
+		expect(answered.closedAtMs - startedAt).toBeLessThan(2_000)
+	})
+
 	test('past the in-flight cap, another body is refused with 503 at once', async () => {
 		const at = await start({ maxConcurrentRequestBodies: 2 })
 		stalledUpload(at, 5000)
