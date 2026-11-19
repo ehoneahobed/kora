@@ -53,3 +53,12 @@ describe('routeBodyDeadlineMs: the ceiling follows the body limit', () => {
 		expect(routeBodyDeadlineMs(Number.NaN, 120_000)).toBe(120_000)
 	})
 })
+
+describe('routeBodyCeilingMs stays within what a timer can wait (review of #323)', () => {
+	// Node fires a setTimeout above 2^31-1 ms after ~1 ms: an unclamped ceiling would answer
+	// every body 408 at once.
+	test('a huge body limit gives at most 2^31-1 ms', () => {
+		expect(routeBodyCeilingMs(Number.MAX_SAFE_INTEGER)).toBeLessThanOrEqual(2 ** 31 - 1)
+		expect(routeBodyCeilingMs(64 * 1024 ** 3)).toBeLessThanOrEqual(2 ** 31 - 1)
+	})
+})

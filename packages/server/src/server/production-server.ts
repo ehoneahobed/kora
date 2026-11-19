@@ -11,6 +11,7 @@ import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
 import { addressBucket } from '../read/address-bucket'
 import {
+	MAX_TIMER_MS,
 	readBodyDeadlineMs,
 	routeBodyCeilingMs,
 	routeBodyDeadlineMs,
@@ -607,7 +608,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 	const routeBodyCeiling =
 		config.routeBodyTimeoutMs === undefined
 			? routeBodyCeilingMs(maxRequestBodyBytes)
-			: positiveInteger('routeBodyTimeoutMs', config.routeBodyTimeoutMs, 0)
+			: timerMilliseconds('routeBodyTimeoutMs', config.routeBodyTimeoutMs)
 	let routeBodiesInFlight = 0
 	const maxBackupBytes = positiveInteger(
 		'maxBackupBytes',
@@ -1639,4 +1640,17 @@ function positiveInteger(option: string, value: unknown, fallback: number): numb
 		throw new InvalidServerConfigError(option, value, 'a positive whole number')
 	}
 	return value
+}
+
+/** A duration a Node timer can wait: a positive whole number of milliseconds up to 2^31-1. */
+function timerMilliseconds(option: string, value: unknown): number {
+	const ms = positiveInteger(option, value, 0)
+	if (ms > MAX_TIMER_MS) {
+		throw new InvalidServerConfigError(
+			option,
+			value,
+			`a positive whole number of milliseconds up to ${MAX_TIMER_MS} (about 24.8 days)`,
+		)
+	}
+	return ms
 }

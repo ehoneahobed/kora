@@ -45,4 +45,18 @@ describe('createProductionServer checks its size and count options', () => {
 			server = create({})
 		})
 	}
+
+	test('routeBodyTimeoutMs above 2^31-1 ms (what a timer can wait) is refused', () => {
+		let thrown: unknown
+		try {
+			server = create({ routeBodyTimeoutMs: 2 ** 31 })
+		} catch (error) {
+			thrown = error
+		}
+		expect(thrown).toBeInstanceOf(InvalidServerConfigError)
+		expect((thrown as InvalidServerConfigError).context).toMatchObject({
+			option: 'routeBodyTimeoutMs',
+		})
+		server = create({ routeBodyTimeoutMs: 2 ** 31 - 1 })
+	})
 })

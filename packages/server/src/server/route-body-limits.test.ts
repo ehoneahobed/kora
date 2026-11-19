@@ -40,7 +40,7 @@ function stalledUpload(
 	const socket = connect(at.port, at.host)
 	sockets.push(socket)
 	socket.write(
-		`POST /echo HTTP/1.1\r\nHost: ${at.host}\r\nContent-Type: application/json\r\nContent-Length: ${length}\r\n\r\n${first}`,
+		`POST /echo HTTP/1.1\r\nHost: ${at.host}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${length}\r\n\r\n${first}`,
 	)
 	let data = ''
 	const reply = new Promise<{ status: number; closedAtMs: number }>((resolve) => {
@@ -81,6 +81,21 @@ describe('custom route bodies', () => {
 		const answered = await reply
 		expect(answered.status).toBe(408)
 		expect(answered.closedAtMs - startedAt).toBeLessThan(1_500)
+	})
+
+	// Review of #323: a sender that keeps sending inside the ceiling is answered normally.
+	test('a body trickled steadily inside the ceiling gets 200', async () => {
+		const at = await start({ routeBodyTimeoutMs: 3_000 })
+		const body = JSON.stringify({ text: 'x'.repeat(400) })
+		const { socket, reply } = stalledUpload(at, Buffer.byteLength(body), '')
+		// Ten pieces, one every 60 ms (about 0.6 s in all, against a 3 s ceiling).
+		const step = Math.ceil(body.length / 10)
+		for (let i = 0; i < body.length; i += step) {
+			socket.write(body.slice(i, i + step))
+			await new Promise((resolve) => setTimeout(resolve, 60))
+		}
+		const answered = await reply
+		expect(answered.status).toBe(200)
 	})
 
 	test('past the in-flight cap, another body is refused with 503 at once', async () => {
