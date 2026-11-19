@@ -115,6 +115,7 @@ example `HELD_ASSIGN_NO_USER`). Codes that reach the app as events (`sync:operat
 | `INVALID_AUDIT_EXPORT`, `INVALID_RICHTEXT_VALUE` | `KoraError` | An audit import without its manifest, or a rich-text value that is not a string, bytes, `null` or `undefined`. | Import an unmodified export; pass a supported value. |
 | `DELIVERY_BATCH_WRITE_FAILED`, `STAGING_UNAVAILABLE`, `STAGING_CLOCK_NOT_ADOPTED`, `SEED_PURGE_FAILED`, `SEED_ORPHANED` | `store:persistence-error` | A delivered batch failed to write in the shared write buffer (it is retried); the staging database did not open (sync applies directly); the clock did not adopt the newest staged time; seeded records could not be cleared; seeded records have no server history and keep their snapshot. | Check storage health if it repeats. |
 | `STALE_STORE_WRITE`, `WRITE_INCOMPLETE`, `SEQUENCE_RESERVATION_FAILED`, `STAGING_UNMERGEABLE` | `KoraError` | Internal: rolls back a write whose delivery position moved, a write transaction without a result, a failed sequence reservation, a staged replica that cannot merge (sync then replicates directly). | None; report one that reaches your code. |
+| `OFFLINE_KEEP_UNSUPPORTED_QUERY`, `OFFLINE_PIN_LIMIT` | `OfflineKeepError` | `app.offline.keep()` was given a query it cannot keep (a relation include; keep each related collection with its own call), or the database already keeps 64 pins. | Keep plain collection queries; release pins you no longer need. See [Offline](/api/offline). |
 
 ## Sync client {#sync}
 
@@ -138,6 +139,7 @@ Thrown by `app.sync` methods or reported in `sync:*` events and `status.reason`.
 | `SEALED_RELATION_FIELD` | `SealedRelationFieldError` | The encryption config encrypts a foreign key of an enforced relation, which the server must read. | List the field in `encryption.cleartextFields`. |
 | `INVALID_SCOPE`, `SCOPE_VIOLATION` | `InvalidScopeError`, `ScopeViolationError` | A malformed scope map, or a write outside the scope (custom engines). | Fix the scope map. |
 | `SYNC_ERROR` with `context.errorType` `DECRYPTION_ERROR`, `ENCRYPTION_ERROR`, `KEY_DERIVATION_ERROR`, `KEY_UNWRAP_ERROR` or `ENCRYPTION_KEY_ERROR` | encryption classes (extend `SyncError`) | Low-level encryption failures (wrong key, tampered data, invalid configuration such as `INVALID_CONFIG`). | See the message and [Sync Encryption](/guide/sync-encryption). |
+| `READ_UNAVAILABLE`, `READ_UNAUTHORIZED`, `READ_NETWORK_ERROR`, `READ_RESPONSE_INVALID`, `READ_FAILED`, `READ_KEY_CONFLICT` | `ReadThroughError` (`@korajs/sync/read`) | The first-visit read-through request: the server has no read endpoint (`404`, not asked again), refused the credential (`401`), could not be reached, answered without a result for a query, kept failing after retries, or two queries shared one key. The server's endpoint answers `READ_UNAVAILABLE` and `READ_FAILED` with the same codes. | None needed: the store answers when it opens. Enable `sync.firstVisit.readThrough` on a server that serves `<syncPath>/read`. |
 
 ### Quarantine codes {#quarantine}
 
@@ -271,6 +273,16 @@ client's flow; `OAUTH_CODE_EXCHANGE_FAILED`; `OAUTH_USER_INFO_FAILED`; `OAUTH_PR
 `ADMIN_UNAUTHORIZED`, `WEBHOOK_ENDPOINT_NOT_FOUND`, `WEBHOOK_TARGET_REFUSED`: the webhook URL is not
 public `https`). See the [Auth API reference](/api/auth#errors).
 
+Client codes (`AuthError` from `AuthClient`): `AUTH_REQUIRED` (an action that needs a session, signed
+out), `AUTH_SERVER_ERROR` (the auth server answered an error; its own code is in `context`),
+`AUTH_NETWORK_ERROR`, `AUTH_TIMEOUT` and `AUTH_INVALID_RESPONSE` (unreachable, too slow, or a
+non-JSON answer such as a captive portal's), `AUTH_FETCH_UNAVAILABLE` (no `fetch` in the runtime:
+pass `fetch`), `AUTH_OAUTH_REDIRECT_UNAVAILABLE` (no browser redirect: pass `redirect: false`), and
+`ACCOUNT_CHANGED` (the tab shows an account it is no longer signed in to: reload). `OrgClient`
+throws `OrgClientError` with `ORG_NOT_AUTHENTICATED`, `ORG_NETWORK_ERROR` and `ORG_SERVER_ERROR`.
+TOTP: `TOTP_STORE_NOT_ATOMIC` (a custom `TotpStore` without `saveIf`, refused) and `TOTP_CONFLICT`
+(the enrollment kept changing during a check: try again).
+
 More auth codes: `ADMIN_REVOCATION_UNAVAILABLE` (`AdminRevocationUnavailableError`: `AdminApi` cannot
 revoke tokens because the user store has no revocation store; pass `revokeAllForUser`),
 `APP_SIGNER_INVALID` (`AppSignerError`: a mistake in the app's signer setup, never a visitor's token),
@@ -293,3 +305,15 @@ and the route codes `UNAUTHENTICATED` (sending a verification email while signed
 | `DOCTOR_DATABASE_ERROR` | `DoctorDatabaseError` | `kora doctor` could not use the database URL (unknown scheme, missing file, missing driver). | Check the URL; install the driver it names. |
 | `KORA_CLOUD_SIGN_IN_REQUIRED` | `KoraCloudSignInRequiredError` | Not signed in to Kora Cloud, or the sign-in ended. | Run `kora login`, or set `KORA_CLOUD_TOKEN` in CI. |
 | `KORA_CLOUD_ERROR` | `KoraCloudError` | Kora Cloud refused a request or could not be reached (`cloudCode` and `status` hold its answer). | Follow the platform's message. |
+| `UPGRADE_*` | `UpgradeError` | `kora upgrade`: bad flags (`UPGRADE_CONFLICTING_FLAGS`, `UPGRADE_INVALID_TAG`, `UPGRADE_INVALID_VERSION`, `UPGRADE_CONFIRMATION_REQUIRED` without `--yes` in a non-interactive shell, `UPGRADE_DOWNGRADE` without `--allow-downgrade`); the project (`UPGRADE_NO_PACKAGE_JSON`, `UPGRADE_INVALID_PACKAGE_JSON`, `UPGRADE_NO_PACKAGES`, `UPGRADE_PACKAGE_NOT_PUBLISHED`, `UPGRADE_READ_FAILED`); the registry (`UPGRADE_REGISTRY_UNREACHABLE`, `UPGRADE_REGISTRY_ERROR`, `UPGRADE_TAG_NOT_FOUND`, `UPGRADE_TAG_MISMATCH` when a dist-tag points at different versions, a release half published); applying (`UPGRADE_CANNOT_LOCATE_SPECIFIER`, `UPGRADE_CODEMOD_FAILED`, `UPGRADE_WRITE_FAILED`, which restores written files where it can, `UPGRADE_INSTALL_FAILED`); and the check after (`UPGRADE_DOCTOR_UNAVAILABLE`, `UPGRADE_DOCTOR_FAILED`). | Each message says what to do; `--to <version>` skips the registry lookup. |
+
+## Test helpers {#test}
+
+`@korajs/test/playwright` helpers throw `OfflineAssertionError`:
+
+| Code | Cause |
+|------|-------|
+| `OFFLINE_STATUS_TIMEOUT` | `waitForOfflineStatus` did not see the expected status in time; the message carries the last status (check the `accessor`). |
+| `READY_TIMEOUT`, `READY_OBSERVED` | The app never became ready, or `expectNeverReady` saw `ready` in a scenario where it must not. |
+| `CRASH_UNSUPPORTED` | `killTab` outside Chromium (it uses `Page.crash` over CDP). |
+| `UNKNOWN_NETWORK_PRESET` | `throttleNetwork` was given a preset name it does not know. |

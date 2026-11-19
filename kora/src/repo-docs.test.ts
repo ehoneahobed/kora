@@ -44,9 +44,12 @@ function argumentText(source: string, open: number): string {
 
 /** Codes passed to KoraError: `super(message, 'CODE', ...)` in a subclass, or `new KoraError(...)`. */
 function koraErrorCodes(source: string): string[] {
-	if (!source.includes('KoraError')) return []
+	// No file-level filter: a file may only import a subclass (`OfflineKeepError`) and never name
+	// KoraError itself.
 	const codes: string[] = []
-	for (const match of source.matchAll(/\b(?:super|new KoraError)\s*\(/g)) {
+	// `super(msg, 'CODE')` in a subclass, `new KoraError(msg, 'CODE')`, and the most common form,
+	// `new SomeError(msg, 'CODE')` for a subclass that takes its code (review of #313).
+	for (const match of source.matchAll(/\b(?:super|new [A-Z]\w*Error)\s*\(/g)) {
 		const args = argumentText(source, (match.index ?? 0) + match[0].length - 1)
 		const code = /^[\s\S]*?,\s*'([A-Z][A-Z0-9_]{2,})'/.exec(args)?.[1]
 		if (code) codes.push(code)
@@ -104,5 +107,12 @@ describe('repository documentation', () => {
 			}
 		}`
 		expect(koraErrorCodes(source)).toEqual(['SOME_CODE', 'OTHER_CODE', 'FIRST_CODE', 'SECOND_CODE'])
+	})
+
+	test('the scanner reads a subclass constructed with its code', () => {
+		const source = `import { OfflineKeepError } from '@korajs/core'
+		throw new OfflineKeepError(\`Kept \${n} pins already\`, 'OFFLINE_PIN_LIMIT')
+		throw new Error('plain', { cause })`
+		expect(koraErrorCodes(source)).toEqual(['OFFLINE_PIN_LIMIT'])
 	})
 })
