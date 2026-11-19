@@ -4,7 +4,7 @@ import { type WriteObserver, notifyWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
 import { type CommitLookup, lookupCommit } from './commit-outcome'
 import type { LocalMutationContext } from './types'
-import { CausalScope, type WriteScope, withWriteScope } from './write-context'
+import { CausalScope, type WriteScope, waitForCausalHeads, withWriteScope } from './write-context'
 import type { WriteResult } from './write-ops'
 
 /** Thrown inside the transaction to roll it back when the journaled write already landed. */
@@ -72,6 +72,8 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 	const txCalledAt = timers ? performance.now() : 0
 	let bodyStartedAt = 0
 	let bodyEndedAt = 0
+	// Not while a clock rebase rewrites operation ids: this write's causalDeps would name them.
+	await waitForCausalHeads(ctx.causalTracker)
 	try {
 		await ctx.adapter.transaction(
 			async (tx) => {
