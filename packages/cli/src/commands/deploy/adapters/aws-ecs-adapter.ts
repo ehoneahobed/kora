@@ -101,6 +101,17 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 				'AWS CLI is not authenticated. Run `aws configure` or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.',
 			)
 		}
+		// The task runs under ecsTaskExecutionRole (it pulls the image and writes logs). Checked
+		// here, before provisioning or building, so a missing role costs nothing to find out.
+		const role = await this.runner.run(
+			'aws',
+			['iam', 'get-role', '--role-name', 'ecsTaskExecutionRole'],
+			cwd,
+		)
+		if (role.exitCode !== 0) {
+			if (hasAwsErrorCode(role.stderr, 'NoSuchEntity')) throw new Error(EXECUTION_ROLE_SETUP)
+			throw new Error(`Could not check the IAM role "ecsTaskExecutionRole": ${role.stderr}`)
+		}
 	}
 
 	public async provision(config: ProjectConfig): Promise<ProvisionResult> {
@@ -206,17 +217,6 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const context = this.requireContext()
 		const region = context.region ?? 'us-east-1'
 		const repoName = `kora/${context.appName}`
-
-		// The task runs under ecsTaskExecutionRole (it pulls the image and writes logs): check it
-		// before anything else runs, and say how to create it.
-		const role = await this.runner.run(
-			'aws',
-			['iam', 'get-role', '--role-name', 'ecsTaskExecutionRole'],
-			context.projectRoot,
-		)
-		if (role.exitCode !== 0) {
-			throw new Error(EXECUTION_ROLE_SETUP)
-		}
 
 		// Get ECR login token
 		const loginPassword = await this.runner.run(
@@ -339,6 +339,17 @@ export class AwsEcsAdapter implements ContextAwareDeployAdapter {
 		const deploymentId = new Date().toISOString()
 
 		if (updateService.exitCode !== 0) {
+			if (
+				!hasAwsErrorCode(
+					updateService.stderr,
+					'ServiceNotFoundException',
+					'ServiceNotActiveException',
+				)
+			) {
+				throw new Error(
+					`Updating the ECS service "${context.appName}" failed: ${updateService.stderr}`,
+				)
+			}
 			// No service yet: the networking (VPC, subnets, security groups, load balancer) is the
 			// developer's, so the deploy stops here and says what is left. Nothing is live.
 			return {
@@ -579,4 +590,13 @@ function inferLogLevel(line: string): LogLine['level'] {
 	if (normalized.includes('warn')) return 'warn'
 	if (normalized.includes('debug')) return 'debug'
 	return 'info'
+}
+
+/**
+ * Whether the AWS CLI's error output names one of `codes`. The CLI prints
+ * `An error occurred (<Code>) when calling the <Operation> operation: ...`; the bare code is
+ * accepted too.
+ */
+function hasAwsErrorCode(stderr: string, ...codes: string[]): boolean {
+	return codes.some((code) => new RegExp(`(^|\\(|\\s)${code}(\\)|\\s|$)`).test(stderr))
 }

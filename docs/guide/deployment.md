@@ -468,7 +468,7 @@ kora deploy --platform=aws-ecs
 Or select "AWS ECS Fargate" when prompted interactively.
 
 Kora will:
-1. Check that the `ecsTaskExecutionRole` IAM role exists (tasks need it to pull the image and write logs). If it does not, the deploy stops before building anything and prints the two commands that create it: `aws iam create-role` with an `ecs-tasks.amazonaws.com` trust policy, and `aws iam attach-role-policy` with `AmazonECSTaskExecutionRolePolicy`.
+1. Check that the `ecsTaskExecutionRole` IAM role exists (tasks need it to pull the image and write logs). If it does not, the deploy stops before building anything and prints the two commands that create it: `aws iam create-role` with an `ecs-tasks.amazonaws.com` trust policy, and `aws iam attach-role-policy` with `AmazonECSTaskExecutionRolePolicy`. The check runs with the credential check, before anything is provisioned. Any other AWS error, such as missing permissions to read the role or update the service, stops the deploy with AWS's message instead of setup steps.
 2. Create an ECR repository for your Docker image
 3. Create an ECS cluster and CloudWatch log group
 4. Build and push your Docker image to ECR
