@@ -44,14 +44,30 @@ export class CausalTracker {
 	 * still exists.
 	 *
 	 * @param idMapping - Old operation id to new operation id
+	 * @returns A function that puts the replaced heads back (when the rewrite did not commit).
+	 *   A head that changed again since is left alone.
 	 */
-	remapIds(idMapping: Readonly<Record<string, string>>): void {
+	remapIds(idMapping: Readonly<Record<string, string>>): () => void {
+		const replaced: Array<[collection: string, previous: string, next: string]> = []
 		for (const [collection, id] of this.lastOpIdByCollection) {
 			const next = idMapping[id]
-			if (next !== undefined) this.lastOpIdByCollection.set(collection, next)
+			if (next === undefined) continue
+			this.lastOpIdByCollection.set(collection, next)
+			replaced.push([collection, id, next])
 		}
-		if (this.lastTransactionOpId !== null) {
-			this.lastTransactionOpId = idMapping[this.lastTransactionOpId] ?? this.lastTransactionOpId
+		const previousTransactionOp = this.lastTransactionOpId
+		if (previousTransactionOp !== null) {
+			this.lastTransactionOpId = idMapping[previousTransactionOp] ?? previousTransactionOp
+		}
+		const transactionOp = this.lastTransactionOpId
+		return () => {
+			for (const [collection, previous, next] of replaced) {
+				if (this.lastOpIdByCollection.get(collection) === next) {
+					this.lastOpIdByCollection.set(collection, previous)
+				}
+			}
+			if (this.lastTransactionOpId === transactionOp)
+				this.lastTransactionOpId = previousTransactionOp
 		}
 	}
 

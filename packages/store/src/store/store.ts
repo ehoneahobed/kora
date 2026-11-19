@@ -4740,18 +4740,35 @@ export class Store implements OperationLog {
 			// Re-stamped operations order differently: their records are re-folded in the
 			// rewrite's transaction, so a crash never leaves the old stamps in a fold state.
 			const touched = new Map<string, Set<string>>()
-			const result = await rebaseUnsyncedOperationsInLog(
-				this.adapter,
-				this.schema,
-				unsyncedOpIds,
-				correctedNowMs,
-				{ inTransaction: this.refoldInRewrite(touched) },
-			)
-			if (result.newMaxTimestamp && this.clock) {
-				this.clock.advanceTo(result.newMaxTimestamp)
+			const refold = this.refoldInRewrite(touched)
+			// Undoes the head remap when the rewrite does not commit.
+			let undoRemap: (() => void) | undefined
+			let result: ClockRebaseResult
+			try {
+				result = await rebaseUnsyncedOperationsInLog(
+					this.adapter,
+					this.schema,
+					unsyncedOpIds,
+					correctedNowMs,
+					{
+						inTransaction: async (tx, operations, rewrite) => {
+							await refold(tx, operations)
+							// Last in the rewrite's transaction, before it commits: a local write queued
+							// behind it (writes build their causalDeps inside their own transaction)
+							// already sees the new ids and a clock past every rewritten stamp. The
+							// store's code after the transaction would run too late.
+							undoRemap = this.causalTracker?.remapIds(rewrite.idMapping)
+							if (rewrite.newMaxTimestamp && this.clock) {
+								// Only forward; harmless if the rewrite then rolls back.
+								this.clock.advanceTo(rewrite.newMaxTimestamp)
+							}
+						},
+					},
+				)
+			} catch (error) {
+				undoRemap?.()
+				throw error
 			}
-			// The rewritten operations have new ids: the next local write must depend on those.
-			this.causalTracker?.remapIds(result.idMapping)
 			this.invalidateRefolded(touched)
 			return result
 		})

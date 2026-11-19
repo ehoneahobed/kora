@@ -58,7 +58,11 @@ export async function rebaseUnsyncedOperationsInLog(
 		 * Runs last in the rewrite's transaction, with the rewritten operations: what must be
 		 * durable with the rewrite (re-folding their records) commits with it.
 		 */
-		inTransaction?: (tx: Transaction, operations: readonly Operation[]) => Promise<void>
+		inTransaction?: (
+			tx: Transaction,
+			operations: readonly Operation[],
+			rewrite: { idMapping: Record<string, string>; newMaxTimestamp: HLCTimestamp | null },
+		) => Promise<void>
 	} = {},
 ): Promise<ClockRebaseResult> {
 	if (unsyncedOpIds.length === 0) {
@@ -197,7 +201,10 @@ export async function rebaseUnsyncedOperationsInLog(
 		}
 		// sequenceNumbers are intentionally unchanged, so `_kora_version_vector`
 		// needs no update: the version vector tracks sequences, not timestamps.
-		await options.inTransaction?.(tx, newOperations)
+		await options.inTransaction?.(tx, newOperations, {
+			idMapping,
+			newMaxTimestamp: newTimestamps[newTimestamps.length - 1] ?? null,
+		})
 
 		result = {
 			operations: newOperations,

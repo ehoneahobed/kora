@@ -35,3 +35,18 @@ describe('CausalTracker', () => {
 		}
 	})
 })
+
+describe('CausalTracker.remapIds', () => {
+	test('moves heads to the rewritten ids, and its undo puts them back unless they moved on', () => {
+		const tracker = new CausalTracker()
+		tracker.afterOperation('todos', 'old-a', false)
+		tracker.afterOperation('notes', 'old-b', false)
+		const undo = tracker.remapIds({ 'old-a': 'new-a', 'old-b': 'new-b' })
+		expect(tracker.nextCausalDeps('todos', false)).toEqual(['new-a'])
+		// A write after the remap moved `notes` on: the undo leaves that head alone.
+		tracker.afterOperation('notes', 'later', false)
+		undo()
+		expect(tracker.nextCausalDeps('todos', false)).toEqual(['old-a'])
+		expect(tracker.nextCausalDeps('notes', false)).toEqual(['later'])
+	})
+})
