@@ -17,7 +17,12 @@ const create = (options: Record<string, unknown>): ProductionServer =>
 	createProductionServer({ store: new MemoryServerStore('s'), ...options })
 
 describe('createProductionServer checks its size and count options', () => {
-	for (const option of ['maxConcurrentRequestBodies', 'maxRequestBodyBytes', 'maxBackupBytes']) {
+	for (const option of [
+		'maxConcurrentRequestBodies',
+		'maxRequestBodyBytes',
+		'maxBackupBytes',
+		'routeBodyTimeoutMs',
+	]) {
 		for (const value of [Number.NaN, 0, -1, 1.5, Number.POSITIVE_INFINITY, '10']) {
 			test(`${option}: ${String(value)} is refused with a clear error`, () => {
 				let thrown: unknown

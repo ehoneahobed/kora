@@ -10,7 +10,11 @@ import {
 import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
 import { addressBucket } from '../read/address-bucket'
-import { readBodyDeadlineMs, routeBodyDeadlineMs } from '../read/read-body-deadline'
+import {
+	readBodyDeadlineMs,
+	routeBodyCeilingMs,
+	routeBodyDeadlineMs,
+} from '../read/read-body-deadline'
 import type { BlobChunkRelayStats } from '../richtext/blob-chunk-relay'
 import { BackupIntegrityError } from '../store/server-backup'
 import type { FullResyncTarget, ServerStore } from '../store/server-store'
@@ -115,11 +119,18 @@ export interface ProductionServerConfig {
 	/**
 	 * Most custom route bodies (`httpRoutes`) read at once. Past it a request with a body is
 	 * answered 503 with `Retry-After`, so slow uploads cannot pile up. Each body must also
-	 * arrive at a minimum rate (2 s plus 1 s per KiB, at most 30 s), or it is answered 408 and
-	 * the connection is closed.
+	 * arrive at a minimum rate (2 s plus 1 s per KiB, at most `routeBodyTimeoutMs`), or it is
+	 * answered 408 and the connection is closed.
 	 * @default 128
 	 */
 	maxConcurrentRequestBodies?: number
+	/**
+	 * The longest a custom route body may take to arrive, in milliseconds (the minimum-rate rule
+	 * still cuts off a small body that stalls sooner). A body without `Content-Length` (chunked)
+	 * gets this whole time, with no rate check.
+	 * @default enough for `maxRequestBodyBytes` at 16 KiB/s after a 2 s grace, at least 30 s (66 s for 1 MiB)
+	 */
+	routeBodyTimeoutMs?: number
 	/**
 	 * Largest backup accepted by `/__kora/backup/import`, in bytes. Defaults to 256 MiB.
 	 */
@@ -585,6 +596,12 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 		config.maxConcurrentRequestBodies,
 		128,
 	)
+	// The longest a custom route body may take: configured, or long enough for the largest
+	// allowed body to arrive over a slow link.
+	const routeBodyCeiling =
+		config.routeBodyTimeoutMs === undefined
+			? routeBodyCeilingMs(maxRequestBodyBytes)
+			: positiveInteger('routeBodyTimeoutMs', config.routeBodyTimeoutMs, 0)
 	let routeBodiesInFlight = 0
 	const maxBackupBytes = positiveInteger(
 		'maxBackupBytes',
@@ -1274,7 +1291,7 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 								new Promise<'timeout'>((resolve) => {
 									timer = setTimeout(
 										() => resolve('timeout'),
-										routeBodyDeadlineMs(Number(req.headers['content-length'])),
+										routeBodyDeadlineMs(Number(req.headers['content-length']), routeBodyCeiling),
 									)
 								}),
 							])
