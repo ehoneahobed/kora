@@ -5,6 +5,32 @@
 export class CausalTracker {
 	private readonly lastOpIdByCollection = new Map<string, string>()
 	private lastTransactionOpId: string | null = null
+	private holding: Promise<void> | null = null
+
+	/**
+	 * Hold new local writes back while operation ids are rewritten (a clock rebase): until the
+	 * returned release is called, {@link settling} is a promise writes wait on before they start
+	 * their storage transaction, so none builds causalDeps from heads the rewrite may still
+	 * change or undo.
+	 *
+	 * @returns The release (idempotent)
+	 */
+	hold(): () => void {
+		let release: () => void = () => {}
+		const held = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		this.holding = held
+		return () => {
+			if (this.holding === held) this.holding = null
+			release()
+		}
+	}
+
+	/** A promise to wait on while a rewrite holds writes back, or null when none does. */
+	get settling(): Promise<void> | null {
+		return this.holding
+	}
 
 	/**
 	 * Start a new transaction boundary. Clears in-transaction op ids.

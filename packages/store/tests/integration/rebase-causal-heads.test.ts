@@ -88,9 +88,10 @@ describe('a clock rebase keeps causal heads pointing at the log', () => {
 			const call = ++calls
 			if (call === 1) {
 				const result = await original(fn, options)
-				// Committed: now the queued write runs before this resolves.
+				// Committed: now the queued write gets a moment to run before this resolves. Held back
+				// by the store until the rebase settles, it runs after instead.
 				queued = store.collection('todos').insert({ title: 'queued behind the rebase' })
-				await writeFinished
+				await Promise.race([writeFinished, new Promise((resolve) => setTimeout(resolve, 100))])
 				return result
 			}
 			const result = await original(fn, options)

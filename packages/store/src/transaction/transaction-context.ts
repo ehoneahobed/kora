@@ -22,6 +22,7 @@ import {
 	CausalScope,
 	type LocalDeleteHook,
 	type WriteEnv,
+	waitForCausalHeads,
 	withWriteScope,
 } from '../mutations/write-context'
 import {
@@ -261,6 +262,8 @@ export class TransactionContext {
 		const register = options?.prepare
 			? await prepareSafely(options.prepare, this.buffer, this.observed)
 			: null
+		// Not while a clock rebase rewrites operation ids: this write's causalDeps would name them.
+		await waitForCausalHeads(this.config.causalTracker)
 		// From here to the start of the storage transaction is one synchronous step.
 		const tracker = register ? registerSafely(register) : null
 		const causal = new CausalScope(this.config.causalTracker, true)

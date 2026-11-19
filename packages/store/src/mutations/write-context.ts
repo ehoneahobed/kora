@@ -244,3 +244,12 @@ export function isStorageFullError(error: unknown): boolean {
 		? isStorageFullError(candidate.cause)
 		: false
 }
+
+/**
+ * Wait while a rewrite of operation ids holds local writes back (see `CausalTracker.hold`).
+ * Call right before starting the storage transaction, with nothing awaited between: a rewrite
+ * that starts after this resolves holds the next check, not this write.
+ */
+export async function waitForCausalHeads(tracker: CausalTracker | null): Promise<void> {
+	while (tracker?.settling) await tracker.settling
+}

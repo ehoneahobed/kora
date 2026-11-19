@@ -50,3 +50,24 @@ describe('CausalTracker.remapIds', () => {
 		expect(tracker.nextCausalDeps('notes', false)).toEqual(['later'])
 	})
 })
+
+describe('CausalTracker.hold', () => {
+	test('settling is a promise while held, resolved and cleared by the release', async () => {
+		const tracker = new CausalTracker()
+		expect(tracker.settling).toBeNull()
+		const release = tracker.hold()
+		const waiting = tracker.settling
+		expect(waiting).toBeInstanceOf(Promise)
+		let settled = false
+		void waiting?.then(() => {
+			settled = true
+		})
+		await Promise.resolve()
+		expect(settled).toBe(false)
+		release()
+		await waiting
+		expect(settled).toBe(true)
+		expect(tracker.settling).toBeNull()
+		release() // idempotent
+	})
+})

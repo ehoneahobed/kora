@@ -4737,6 +4737,10 @@ export class Store implements OperationLog {
 		// read phase and the rewrite share one transaction (rebaseUnsyncedOperationsInLog), so no
 		// local write lands between them.
 		return this.writeGate.run({ operation: 'rebase' }, async () => {
+			// Local writes that start from now on wait until the outcome is settled (the remap
+			// committed, or undone): the adapter's lock wakes a queued write before this code
+			// learns whether the rewrite committed. Taken before any await.
+			const releaseWrites = this.causalTracker?.hold()
 			// Re-stamped operations order differently: their records are re-folded in the
 			// rewrite's transaction, so a crash never leaves the old stamps in a fold state.
 			const touched = new Map<string, Set<string>>()
@@ -4768,6 +4772,8 @@ export class Store implements OperationLog {
 			} catch (error) {
 				undoRemap?.()
 				throw error
+			} finally {
+				releaseWrites?.()
 			}
 			this.invalidateRefolded(touched)
 			return result
