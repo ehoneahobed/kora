@@ -140,4 +140,24 @@ describe('BlobAccessIndex scope sets stay bounded', () => {
 		await index.isReferenced(scopeOf(1_000), blobHash)
 		expect(cached(index).size).toBe(1)
 	})
+
+	// Review of #297: a cache hit moves a set to the recently-used end, behind sets built after
+	// it. Expiry follows build time, not use, so a set read once and then left alone must still
+	// be swept when it expires, wherever reads have moved it.
+	test('a set moved behind newer ones by a read is still swept when it expires', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		const { blobHash } = await chunked()
+		const store = await storeWith({ hash: blobHash, size: 16 })
+		const index = new BlobAccessIndex(store, null, 5_000)
+		const start = Date.now()
+		await index.isReferenced(scopeOf(1), blobHash) // A, built at 0
+		vi.setSystemTime(start + 3_000)
+		await index.isReferenced(scopeOf(2), blobHash) // B, built at 3 s
+		await index.isReferenced(scopeOf(1), blobHash) // A read: now behind B in use order
+		vi.setSystemTime(start + 6_000) // A expired (built 6 s ago), B fresh (3 s)
+		await index.isReferenced(scopeOf(3), blobHash) // C cached: the sweep runs
+		expect(cached(index).has(JSON.stringify(scopeOf(1)))).toBe(false)
+		expect(cached(index).has(JSON.stringify(scopeOf(2)))).toBe(true)
+		expect(cached(index).has(JSON.stringify(scopeOf(3)))).toBe(true)
+	})
 })
