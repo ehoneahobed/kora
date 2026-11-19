@@ -76,6 +76,13 @@ export interface BlobReferenceRequest {
  */
 export class BlobAccessIndex {
 	private readonly byScope = new Map<string, ScopeEntry>()
+	/**
+	 * The cached sets in build order, for expiry: reads reorder `byScope` (least recently used
+	 * first), so its order says nothing about age. An entry whose set was evicted or rebuilt
+	 * since is skipped when it reaches the front.
+	 */
+	private expiryOrder: Array<{ key: string; builtAtMs: number }> = []
+	private expiryHead = 0
 	/** Rebuilds in progress per scope key, shared by concurrent lookups (RT-17). */
 	private readonly inflight = new Map<
 		string,
@@ -107,6 +114,8 @@ export class BlobAccessIndex {
 		if (collections === undefined) {
 			this.globalGeneration += 1
 			this.byScope.clear()
+			this.expiryOrder = []
+			this.expiryHead = 0
 			return
 		}
 		for (const collection of collections) {
@@ -322,15 +331,32 @@ export class BlobAccessIndex {
 	 * again), then the least recently used go past the cap.
 	 */
 	private remember(key: string, entry: ScopeEntry): void {
-		// From the least recently used end, until a fresh set: as much work as there is to drop
-		// (an expired set further in is still bounded by the cap).
+		// Oldest built first, until a set still within its time: as much work as there is to
+		// drop. A queued set that was evicted or rebuilt meanwhile is only skipped.
 		const now = Date.now()
-		for (const [other, cached] of this.byScope) {
-			if (now - cached.builtAtMs < this.ttlMs) break
-			this.byScope.delete(other)
+		while (this.expiryHead < this.expiryOrder.length) {
+			const oldest = this.expiryOrder[this.expiryHead]
+			if (oldest === undefined || now - oldest.builtAtMs < this.ttlMs) break
+			this.expiryHead++
+			if (this.byScope.get(oldest.key)?.builtAtMs === oldest.builtAtMs) {
+				this.byScope.delete(oldest.key)
+			}
 		}
 		this.byScope.delete(key)
 		this.byScope.set(key, entry)
+		this.expiryOrder.push({ key, builtAtMs: entry.builtAtMs })
+		// Skipped entries pile up at the front: drop them, and rebuild from the cache when the
+		// queue holds far more than it (sets evicted by the cap stay queued until they expire).
+		if (this.expiryHead > 1024 && this.expiryHead * 2 > this.expiryOrder.length) {
+			this.expiryOrder = this.expiryOrder.slice(this.expiryHead)
+			this.expiryHead = 0
+		}
+		if (this.expiryOrder.length - this.expiryHead > 4 * this.maxScopeSets + 1024) {
+			this.expiryOrder = [...this.byScope]
+				.map(([other, cached]) => ({ key: other, builtAtMs: cached.builtAtMs }))
+				.sort((a, b) => a.builtAtMs - b.builtAtMs)
+			this.expiryHead = 0
+		}
 		while (this.byScope.size > this.maxScopeSets) {
 			const oldest = this.byScope.keys().next().value
 			if (oldest === undefined) break
