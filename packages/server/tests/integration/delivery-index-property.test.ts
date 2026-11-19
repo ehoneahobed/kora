@@ -270,14 +270,26 @@ function stream(messages: SyncMessage[]): string[] {
 		if (m.type !== 'operation-batch') continue
 		const batch = m as unknown as {
 			operations: Array<{ type: string; collection: string; recordId: string }>
-			retractions?: Array<{ collection: string; recordId: string }>
+			retractions?: Array<{ collection: string; recordId: string; afterOperations?: number }>
 			accessNarrowing?: unknown
 			maxDeliverySequence?: number
 		}
 		if (batch.accessNarrowing !== undefined)
 			out.push(`narrow ${JSON.stringify(batch.accessNarrowing)}`)
-		for (const r of batch.retractions ?? []) out.push(`retract ${r.collection}/${r.recordId}`)
-		for (const op of batch.operations) out.push(`${op.type} ${op.collection}/${op.recordId}`)
+		// The order the device applies: each retraction after the first `afterOperations`
+		// operations of its batch (orderedRetractions), so a stream cut into other batches but
+		// applied in the same order reads the same. A retraction without a position comes first.
+		const retractions = batch.retractions ?? []
+		const placeRetractions = (position: number): void => {
+			for (const r of retractions) {
+				if ((r.afterOperations ?? 0) === position) out.push(`retract ${r.collection}/${r.recordId}`)
+			}
+		}
+		placeRetractions(0)
+		for (const [i, op] of batch.operations.entries()) {
+			out.push(`${op.type} ${op.collection}/${op.recordId}`)
+			placeRetractions(i + 1)
+		}
 		watermark = Math.max(watermark, batch.maxDeliverySequence ?? 0)
 	}
 	// The exact frontier the device ends at (case 6): an index read that skipped an
@@ -435,8 +447,10 @@ async function playBoth(
 /**
  * Logs that once failed on the order of the stream, not on a delete: replayed with the
  * generated logs and checked alone below. A membership change and a retraction in one burst
- * (found by seed 194831439): the global scan sends the lesson's retraction before the new member
- * row, and the index path must send the same stream.
+ * (found by seed 194831439): the global scan sends the member row and the lesson's retraction in
+ * one batch, the retraction placed after the row (`afterOperations: 1`); the index path sends them
+ * in two batches, in the same order. The comparison read the batch as "retractions first", so the
+ * same applied stream looked reordered.
  */
 const ORDER_REGRESSIONS: Action[][] = [
 	[
