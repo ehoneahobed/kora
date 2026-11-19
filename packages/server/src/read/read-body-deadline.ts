@@ -18,21 +18,45 @@ export function readBodyDeadlineMs(contentLength: number): number {
 	return Math.min(READ_BODY_TIMEOUT_MS, READ_BODY_GRACE_MS + Math.ceil(contentLength / 1024) * 1000)
 }
 
-/** The longest a custom route (auth, webhooks, app APIs) may take to deliver its body. */
+/**
+ * The smallest ceiling for a custom route body (auth, webhooks, app APIs): what the default
+ * ceiling never goes below, and what a body without a length gets when no limit applies.
+ */
 export const ROUTE_BODY_TIMEOUT_MS = 30_000
 
+/** The rate the default ceiling lets the largest allowed body arrive at: about a 2G link. */
+export const ROUTE_BODY_SLOW_LINK_BYTES_PER_SECOND = 16 * 1024
+
 /**
- * {@link readBodyDeadlineMs} for custom route bodies, which may be larger (up to
- * `maxRequestBodyBytes`): the same grace and minimum rate, never more than
- * {@link ROUTE_BODY_TIMEOUT_MS}.
+ * The default ceiling for custom route bodies: long enough for a body of `maxRequestBodyBytes`
+ * to arrive at {@link ROUTE_BODY_SLOW_LINK_BYTES_PER_SECOND} after the grace period, and never
+ * below {@link ROUTE_BODY_TIMEOUT_MS}. A flat ceiling made a body near the limit need a faster
+ * link than offline-first apps can count on (1 MiB in 30 s is ~35 KB/s), and a larger limit worse.
  *
- * @param contentLength - The parsed `Content-Length` header, if any
+ * @param maxRequestBodyBytes - The server's body limit
  * @returns Milliseconds
  */
-export function routeBodyDeadlineMs(contentLength: number): number {
-	if (!Number.isFinite(contentLength) || contentLength < 0) return ROUTE_BODY_TIMEOUT_MS
-	return Math.min(
+export function routeBodyCeilingMs(maxRequestBodyBytes: number): number {
+	return Math.max(
 		ROUTE_BODY_TIMEOUT_MS,
-		READ_BODY_GRACE_MS + Math.ceil(contentLength / 1024) * 1000,
+		READ_BODY_GRACE_MS +
+			Math.ceil(maxRequestBodyBytes / ROUTE_BODY_SLOW_LINK_BYTES_PER_SECOND) * 1000,
 	)
+}
+
+/**
+ * {@link readBodyDeadlineMs} for custom route bodies: the same grace and minimum rate (a body
+ * declaring little that stalls is cut off in seconds), never more than `ceilingMs`. A body
+ * without a valid `Content-Length` (chunked) gets the ceiling.
+ *
+ * @param contentLength - The parsed `Content-Length` header, if any
+ * @param ceilingMs - The longest any body may take (`routeBodyTimeoutMs`, or {@link routeBodyCeilingMs})
+ * @returns Milliseconds
+ */
+export function routeBodyDeadlineMs(
+	contentLength: number,
+	ceilingMs: number = ROUTE_BODY_TIMEOUT_MS,
+): number {
+	if (!Number.isFinite(contentLength) || contentLength < 0) return ceilingMs
+	return Math.min(ceilingMs, READ_BODY_GRACE_MS + Math.ceil(contentLength / 1024) * 1000)
 }

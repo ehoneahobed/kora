@@ -59,11 +59,12 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `allowedOrigins` | | Other origins whose pages may call `httpRoutes` and `/health` from a browser engine. Always allowed: native app shells (Tauri's `tauri://localhost`, `http(s)://tauri.localhost`), the comma-separated `KORA_ALLOWED_ORIGINS`, and, outside production, `http://localhost` on any port. Never with credentials. |
 | `trustProxy` | `KORA_TRUST_PROXY` | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list; the variable takes the same, comma-separated); `request.ip` uses it. |
 | `maxRequestBodyBytes` | 1 MiB | Larger bodies of custom routes get `413` before they are buffered. |
-| `maxConcurrentRequestBodies` | 128 | Custom route bodies read at once; past it a request with a body gets `503` with `Retry-After`. Each body must also arrive at a minimum rate (2 s plus 1 s per KiB, at most 30 s), or it gets `408` and the connection is closed. |
+| `maxConcurrentRequestBodies` | 128 | Custom route bodies read at once; past it a request with a body gets `503` with `Retry-After`. Each body must also arrive at a minimum rate (2 s plus 1 s per KiB, at most `routeBodyTimeoutMs`), or it gets `408` and the connection is closed. |
+| `routeBodyTimeoutMs` | enough for `maxRequestBodyBytes` at 16 KiB/s after 2 s, at least 30 s (66 s for 1 MiB) | The longest a custom route body may take to arrive. The default grows with `maxRequestBodyBytes`, so a client on a slow link (about 2G) can still upload a body near the limit. A body sent chunked (no `Content-Length`) has no declared size to rate-check: it gets this whole time, and the in-flight cap bounds how many such uploads wait at once. |
 | `maxBackupBytes` | 256 MiB | Largest backup import. |
 | `crossOriginEmbedderPolicy` | `'credentialless'` | COEP header for the served app. |
 
-The size and count options (`maxRequestBodyBytes`, `maxConcurrentRequestBodies`, `maxBackupBytes`) must be positive whole numbers. Anything else, such as `NaN`, `0` or a fraction, throws `InvalidServerConfigError` (`INVALID_SERVER_CONFIG`) when the server is created, instead of turning the limit off or refusing every request.
+The size and count options (`maxRequestBodyBytes`, `maxConcurrentRequestBodies`, `maxBackupBytes`, `routeBodyTimeoutMs`) must be positive whole numbers. Anything else, such as `NaN`, `0` or a fraction, throws `InvalidServerConfigError` (`INVALID_SERVER_CONFIG`) when the server is created, instead of turning the limit off or refusing every request.
 
 `syncOptions` (also the config of `createKoraServer` / `KoraSyncServer`):
 
