@@ -751,6 +751,8 @@ export class SyncEngine {
 	 * per row registers thousands across one render's microtasks.
 	 */
 	private pendingViewChange: { signature: string; effective: SyncQuerySubset[] } | null = null
+	/** A burst of view changes made while the stored watermarks load, judged once (see changeQuerySubsets). */
+	private pendingReconnectCheck: ReturnType<typeof setTimeout> | null = null
 	private pendingViewTimer: ReturnType<typeof setTimeout> | null = null
 	private staticQuerySubsets: SyncQuerySubset[] = []
 	/** Subsets of `app.offline.keep()` pins (offline-readiness design 4.3). */
@@ -1255,6 +1257,12 @@ export class SyncEngine {
 	private async stopInternal(): Promise<void> {
 		// A pending view switch (a burst of live-query changes) is settled, not dropped.
 		this.flushViewChange()
+		// A burst judged only for a reconnect (made while the watermarks loaded) has nothing left
+		// to reconnect once stopped.
+		if (this.pendingReconnectCheck !== null) {
+			clearTimeout(this.pendingReconnectCheck)
+			this.pendingReconnectCheck = null
+		}
 		// Every timer goes first, before any early return (SYNC-10): an engine that is
 		// already disconnected (the server closed the session) still owns the awareness
 		// cleanup interval and a pending query-subset reconnect.
@@ -2093,11 +2101,19 @@ export class SyncEngine {
 		if (this.watermarksPending() && !this.pendingViewChange) {
 			// The start is still reading the stored watermarks and computes the view itself: no
 			// switch now or later (it would save 0 over a stored watermark), only the reconnect.
-			const before = this.deliverySignatureFor(this.activeScope)
+			// A burst is judged once, on a timer turn, as a switch is: comparing the whole view
+			// after every change cost O(n²) for n views mounted at start.
+			if (this.pendingReconnectCheck === null) {
+				const before = this.deliverySignatureFor(this.activeScope)
+				this.pendingReconnectCheck = setTimeout(() => {
+					this.pendingReconnectCheck = null
+					if (this.deliverySignatureFor(this.activeScope) !== before) {
+						this.scheduleQuerySubsetReconnect()
+					}
+				}, 0)
+			}
 			change()
 			this.querySubsetsVersion++
-			if (this.deliverySignatureFor(this.activeScope) !== before)
-				this.scheduleQuerySubsetReconnect()
 			return
 		}
 		if (!this.pendingViewChange) {
