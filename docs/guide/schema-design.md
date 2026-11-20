@@ -157,9 +157,10 @@ without one.
 | `t.richtext()` | `Uint8Array` | `string \| Uint8Array \| ArrayBuffer` | same as insert |
 
 Every record also has `id: string`, `createdAt: number` and `updatedAt: number`. A defaulted
-field reads as `T | null` because an update can clear it with `null`. The insert type has no
-`null`, but at runtime an insert accepts `null` for an optional field without a default and leaves
-it empty (a form's "None" choice); a required or defaulted field refuses it. An `op.*` helper on a field
+field reads as `T | null` because an update can clear it with `null`. An insert accepts
+`null` for an optional field without a default and leaves it empty (a form's "None" choice), and the
+insert type allows it for exactly those fields; a required or defaulted field refuses it (a compile
+error, and a validation error at runtime). An `op.*` helper on a field
 of another kind (`op.append` on a number, `op.increment` on an array) or with an item of the wrong
 type is a compile error.
 

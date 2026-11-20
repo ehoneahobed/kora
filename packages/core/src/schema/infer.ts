@@ -12,7 +12,8 @@
  *   cleared with `update(id, { field: null })`, and rows written before a field existed
  *   hold null).
  * - Insert: a required field must be provided; optional and defaulted fields may be
- *   omitted (the type has no `null`; the runtime also accepts `null` for an optional field without a default); auto fields cannot be provided at all.
+ *   omitted; an optional field with no default also accepts `null` (left empty), a defaulted
+ *   field refuses it (omit it to get the default); auto fields cannot be provided at all.
  * - Update: every non-auto field is optional; optional and defaulted fields accept `null`
  *   to clear them; number and timestamp fields also accept the numeric `op.*` helpers, and
  *   array fields `op.append` / `op.remove` with an item of the element type.
@@ -87,6 +88,8 @@ export type InferFieldInput<F> = F extends { readonly '~field': unknown }
 
 type IsRequired<F> = F extends { readonly '~field': { readonly required: true } } ? true : false
 type IsAuto<F> = F extends { readonly '~field': { readonly auto: true } } ? true : false
+/** `.default()` was called (literally `true`; a builder that never had one reads `boolean`). */
+type HasDefault<F> = F extends { readonly '~field': { readonly defaulted: true } } ? true : false
 type KindOf<F> = F extends { readonly '~field': { readonly kind: infer K } } ? K : FieldKind
 
 type RequiredInsertKeys<F extends FieldMap> = {
@@ -132,14 +135,17 @@ export type InferRecord<Fields extends FieldMap> = Simplify<
 /**
  * Infers the insert input type.
  * - Required non-auto fields are required keys
- * - Optional/defaulted non-auto fields are optional keys (omit them; the type has no `null`)
+ * - Optional/defaulted non-auto fields are optional keys; an optional field with no default
+ *   also takes `null` (left empty), a defaulted one does not (omit it to get the default)
  * - Auto fields are excluded entirely
  */
 export type InferInsertInput<Fields extends FieldMap> = Simplify<
 	{
 		[K in RequiredInsertKeys<Fields>]: InferFieldInput<Fields[K]>
 	} & {
-		[K in OptionalInsertKeys<Fields>]?: InferFieldInput<Fields[K]>
+		[K in OptionalInsertKeys<Fields>]?:
+			| InferFieldInput<Fields[K]>
+			| (HasDefault<Fields[K]> extends true ? never : null)
 	}
 >
 
