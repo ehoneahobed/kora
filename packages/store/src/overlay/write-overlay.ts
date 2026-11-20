@@ -477,19 +477,27 @@ async function readBase(
 	const read = overlay.readRecord ?? defaultReadRecord
 	const readState = overlay.readFoldState ?? defaultReadFoldState
 	const timeoutMs = overlay.baseReadTimeoutMs ?? BASE_READ_TIMEOUT_MS
-	// Taken before the read is issued: any change the registry hears of before the result
-	// arrives makes the state older than what it knows.
-	const stateToken = overlay.registry.seedStamp(collection)
+	let stateToken = 0
 	let timer: ReturnType<typeof setTimeout> | undefined
 	const timedOut = new Promise<'timeout'>((resolve) => {
 		timer = setTimeout(() => resolve('timeout'), timeoutMs)
 	})
 	try {
 		const outcome = await Promise.race([
-			Promise.all([
-				wantRecord ? read(ctx, collection, id) : Promise.resolve(null),
-				wantState ? readState(ctx, collection, id) : Promise.resolve(null),
-			]),
+			(async () => {
+				// An earlier write of this record that is still running (pending, or not predicted)
+				// is not in the database yet: read after it, or the base lacks it. Within the same
+				// budget, so a slow commit makes this write a miss, never a wrong prediction.
+				const running = overlay.registry.whenRecordSettled(collection, id)
+				if (running) await running
+				// Taken when the read is issued: any change the registry hears of before the
+				// result arrives makes the state older than what it knows.
+				stateToken = overlay.registry.seedStamp(collection)
+				return Promise.all([
+					wantRecord ? read(ctx, collection, id) : Promise.resolve(null),
+					wantState ? readState(ctx, collection, id) : Promise.resolve(null),
+				])
+			})(),
 			timedOut,
 		])
 		if (outcome === 'timeout') return { status: 'timeout' }

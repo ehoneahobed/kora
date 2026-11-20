@@ -345,6 +345,8 @@ export class PendingWrites {
 	private seeded = 0
 	/** Records with a running write that was not predicted, by cache key. */
 	private readonly unpredicted = new Map<string, number>()
+	/** Callers of {@link whenRecordSettled} waiting for a record's running writes to finish. */
+	private readonly settleWaiters = new Set<{ key: string; resolve: () => void }>()
 
 	constructor(options: PendingWritesOptions = {}) {
 		const { now, onEvent, ...limits } = options
@@ -1111,12 +1113,46 @@ export class PendingWrites {
 				if (left > 0) this.unpredicted.set(key, left)
 				else this.unpredicted.delete(key)
 			}
+			this.wakeSettled()
 		}
 	}
 
 	/** Whether a write the overlay did not predict is changing this record right now. */
 	isHeld(collection: string, id: string): boolean {
 		return (this.unpredicted.get(cacheKey(collection, id)) ?? 0) > 0
+	}
+
+	/**
+	 * Settles once no write of this record is running: no pending entry and no unpredicted
+	 * write (`null` when none is running now). A base read waits for it: a read issued while
+	 * an earlier write of the record is still queued (or held in its transaction's write
+	 * buffer) sees the record without that write, and a prediction built on it shows the
+	 * record without it until the commit corrects the display.
+	 */
+	whenRecordSettled(collection: string, id: string): Promise<void> | null {
+		const key = cacheKey(collection, id)
+		if (!this.isRunning(key)) return null
+		return new Promise<void>((resolve) => {
+			this.settleWaiters.add({ key, resolve })
+		})
+	}
+
+	private isRunning(key: string): boolean {
+		if ((this.unpredicted.get(key) ?? 0) > 0) return true
+		for (const entry of this.entries.values()) {
+			if (entry.state === 'pending' && cacheKey(entry.collection, entry.recordId) === key)
+				return true
+		}
+		return false
+	}
+
+	private wakeSettled(all = false): void {
+		for (const waiter of this.settleWaiters) {
+			if (all || !this.isRunning(waiter.key)) {
+				this.settleWaiters.delete(waiter)
+				waiter.resolve()
+			}
+		}
 	}
 
 	/** The newest not-committed entry for a record: what a new update would derive from. */
@@ -1331,6 +1367,7 @@ export class PendingWrites {
 		this.rolledBackIds.clear()
 		this.generation += 1
 		this.totalBytes = 0
+		this.wakeSettled(true)
 		if (dropped.length > 0) {
 			this.changed('cleared', [...new Set(dropped.map((entry) => entry.collection))])
 		}
@@ -1413,6 +1450,7 @@ export class PendingWrites {
 	}
 
 	private changed(kind: RegistryChange['kind'], collections: readonly string[]): void {
+		this.wakeSettled()
 		for (const listener of this.changeListeners) {
 			try {
 				listener({ kind, collections })
