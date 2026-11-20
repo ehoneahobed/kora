@@ -226,10 +226,10 @@ const inventory = defineSchema({
 | `t.richtext()` | `Uint8Array` | `string \| Uint8Array \| ArrayBuffer` | same as insert |
 
 Every record also has `id: string`, `createdAt: number` and `updatedAt: number`. A defaulted field
-reads as `T | null` because `update(id, { field: null })` can clear it. The insert type has no
-`null`, but at runtime an insert accepts `null` for an optional field with no default and leaves it
-empty, as an update does (a form's "None" choice). A required or defaulted field refuses `null` with
-`SCHEMA_VALIDATION`.
+reads as `T | null` because `update(id, { field: null })` can clear it. An insert accepts
+`null` for an optional field with no default and leaves it empty, as an update does (a form's "None"
+choice); the insert type allows it for exactly those fields. A required or defaulted field refuses
+`null`: a compile error, and `SCHEMA_VALIDATION` at runtime.
 
 ```typescript
 import type { CollectionInsertOf, CollectionRecordOf } from 'korajs'

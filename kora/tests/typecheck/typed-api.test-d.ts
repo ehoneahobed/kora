@@ -101,8 +101,12 @@ export async function collectionAccessor(): Promise<void> {
 	await app.todos.insert({ title: 1 })
 	// @ts-expect-error auto field cannot be set
 	await app.todos.insert({ title: 'x', createdOn: 5 })
-	// @ts-expect-error insert refuses null; omit the key instead
-	await app.todos.insert({ title: 'x', assignee: null })
+	// An optional field with no default takes null (left empty), as the runtime does
+	await app.todos.insert({ title: 'x', assignee: null, prefs: null })
+	// @ts-expect-error a defaulted field refuses null; omit the key to get the default
+	await app.todos.insert({ title: 'x', done: null })
+	// @ts-expect-error a required field refuses null
+	await app.todos.insert({ title: null })
 	// @ts-expect-error timestamps are milliseconds, not Date
 	await app.todos.insert({ title: 'x', dueAt: new Date() })
 	// @ts-expect-error not an enum member

@@ -30,6 +30,7 @@ export interface FieldTypeInfo<
 	Auto extends boolean,
 	Output,
 	Input,
+	Def extends boolean = boolean,
 > {
 	/** The field kind. */
 	readonly kind: Kind
@@ -41,6 +42,11 @@ export interface FieldTypeInfo<
 	readonly output: Output
 	/** The type a write accepts for the field (before optionality). */
 	readonly input: Input
+	/**
+	 * `true` once `.default()` gave the field a default (an insert then refuses `null`: leave
+	 * the key out to get the default). `boolean` (unknown) reads as no default.
+	 */
+	readonly defaulted: Def
 }
 
 /**
@@ -106,13 +112,14 @@ export class FieldBuilder<
 	Auto extends boolean = boolean,
 	Output = DefaultFieldOutput<Kind>,
 	Input = Kind extends 'richtext' ? DefaultFieldInput<Kind> : Output,
+	Def extends boolean = boolean,
 > {
 	/**
 	 * Type-only brand (never present at runtime). It makes the builder's kind,
 	 * requiredness, auto flag and value types part of its structure, which is what
 	 * schema inference reads.
 	 */
-	declare readonly '~field': FieldTypeInfo<Kind, Req, Auto, Output, Input>
+	declare readonly '~field': FieldTypeInfo<Kind, Req, Auto, Output, Input, Def>
 
 	protected readonly _kind: Kind
 	protected readonly _required: boolean
@@ -137,7 +144,7 @@ export class FieldBuilder<
 	}
 
 	/** Mark this field as optional (not required on insert; reads may return `null`). */
-	optional(): FieldBuilder<Kind, false, Auto, Output, Input> {
+	optional(): FieldBuilder<Kind, false, Auto, Output, Input, Def> {
 		return this.carryStamp(
 			new FieldBuilder(this._kind, false, this._defaultValue, this._auto, this._mergeStrategy),
 		)
@@ -147,7 +154,7 @@ export class FieldBuilder<
 	 * Set a default value for this field. Implicitly makes the field optional on insert.
 	 * The value must be of the field's type (`t.number().default('x')` is a type error).
 	 */
-	default(value: Input): FieldBuilder<Kind, false, Auto, Output, Input> {
+	default(value: Input): FieldBuilder<Kind, false, Auto, Output, Input, true> {
 		if (this._stamp) {
 			throw new SchemaValidationError(
 				'A stamped field gets its value from the server; it cannot also have a default.',
@@ -160,7 +167,7 @@ export class FieldBuilder<
 	 * Mark this field as auto-populated (e.g., createdAt timestamps). Developers cannot
 	 * set auto fields; the framework fills `t.timestamp().auto()` with the insert time.
 	 */
-	auto(): FieldBuilder<Kind, false, true, Output, Input> {
+	auto(): FieldBuilder<Kind, false, true, Output, Input, false> {
 		if (this._stamp) {
 			throw new SchemaValidationError('A field cannot be both auto() and stamp().')
 		}
@@ -180,7 +187,7 @@ export class FieldBuilder<
 	 *   - `'append-only'`: Concatenate additions (for arrays)
 	 *   - `'server-authoritative'`: Always prefer the remote/server value
 	 */
-	merge(strategy: FieldMergeStrategy): FieldBuilder<Kind, Req, Auto, Output, Input> {
+	merge(strategy: FieldMergeStrategy): FieldBuilder<Kind, Req, Auto, Output, Input, Def> {
 		return this.carryStamp(
 			new FieldBuilder(this._kind, this._required, this._defaultValue, this._auto, strategy),
 		)
@@ -199,7 +206,7 @@ export class FieldBuilder<
 	stamp(
 		this: FieldBuilder<'string', boolean, false, Output, Input>,
 		source: 'userId',
-	): FieldBuilder<'string', false, false, Output, Input> {
+	): FieldBuilder<'string', false, false, Output, Input, false> {
 		if (this._kind !== 'string') {
 			throw new SchemaValidationError('stamp() is only available on t.string() fields.')
 		}
@@ -211,7 +218,7 @@ export class FieldBuilder<
 				'A stamped field gets its value from the server; it cannot be auto() or have a default.',
 			)
 		}
-		const next = new FieldBuilder<'string', false, false, Output, Input>(
+		const next = new FieldBuilder<'string', false, false, Output, Input, false>(
 			'string',
 			false,
 			undefined,
@@ -271,7 +278,8 @@ export class EnumFieldBuilder<
 	Values extends readonly string[] = readonly string[],
 	Req extends boolean = boolean,
 	Auto extends boolean = boolean,
-> extends FieldBuilder<'enum', Req, Auto, Values[number]> {
+	Def extends boolean = boolean,
+> extends FieldBuilder<'enum', Req, Auto, Values[number], Values[number], Def> {
 	private readonly _enumValues: Values
 	private readonly _transitions: TransitionMap | null
 
@@ -288,7 +296,7 @@ export class EnumFieldBuilder<
 		this._transitions = transitions
 	}
 
-	override optional(): EnumFieldBuilder<Values, false, Auto> {
+	override optional(): EnumFieldBuilder<Values, false, Auto, Def> {
 		return new EnumFieldBuilder(
 			this._enumValues,
 			false,
@@ -299,7 +307,7 @@ export class EnumFieldBuilder<
 		)
 	}
 
-	override default(value: Values[number]): EnumFieldBuilder<Values, false, Auto> {
+	override default(value: Values[number]): EnumFieldBuilder<Values, false, Auto, true> {
 		return new EnumFieldBuilder(
 			this._enumValues,
 			false,
@@ -310,7 +318,7 @@ export class EnumFieldBuilder<
 		)
 	}
 
-	override auto(): EnumFieldBuilder<Values, false, true> {
+	override auto(): EnumFieldBuilder<Values, false, true, false> {
 		return new EnumFieldBuilder(
 			this._enumValues,
 			false,
@@ -321,7 +329,7 @@ export class EnumFieldBuilder<
 		)
 	}
 
-	override merge(strategy: FieldMergeStrategy): EnumFieldBuilder<Values, Req, Auto> {
+	override merge(strategy: FieldMergeStrategy): EnumFieldBuilder<Values, Req, Auto, Def> {
 		return new EnumFieldBuilder(
 			this._enumValues,
 			this._required,
@@ -350,7 +358,7 @@ export class EnumFieldBuilder<
 	 */
 	transitions(
 		map: Partial<Record<Values[number], Values[number][]>>,
-	): EnumFieldBuilder<Values, Req, Auto> {
+	): EnumFieldBuilder<Values, Req, Auto, Def> {
 		// Validate that all source and target states are valid enum values
 		const validValues = new Set(this._enumValues as readonly string[])
 		for (const [state, targets] of Object.entries(map)) {
@@ -411,7 +419,8 @@ export class ArrayFieldBuilder<
 	Item extends FieldBuilder = FieldBuilder,
 	Req extends boolean = boolean,
 	Auto extends boolean = boolean,
-> extends FieldBuilder<'array', Req, Auto, FieldOutput<Item>[], FieldInput<Item>[]> {
+	Def extends boolean = boolean,
+> extends FieldBuilder<'array', Req, Auto, FieldOutput<Item>[], FieldInput<Item>[], Def> {
 	private readonly _item: Item
 
 	constructor(
@@ -425,7 +434,7 @@ export class ArrayFieldBuilder<
 		this._item = itemBuilder
 	}
 
-	override optional(): ArrayFieldBuilder<Item, false, Auto> {
+	override optional(): ArrayFieldBuilder<Item, false, Auto, Def> {
 		return new ArrayFieldBuilder(
 			this._item,
 			false,
@@ -435,15 +444,15 @@ export class ArrayFieldBuilder<
 		)
 	}
 
-	override default(value: FieldInput<Item>[]): ArrayFieldBuilder<Item, false, Auto> {
+	override default(value: FieldInput<Item>[]): ArrayFieldBuilder<Item, false, Auto, true> {
 		return new ArrayFieldBuilder(this._item, false, value, this._auto, this._mergeStrategy)
 	}
 
-	override auto(): ArrayFieldBuilder<Item, false, true> {
+	override auto(): ArrayFieldBuilder<Item, false, true, false> {
 		return new ArrayFieldBuilder(this._item, false, undefined, true, this._mergeStrategy)
 	}
 
-	override merge(strategy: FieldMergeStrategy): ArrayFieldBuilder<Item, Req, Auto> {
+	override merge(strategy: FieldMergeStrategy): ArrayFieldBuilder<Item, Req, Auto, Def> {
 		return new ArrayFieldBuilder(
 			this._item,
 			this._required,
@@ -504,12 +513,14 @@ export class ObjectFieldBuilder<
 	Fields extends Record<string, FieldBuilder> = Record<string, FieldBuilder>,
 	Req extends boolean = boolean,
 	Auto extends boolean = boolean,
+	Def extends boolean = boolean,
 > extends FieldBuilder<
 	'object',
 	Req,
 	Auto,
 	ObjectFieldValue<Fields, 'output'>,
-	ObjectFieldValue<Fields, 'input'>
+	ObjectFieldValue<Fields, 'input'>,
+	Def
 > {
 	private readonly _fields: Fields
 
@@ -524,7 +535,7 @@ export class ObjectFieldBuilder<
 		this._fields = fields
 	}
 
-	override optional(): ObjectFieldBuilder<Fields, false, Auto> {
+	override optional(): ObjectFieldBuilder<Fields, false, Auto, Def> {
 		return new ObjectFieldBuilder(
 			this._fields,
 			false,
@@ -536,15 +547,15 @@ export class ObjectFieldBuilder<
 
 	override default(
 		value: ObjectFieldValue<Fields, 'input'>,
-	): ObjectFieldBuilder<Fields, false, Auto> {
+	): ObjectFieldBuilder<Fields, false, Auto, true> {
 		return new ObjectFieldBuilder(this._fields, false, value, this._auto, this._mergeStrategy)
 	}
 
-	override auto(): ObjectFieldBuilder<Fields, false, true> {
+	override auto(): ObjectFieldBuilder<Fields, false, true, false> {
 		return new ObjectFieldBuilder(this._fields, false, undefined, true, this._mergeStrategy)
 	}
 
-	override merge(strategy: FieldMergeStrategy): ObjectFieldBuilder<Fields, Req, Auto> {
+	override merge(strategy: FieldMergeStrategy): ObjectFieldBuilder<Fields, Req, Auto, Def> {
 		return new ObjectFieldBuilder(
 			this._fields,
 			this._required,
@@ -586,9 +597,10 @@ export class JsonFieldBuilder<
 	T = unknown,
 	Req extends boolean = boolean,
 	Auto extends boolean = boolean,
-> extends FieldBuilder<'json', Req, Auto, T> {
-	override optional(): JsonFieldBuilder<T, false, Auto> {
-		return new JsonFieldBuilder<T, false, Auto>(
+	Def extends boolean = boolean,
+> extends FieldBuilder<'json', Req, Auto, T, T, Def> {
+	override optional(): JsonFieldBuilder<T, false, Auto, Def> {
+		return new JsonFieldBuilder<T, false, Auto, Def>(
 			'json',
 			false,
 			this._defaultValue,
@@ -597,8 +609,8 @@ export class JsonFieldBuilder<
 		)
 	}
 
-	override default(value: T): JsonFieldBuilder<T, false, Auto> {
-		return new JsonFieldBuilder<T, false, Auto>(
+	override default(value: T): JsonFieldBuilder<T, false, Auto, true> {
+		return new JsonFieldBuilder<T, false, Auto, true>(
 			'json',
 			false,
 			value,
@@ -607,12 +619,18 @@ export class JsonFieldBuilder<
 		)
 	}
 
-	override auto(): JsonFieldBuilder<T, false, true> {
-		return new JsonFieldBuilder<T, false, true>('json', false, undefined, true, this._mergeStrategy)
+	override auto(): JsonFieldBuilder<T, false, true, false> {
+		return new JsonFieldBuilder<T, false, true, false>(
+			'json',
+			false,
+			undefined,
+			true,
+			this._mergeStrategy,
+		)
 	}
 
-	override merge(strategy: FieldMergeStrategy): JsonFieldBuilder<T, Req, Auto> {
-		return new JsonFieldBuilder<T, Req, Auto>(
+	override merge(strategy: FieldMergeStrategy): JsonFieldBuilder<T, Req, Auto, Def> {
+		return new JsonFieldBuilder<T, Req, Auto, Def>(
 			'json',
 			this._required,
 			this._defaultValue,
@@ -647,7 +665,8 @@ export class JsonFieldBuilder<
 export class SecretFieldBuilder<
 	Req extends boolean = boolean,
 	Auto extends boolean = boolean,
-> extends FieldBuilder<'secret', Req, Auto, string> {
+	Def extends boolean = boolean,
+> extends FieldBuilder<'secret', Req, Auto, string, string, Def> {
 	private readonly _secretMode: SecretMode
 
 	constructor(
@@ -662,7 +681,7 @@ export class SecretFieldBuilder<
 	}
 
 	/** Store this secret as a one-way salted hash (passwords: verify, never read back). */
-	hashed(): SecretFieldBuilder<Req, Auto> {
+	hashed(): SecretFieldBuilder<Req, Auto, Def> {
 		return new SecretFieldBuilder(
 			'hashed',
 			this._required,
@@ -673,7 +692,7 @@ export class SecretFieldBuilder<
 	}
 
 	/** Store this secret as reversible ciphertext (tokens/keys: decrypt to use). */
-	encrypted(): SecretFieldBuilder<Req, Auto> {
+	encrypted(): SecretFieldBuilder<Req, Auto, Def> {
 		return new SecretFieldBuilder(
 			'encrypted',
 			this._required,
@@ -683,7 +702,7 @@ export class SecretFieldBuilder<
 		)
 	}
 
-	override optional(): SecretFieldBuilder<false, Auto> {
+	override optional(): SecretFieldBuilder<false, Auto, Def> {
 		return new SecretFieldBuilder(
 			this._secretMode,
 			false,
@@ -693,15 +712,15 @@ export class SecretFieldBuilder<
 		)
 	}
 
-	override default(value: string): SecretFieldBuilder<false, Auto> {
+	override default(value: string): SecretFieldBuilder<false, Auto, true> {
 		return new SecretFieldBuilder(this._secretMode, false, value, this._auto, this._mergeStrategy)
 	}
 
-	override auto(): SecretFieldBuilder<false, true> {
+	override auto(): SecretFieldBuilder<false, true, false> {
 		return new SecretFieldBuilder(this._secretMode, false, undefined, true, this._mergeStrategy)
 	}
 
-	override merge(strategy: FieldMergeStrategy): SecretFieldBuilder<Req, Auto> {
+	override merge(strategy: FieldMergeStrategy): SecretFieldBuilder<Req, Auto, Def> {
 		return new SecretFieldBuilder(
 			this._secretMode,
 			this._required,
