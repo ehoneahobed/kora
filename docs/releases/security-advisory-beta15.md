@@ -4,15 +4,14 @@ title: "Security advisory: Kora.js 1.0.0-beta.14 and earlier (fixed in 1.0.0-bet
 
 # Security advisory: Kora.js 1.0.0-beta.14 and earlier
 
-> **Draft. Not published.** GitHub advisory ids and CVSS scores are assigned when this is
-> published with the 1.0.0-beta.15 release. Each item below was checked against the published
-> `v1.0.0-beta.14` source. Fixes to features that are new in beta.15 (access rules,
+> Published 2026-11-20 with the 1.0.0-beta.15 release. Each item below was checked against the
+> published `v1.0.0-beta.14` source. Fixes to features that are new in beta.15 (access rules,
 > `@korajs/spaces`, the read-through endpoint) are not listed: no released version had them.
 
 **Affected:** the packages named per item, `<= 1.0.0-beta.14` (every published version that has the
-feature) · **Patched:** `1.0.0-beta.15` · **GitHub advisory:** `GHSA-xxxx-xxxx-xxxx`
-(**placeholder**, assigned at publish; replace it here and in the release notes) · **CVSS:**
-**placeholder**, assigned at publish
+feature; `@korajs/tauri <= 0.4.3-beta.13`, `create-kora-app <= 0.1.25-beta.13`) · **Patched:**
+`1.0.0-beta.15` (`@korajs/tauri` `0.5.0-beta.14`, `create-kora-app` `0.1.25-beta.14`) · **GitHub
+advisory:** [GHSA-p6gp-vqp9-4hw4](https://github.com/ehoneahobed/kora/security/advisories/GHSA-p6gp-vqp9-4hw4) · **Severity:** medium (the most serious items depend on how an app exposes them)
 
 ## Patches
 

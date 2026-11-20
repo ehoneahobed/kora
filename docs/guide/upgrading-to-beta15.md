@@ -5,9 +5,8 @@ description: "Upgrade a Kora.js app from 1.0.0-beta.14 to 1.0.0-beta.15: what ko
 
 # Upgrading to 1.0.0-beta.15
 
-> **Draft until 1.0.0-beta.15 is published.** This page is written from the changes merged to
-> `main` after 1.0.0-beta.14. Nothing here is released yet, and the release notes list what is still
-> open ([release notes draft](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.15.md)).
+> 1.0.0-beta.15 was released on 2026-11-20 ([release notes](https://github.com/ehoneahobed/kora/blob/main/docs/releases/v1.0.0-beta.15.md),
+> [security advisory](https://github.com/ehoneahobed/kora/security/advisories/GHSA-p6gp-vqp9-4hw4)).
 
 beta.15 is the offline-readiness, access-rules and fast-sync release. It keeps **sync protocol 2**
 (the handshake and delivery messages gain optional fields; a beta.14 client still syncs with a
