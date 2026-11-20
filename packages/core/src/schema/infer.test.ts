@@ -226,15 +226,17 @@ describe('InferInsertInput', () => {
 	type Insert = InferInsertInput<Fields>
 
 	test('required fields are required, optional and defaulted optional, auto excluded', () => {
+		// An optional field with no default also takes `null` (left empty), as the runtime does;
+		// a defaulted field does not (the runtime refuses it: leave it out to get the default).
 		expectTypeOf<Insert>().toEqualTypeOf<{
 			title: string
 			count: number
-			assignee?: string
+			assignee?: string | null
 			done?: boolean
 			priority?: 'low' | 'high'
 			tags?: string[]
-			prefs?: { theme: string }
-			notes?: RichtextInput
+			prefs?: { theme: string } | null
+			notes?: RichtextInput | null
 		}>()
 		expectTypeOf<InferInsert<Fields>>().toEqualTypeOf<Insert>()
 	})
@@ -247,11 +249,53 @@ describe('InferInsertInput', () => {
 		const wrong: Insert = { title: 1, count: 1 }
 		// @ts-expect-error auto fields cannot be set
 		const auto: Insert = { title: 'x', count: 1, createdOn: 5 }
-		// @ts-expect-error insert refuses null (omit the key instead)
-		const nulled: Insert = { title: 'x', count: 1, assignee: null }
+		// @ts-expect-error a required field refuses null
+		const requiredNull: Insert = { title: null, count: 1 }
+		// @ts-expect-error a defaulted field refuses null (leave it out to get the default)
+		const defaultedNull: Insert = { title: 'x', count: 1, done: null }
+		const optionalNull: Insert = { title: 'x', count: 1, assignee: null, prefs: null }
 		// @ts-expect-error unknown field
 		const unknownKey: Insert = { title: 'x', count: 1, nope: true }
-		expect([ok, missing, wrong, auto, nulled, unknownKey]).toHaveLength(6)
+		expect([
+			ok,
+			missing,
+			wrong,
+			auto,
+			requiredNull,
+			defaultedNull,
+			optionalNull,
+			unknownKey,
+		]).toHaveLength(8)
+	})
+
+	test('a default survives the other modifiers; null follows the runtime rule', () => {
+		const chained = defineSchema({
+			version: 1,
+			collections: {
+				c: {
+					fields: {
+						defaultThenOptional: t.string().default('a').optional(),
+						defaultThenMerge: t.number().default(0).merge('max'),
+						enumDefaultTransitions: t
+							.enum(['a', 'b'])
+							.default('a')
+							.transitions({ a: ['b'] }),
+						optionalThenMerge: t.number().optional().merge('max'),
+						jsonOptional: t.json<{ n: number }>().optional(),
+						jsonDefault: t.json<{ n: number }>().default({ n: 1 }),
+					},
+				},
+			},
+		})
+		type C = InferInsertInput<(typeof chained.__input)['collections']['c']['fields']>
+		expectTypeOf<C>().toEqualTypeOf<{
+			defaultThenOptional?: string
+			defaultThenMerge?: number
+			enumDefaultTransitions?: 'a' | 'b'
+			optionalThenMerge?: number | null
+			jsonOptional?: { n: number } | null
+			jsonDefault?: { n: number }
+		}>()
 	})
 })
 
