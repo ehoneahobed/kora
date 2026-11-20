@@ -424,8 +424,10 @@ Kora automatically forwards these environment variables from your machine to the
 | `KORA_AUTH_SECRET` | For sign-in | Secret that signs session tokens; without it the server runs with sign-in off. Generate with `openssl rand -base64 32` |
 | `KORA_AUTH_SECRET_PREVIOUS` | Optional | The previous secret while you rotate it, so existing sessions stay valid |
 | `KORA_GOOGLE_CLIENT_ID`, `KORA_GOOGLE_CLIENT_SECRET`, `KORA_GOOGLE_REDIRECT_URI`, `KORA_OAUTH_PKCE` | For Google sign-in | OAuth settings the template server reads |
-| `KORA_ADMIN_TOKEN`, `KORA_BACKUP_TOKEN`, `KORA_METRICS_TOKEN` | Optional | Tokens for the operational endpoints |
+| `KORA_ADMIN_TOKEN`, `KORA_BACKUP_TOKEN`, `KORA_METRICS_TOKEN`, `KORA_INSIGHTS_TOKEN` | Optional | Tokens for the operational endpoints |
 | `KORA_TRUST_PROXY` | Optional | Trusted proxy hops in front of the container |
+| `KORA_ALLOWED_ORIGINS` | Optional | Extra origins allowed to call the server (for example a native app's origin) |
+| `KORA_BLOB_STORE_URL`, `KORA_BLOB_STORE_ACCESS_KEY_ID`, `KORA_BLOB_STORE_SECRET_ACCESS_KEY`, `KORA_BLOB_STORE_REGION`, `KORA_BLOB_STORE_ENDPOINT` | For file fields | An S3-compatible object store for files (`s3://<bucket>`). Without one, files are kept on the container's disk, which a redeploy replaces |
 | `PUBLIC_URL` | Optional | Public URL of your app (for OG meta tags, email links, etc.) |
 | `NODE_ENV` | Optional | Defaults to the image's value |
 

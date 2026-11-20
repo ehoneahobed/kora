@@ -211,6 +211,40 @@ describe('AwsLightsailAdapter', () => {
 			}
 		})
 
+		// createProductionServer and the stores read settings from the environment themselves
+		// (blob store, insights token, allowed origins): a template never names them, so the
+		// template check above cannot see them. Scan the framework's own readers instead.
+		test('every KORA_* setting the production server reads is forwarded', async () => {
+			const { readFileSync } = await import('node:fs')
+			const { join } = await import('node:path')
+			const packages = join(__dirname, '../../../../..')
+			const readers = [
+				'server/src/server/production-server.ts',
+				'server/src/server/host-settings.ts',
+				'server/src/server/cross-origin.ts',
+				'server/src/logging/structured-logger.ts',
+				'store/src/blob/open-blob-store.ts',
+				'auth/src/provider/adapter.ts',
+				'auth/src/provider/built-in/quickstart-server.ts',
+			]
+			const read = new Set<string>()
+			for (const file of readers) {
+				const source = readFileSync(join(packages, file), 'utf8')
+				for (const match of source.matchAll(/env\.(KORA_[A-Z0-9_]+)|'(KORA_[A-Z0-9_]+)'/g)) {
+					read.add((match[1] ?? match[2]) as string)
+				}
+			}
+			const expected = [...read].sort()
+			expect(expected).toContain('KORA_BLOB_STORE_URL')
+			for (const name of expected) process.env[name] = `value-of-${name}`
+			try {
+				const environment = await deployedEnvironment()
+				expect(expected.filter((name) => environment[name] !== `value-of-${name}`)).toEqual([])
+			} finally {
+				for (const name of expected) delete process.env[name]
+			}
+		})
+
 		test('KORA_AUTH_SECRET wins over AUTH_SECRET when both are set', async () => {
 			process.env.KORA_AUTH_SECRET = 'current-secret'
 			process.env.AUTH_SECRET = 'legacy-secret'
