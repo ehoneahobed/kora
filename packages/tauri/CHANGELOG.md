@@ -1,5 +1,71 @@
 # @korajs/tauri
 
+## 0.5.0-beta.14
+
+### Minor Changes
+
+- 59a80c8: `app.storage.deleteDatabase()` works in Tauri apps (native SQLite): it deletes the database file and SQLite's companion files from the app's data directory, with the same refusals as in a browser (open database, unsynced writes unless `force`). An app can now erase one device's copy, for a "reset this device" button, without writing deletes that sync to the server and every other device. The Tauri plugin adds `inspect` and `delete` commands (in `kora-sqlite:default`); `@korajs/tauri` exports `inspectTauriDatabase`, `readTauriDatabase` and `deleteTauriDatabase`.
+
+  `deleteDatabase` also removes the database's default blob store (`<name>-blobs` in OPFS), in browsers and Tauri apps, so erasing a device leaves none of its files behind. Kora uploads a blob before the operation that references it, so once the database had no unsynced operations the local copies are not the only ones. A custom `blob.store` is left to the app.
+
+- 39c24c6: Desktop sign-in sessions live in the operating system's credential store. `createTauriCredentialStore()` keeps credentials in Keychain (macOS), Credential Manager (Windows) or the Secret Service (Linux) through new commands of the `kora-sqlite` plugin, included in its default permission. Pass it to `createAuthTokenStorage` for `createKoraAuth({ storage })`; the Tauri template now does. A session saved in WebView storage by an earlier version moves to the keychain on first read; where no credential store exists it falls back to WebView storage and warns once. The plugin needs Rust 1.88 or newer.
+
+### Patch Changes
+
+- 2b9b8b5: Make a resolved local write a durability guarantee on every storage backend. Local CRUD, `insertMany`, mutations, and outer transactions now wait for the IndexedDB fallback's strict group-commit barrier before resolving; OPFS and native adapters pay no extra barrier. A barrier failure rejects with `WriteNotDurableError` (`WRITE_NOT_DURABLE`) after the committed operation is published, so applications can surface the problem without blindly repeating an action that already exists locally. `store:write-durability` reports failure and later recovery with the affected operation ids.
+
+  Native SQLite now explicitly uses `synchronous = FULL` in both the better-sqlite3 adapter and Tauri plugin so a resolved write survives an operating-system crash or power loss.
+
+- 12da108: Storage auto-detected inside Tauri now opens in a built app. `createApp` used to load `@korajs/tauri` through an import that bundlers cannot see, and a webview cannot resolve a bare package name, so it failed with "Failed to resolve module specifier '@korajs/tauri'". Importing `@korajs/tauri` now registers its adapter, and `createApp` uses that registration. The `tauri-react` template imports it in `src/main.tsx`. Without the import, the error says what to add. `korajs` now declares `@korajs/tauri` as an optional peer.
+- 8889cb2: `TauriAdapterError`, `TauriStoreNotOpenError`, `TauriDatabaseInUseError` and `AuthProviderError` now extend `KoraError`, keeping their names and fields. `TauriDatabaseInUseError` gains the code `TAURI_DATABASE_IN_USE`, and `AuthProviderError` the code `AUTH_PROVIDER_ERROR`. `AuthEvent`'s `user` is now the client's `AuthUser`, the type `AuthClient.currentUser` returns, instead of a stale duplicate. `@korajs/tauri` now ships a README.
+- e466c23: Binary values (rich text, blobs) now round-trip through the Tauri SQLite plugin. `invoke` carries arguments and results as JSON, so a `Uint8Array` used to arrive as `{"0":..}` and be stored as JSON text, and BLOB columns came back as hex strings the store could not decode, which broke rich text on Tauri. Bytes now travel as `{ $koraBytes: base64 }` both ways: the plugin binds them as BLOBs and returns BLOBs in that form, and the adapter converts back to `Uint8Array`. Update the Rust plugin together with the JS package.
+- 02a71d7: The Kora SQLite Tauri plugin's `open` command now refuses a parent (`..`), absolute or empty database path, as `inspect` and `delete` already did. Database connections also refuse `ATTACH` and `VACUUM INTO`, because those could read or write any file the app can reach. Kora never uses them. Even a compromised webview can no longer open or write a database outside the app's data directory.
+- b33fe71: The Tauri SQLite adapter now queues `execute`, `query` and `migrate` behind an open transaction, as the browser adapter does. Before, a standalone write sent while a transaction was open ran inside it, so a ROLLBACK lost the write, and a read could see uncommitted rows. The plugin's database commands now also run on Tauri's async runtime instead of the main thread, so a slow query no longer freezes the window. Rebuild the app to pick up the plugin change.
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [003d7bf]
+- Updated dependencies [0b461fa]
+- Updated dependencies [8411be3]
+- Updated dependencies [714ebd2]
+- Updated dependencies [ba4eaa7]
+- Updated dependencies [180923d]
+- Updated dependencies [b8f9e6f]
+- Updated dependencies [d8fbc4e]
+- Updated dependencies [ae1e0a9]
+- Updated dependencies [ebf38cd]
+- Updated dependencies [9afd6a0]
+- Updated dependencies [d45441e]
+- Updated dependencies [4d5f2a2]
+- Updated dependencies [82c9f65]
+- Updated dependencies [95f5a26]
+- Updated dependencies [dec63c6]
+- Updated dependencies [ea9f219]
+- Updated dependencies [941c67e]
+- Updated dependencies [ab20522]
+- Updated dependencies [2b9b8b5]
+- Updated dependencies [89cb4c4]
+- Updated dependencies [5b80d54]
+- Updated dependencies [fef8dc8]
+- Updated dependencies [f51b43c]
+- Updated dependencies [7775735]
+- Updated dependencies [f03e493]
+- Updated dependencies [c893d28]
+- Updated dependencies [0b461fa]
+- Updated dependencies [b378fb9]
+- Updated dependencies [22f5d75]
+- Updated dependencies [a9726dc]
+- Updated dependencies [1c9dbe0]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [df7a430]
+- Updated dependencies [b7f964a]
+- Updated dependencies [6a38edf]
+- Updated dependencies [d93d324]
+  - @korajs/core@1.0.0-beta.15
+
 ## 0.4.3-beta.13
 
 ### Patch Changes
