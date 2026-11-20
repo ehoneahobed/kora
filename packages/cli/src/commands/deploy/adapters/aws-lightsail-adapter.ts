@@ -478,7 +478,8 @@ export class NodeAwsLightsailCommandRunner implements AwsLightsailCommandRunner 
 /**
  * Environment variables forwarded from the host to the Lightsail container: everything the
  * template servers read that is not set inside the container (PORT, and the database and
- * sync paths, which have defaults). The test checks this list against the templates.
+ * sync paths, which have defaults), and every `KORA_*` setting `createProductionServer` and
+ * the blob store read themselves. The tests check this list against both.
  */
 const PASSTHROUGH_ENV_VARS = [
 	'DATABASE_URL',
@@ -494,6 +495,14 @@ const PASSTHROUGH_ENV_VARS = [
 	'KORA_BACKUP_TOKEN',
 	'KORA_METRICS_TOKEN',
 	'KORA_TRUST_PROXY',
+	'KORA_INSIGHTS_TOKEN',
+	'KORA_ALLOWED_ORIGINS',
+	'KORA_BLOB_STORE_URL',
+	'KORA_BLOB_STORE_ACCESS_KEY_ID',
+	'KORA_BLOB_STORE_SECRET_ACCESS_KEY',
+	'KORA_BLOB_STORE_REGION',
+	'KORA_BLOB_STORE_ENDPOINT',
+	'KORA_BLOB_DIR',
 ] as const
 
 /**

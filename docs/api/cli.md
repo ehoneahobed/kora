@@ -512,8 +512,10 @@ the deploy with AWS's message.
 ### AWS Lightsail
 
 `kora deploy --platform aws-lightsail` forwards `KORA_AUTH_SECRET` and
-`KORA_AUTH_SECRET_PREVIOUS`, the Google OAuth settings, the admin, backup and metrics tokens and
-`KORA_TRUST_PROXY` to the container. A legacy `AUTH_SECRET` is forwarded as `KORA_AUTH_SECRET`,
+`KORA_AUTH_SECRET_PREVIOUS`, the Google OAuth settings, the admin, backup, metrics and insights
+tokens, `KORA_TRUST_PROXY`, `KORA_ALLOWED_ORIGINS` and the blob store settings (`KORA_BLOB_STORE_*`,
+`KORA_BLOB_DIR`) to the container: every setting the template server and `createProductionServer`
+read. A legacy `AUTH_SECRET` is forwarded as `KORA_AUTH_SECRET`,
 with a warning.
 
 ---
