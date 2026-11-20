@@ -315,6 +315,14 @@ export interface ProductionServer {
 	 */
 	revalidateSessions(): Promise<number>
 	/**
+	 * End every live sync session whose access rules are no longer in force: the store is
+	 * rebuilding its membership index, or rebuilt it since the session compiled its grant.
+	 * Each client reconnects and is re-scoped. Call it after restoring a backup with
+	 * `store.importBackup(...)` yourself (the `/__kora/backup` restore and every delivery
+	 * poll already do). See `KoraSyncServer.revalidateAccessSessions`.
+	 */
+	revalidateAccessSessions(): Promise<void>
+	/**
 	 * Make every device of a user (`{ userId }`), or one device (`{ nodeId }`), download
 	 * its data again from the start of the delivery stream at its next connection, and
 	 * end its live sessions on this instance so they reconnect now. Unsent writes on the
@@ -796,6 +804,9 @@ export function createProductionServer(appConfig: ProductionServerConfig): Produ
 			return syncServer.getLiveBlobRefs()
 		},
 
+		revalidateAccessSessions(): Promise<void> {
+			return syncServer.revalidateAccessSessions()
+		},
 		refreshScopes(userId: string): Promise<number> {
 			return syncServer.refreshScopes(userId)
 		},

@@ -238,7 +238,7 @@ received. Operations the device already has are skipped by id, so the resync cos
 correctness. A device or server from before anchors behaves as it did. With access rules, a replace-mode restore also ends every live session
 (retriable `ACCESS_RULES_CHANGED`) so each device reconnects and is re-scoped under the restored
 memberships; on another server instance this happens at its next delivery poll. If you restore by
-calling `store.importBackup(...)` yourself, call `revalidateAccessSessions()` on your `KoraSyncServer` afterwards; a `createProductionServer` handle has no such method, and its next delivery poll (`deliveryPollIntervalMs`, 2 s by default) ends those sessions.
+calling `store.importBackup(...)` yourself, call `revalidateAccessSessions()` afterwards, on the `createProductionServer` handle or your `KoraSyncServer`, so those sessions end at once instead of at the next delivery poll (`deliveryPollIntervalMs`, 2 s by default).
 
 ## Restore a Whole App on Your Own Machine
 
