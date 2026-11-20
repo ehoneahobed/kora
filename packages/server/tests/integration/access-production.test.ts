@@ -5,6 +5,8 @@
  */
 import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import { describe, expect, test, vi } from 'vitest'
+import WebSocket from 'ws'
+import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { createProductionServer } from '../../src/server/production-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
@@ -110,6 +112,70 @@ describe('access API on the production server', () => {
 				{ timeout: 2000 },
 			)
 		} finally {
+			await server.stop()
+		}
+	})
+
+	// A production app that restores with `store.importBackup` itself (not the backup endpoint)
+	// re-checks live sessions through the handle, as `KoraSyncServer.revalidateAccessSessions`.
+	test('revalidateAccessSessions ends a session the restored index no longer grants', async () => {
+		const store = new MemoryServerStore('s')
+		await store.setSchema(schema)
+		const server = createProductionServer({
+			store,
+			port: 0,
+			staticDir: '/nonexistent',
+			syncOptions: {
+				accessSweepIntervalMs: 0,
+				// No delivery poll during the test: only the call below may end the session.
+				deliveryPollIntervalMs: 600_000,
+				auth: new TokenAuthProvider({
+					validate: async (token) => (['ann', 'bob'].includes(token) ? { userId: token } : null),
+				}),
+			},
+		})
+		const base = await server.start()
+		const socket = new WebSocket(`${base.replace('http', 'ws')}/kora-sync`)
+		try {
+			await server.kora.apply({
+				collection: 'boards',
+				type: 'insert',
+				recordId: 'b1',
+				data: { title: 'Plan', ownerId: 'ann' },
+			})
+			const before = await store.exportBackup()
+			await server.access.grant({ userId: 'bob', group: ['boards', 'b1'], role: 'view' })
+			const messages: Array<{ type: string; code?: string }> = []
+			socket.on('message', (data) => messages.push(JSON.parse(String(data))))
+			await new Promise<void>((resolve, reject) => {
+				socket.once('open', () => resolve())
+				socket.once('error', reject)
+			})
+			socket.send(
+				JSON.stringify({
+					type: 'handshake',
+					protocolVersion: 2,
+					messageId: 'hs-1',
+					nodeId: 'bob-node',
+					versionVector: {},
+					schemaVersion: 1,
+					authToken: 'bob',
+					supportsScopeDisjunction: true,
+					lastDeliverySequence: 0,
+				}),
+			)
+			await vi.waitFor(() =>
+				expect(messages.some((m) => m.type === 'handshake-response')).toBe(true),
+			)
+
+			// Restored to before bob joined; his session still holds the old grant.
+			await store.importBackup(before, false)
+			await server.revalidateAccessSessions()
+			await vi.waitFor(() =>
+				expect(messages.find((m) => m.type === 'error')?.code).toBe('ACCESS_RULES_CHANGED'),
+			)
+		} finally {
+			socket.close()
 			await server.stop()
 		}
 	})
