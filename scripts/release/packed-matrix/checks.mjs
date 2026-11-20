@@ -524,8 +524,11 @@ export function buildChecks() {
 			})
 			if (downgrade.status === 0) throw new Error(`a downgrade to ${prior} was not refused`)
 
-			// The registry lookup path (--tag), against the real registry.
-			const tagged = run(kora, ['upgrade', '--dry-run', '--tag', 'latest'], {
+			// The registry lookup path (--tag), against the real registry. On the release pull
+			// request the project is already on the unpublished candidate, newer than `latest`, so
+			// the lookup resolves to an older version: --allow-downgrade lets the dry run plan it
+			// (and write nothing) instead of stopping at the downgrade refusal tested above.
+			const tagged = run(kora, ['upgrade', '--dry-run', '--allow-downgrade', '--tag', 'latest'], {
 				cwd: projectDir,
 				env: { CI: 'false' },
 				timeoutMs: 60_000,
