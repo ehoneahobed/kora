@@ -384,6 +384,58 @@ describe('failure paths', () => {
 	})
 })
 
+// Found by the random-bursts property below (about 1 run in 40 under load): update A, an
+// update that changes nothing after A (not predicted, so the record is held), then a third
+// write. The held record makes the third write read its base, and that read ran before A's
+// transaction stored A, so the third write was predicted on the record without A and the
+// commit check reported a divergence. The injected read returns what the database holds at
+// the moment it runs: without A while A (or the held write) is still running.
+describe("a base read waits for the record's running writes", () => {
+	for (const [name, third] of [
+		['a delete', (todos: ReturnType<Store['collection']>, id: string) => todos.delete(id)],
+		[
+			'another update',
+			(todos: ReturnType<Store['collection']>, id: string) => todos.update(id, { note: 'x' }),
+		],
+	] as const) {
+		test(`update, a no-change update, then ${name}: predicted on the record with the update`, async () => {
+			let registry: PendingWrites | null = null
+			let stored: Record<string, unknown> | null = null
+			const reads: string[] = []
+			const h = await open(new BetterSqlite3Adapter(':memory:'), {
+				strict: false,
+				readRecord: async (_ctx, collection, id) => {
+					const running =
+						registry?.isHeld(collection, id) === true ||
+						(registry?.list() ?? []).some(
+							(entry) => entry.recordId === id && entry.state === 'pending',
+						)
+					reads.push(running ? 'while-running' : 'settled')
+					if (running) return stored as never
+					return (await h.store.collection(collection).findById(id)) as never
+				},
+			})
+			registry = h.registry
+			try {
+				const todos = h.store.collection('todos')
+				const created = await todos.insert({ title: 'b' })
+				stored = { ...created }
+				await Promise.allSettled([
+					todos.update(created.id, { title: 'O$^5', done: false, n: 33 }),
+					todos.update(created.id, { n: 33 }),
+					third(todos, created.id),
+				])
+				expect(reads).not.toContain('while-running')
+				expect(h.overlayEvents.filter((event) => event.type === 'store:overlay-diverged')).toEqual(
+					[],
+				)
+			} finally {
+				await h.store.close()
+			}
+		})
+	}
+})
+
 describe('predictions hold under random bursts of overlapping writes', () => {
 	test('no divergence between the prediction and what was stored', async () => {
 		const op = fc.oneof(
